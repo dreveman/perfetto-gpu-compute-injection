@@ -21,6 +21,10 @@ pub struct Config {
     /// Whether verbose logging is enabled.
     pub verbose: bool,
     /// List of metrics to be collected.
+    ///
+    /// Note: This is only used when the counters data source is enabled.
+    /// When only the renderstages data source is enabled, metrics collection
+    /// is skipped for better performance.
     pub metrics: Vec<String>,
 }
 

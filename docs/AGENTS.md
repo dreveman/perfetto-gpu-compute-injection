@@ -44,7 +44,7 @@ This is a Rust library that bridges NVIDIA CUPTI with Perfetto tracing. It injec
   - `lib.rs`: Entry point with `InitializeInjection()`, Perfetto trace emission
   - `callbacks.rs`: CUPTI callback handlers for kernel launches and resource events
   - `state.rs`: Global state management with `GLOBAL_STATE` singleton
-  - `tracing.rs`: Perfetto data source registration (`gpu.counters`)
+  - `tracing.rs`: Perfetto data source registration (`gpu.counters` and `gpu.renderstages`)
   - `metrics.rs`: Default metrics list and parsing
   - `config.rs`: Environment variable configuration
 
@@ -75,10 +75,21 @@ Hardware Counter Collection → Metric Evaluation → Perfetto TracePackets
 
 ### Environment Variables
 
-- `INJECTION_METRICS`: Comma/semicolon-separated metric names (defaults to 24 standard metrics)
+- `INJECTION_METRICS`: Comma/semicolon-separated metric names (defaults to 24 standard metrics). Only used when `gpu.counters` data source is enabled.
 - `INJECTION_VERBOSE`: Enable detailed stdout logging
-- `INJECTION_DATA_SOURCE_NAME`: Override Perfetto data source name (defaults to `gpu.counters`)
+- `INJECTION_DATA_SOURCE_NAME_SUFFIX`: Suffix for Perfetto data source names (default: `nv`). Data sources will be named `gpu.counters.<suffix>` and `gpu.renderstages.<suffix>`.
 - `CUDA_HOME`: CUDA installation path (build-time, defaults to `/usr/local/cuda`)
+
+### Data Sources
+
+The library registers two independent Perfetto data sources with names in the format `gpu.<type>.<suffix>`:
+
+- **`gpu.counters.nv`**: Hardware performance counter metrics via CUPTI Range Profiler. Higher overhead but detailed metrics.
+- **`gpu.renderstages.nv`**: Kernel execution events with metadata. Lower overhead, suitable for timeline visualization.
+
+The suffix defaults to "nv" (NVIDIA) since CUPTI is exclusively for NVIDIA GPUs.
+
+**Performance Note**: When only `gpu.renderstages.<suffix>` is enabled, profiler initialization and range profiling are skipped for significantly lower overhead.
 
 ## Usage
 

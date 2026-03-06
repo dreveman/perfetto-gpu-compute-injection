@@ -1,4 +1,4 @@
-# Perfetto CUPTI GPU Compute Injection
+# Perfetto GPU Compute Injection
 
 This Rust crate implements a profiling injection library that bridges NVIDIA CUPTI (CUDA Profiling Tools Interface) with the Perfetto tracing system. It is designed to be injected into CUDA applications to capture GPU compute metrics and trace events.
 
@@ -22,7 +22,7 @@ The library intercepts CUDA driver API calls (specifically `cuLaunchKernel`) and
 The library can be injected into any unmodified CUDA application using the `CUDA_INJECTION64_PATH` environment variable.
 
 ```bash
-CUDA_INJECTION64_PATH=target/release/libperfetto_cupti_gpu_compute.so /path/to/example_cuda_app
+CUDA_INJECTION64_PATH=target/release/libperfetto_gpu_compute_injection.so /path/to/example_cuda_app
 ```
 
 ## Environment Variables

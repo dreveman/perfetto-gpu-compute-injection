@@ -21,7 +21,10 @@ use std::{collections::HashMap, sync::Mutex};
 /// Represents a specific kernel launch event.
 pub struct KernelLaunch {
     pub function: CUfunction,
-    pub timestamp: u64,
+    /// Trace timestamp captured just before range profiler push (when counters enabled).
+    pub start: u64,
+    /// Trace timestamp captured after range profiler pop completes all passes (when counters enabled).
+    pub end: u64,
 }
 
 /// Detailed activity information for a kernel execution.
@@ -34,6 +37,10 @@ pub struct KernelActivity {
     pub registers_per_thread: u16,
     pub dynamic_shared_memory: i32,
     pub static_shared_memory: i32,
+    /// Kernel execution start timestamp (nanoseconds).
+    pub start: u64,
+    /// Kernel execution end timestamp (nanoseconds).
+    pub end: u64,
 }
 
 /// Profiling data associated with a specific CUDA context.

@@ -32,6 +32,20 @@ pub unsafe fn activity_register_callbacks(
     Ok(())
 }
 
+/// Registers a custom timestamp callback for CUPTI activity records.
+///
+/// This allows activity records to use timestamps from a custom source
+/// (e.g., trace clock) instead of the default CUPTI timestamps.
+/// # Safety
+///
+/// The function pointer must be valid and remain valid for the lifetime of the activity session.
+pub unsafe fn activity_register_timestamp_callback(
+    func_timestamp: CUpti_TimestampCallbackFunc,
+) -> Result<(), CUptiResult> {
+    check_cupti!(unsafe { cuptiActivityRegisterTimestampCallback(func_timestamp) });
+    Ok(())
+}
+
 /// Flushes all CUPTI activity buffers.
 pub fn activity_flush_all(flag: u32) -> Result<(), CUptiResult> {
     check_cupti!(unsafe { cuptiActivityFlushAll(flag) });

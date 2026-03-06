@@ -19,7 +19,7 @@ use perfetto_sdk::data_source::{
 use std::{
     env,
     sync::{
-        atomic::{AtomicU64, AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
         OnceLock,
     },
 };
@@ -40,35 +40,106 @@ pub fn get_next_event_id() -> u64 {
 /// Tracks whether the first counters have been received for a given data source instance.
 pub static GOT_FIRST_COUNTERS: AtomicU8 = AtomicU8::new(0);
 
-static GPU_COUNTERS_DATA_SOURCE: OnceLock<DataSource> = OnceLock::new();
-static DATA_SOURCE_NAME: OnceLock<String> = OnceLock::new();
-const DEFAULT_DATA_SOURCE_NAME: &str = "gpu.counters";
+/// Tracks whether the first renderstages have been emitted for a given data source instance.
+pub static GOT_FIRST_RENDERSTAGES: AtomicU8 = AtomicU8::new(0);
 
-/// Returns the data source name, reading from `INJECTION_DATA_SOURCE_NAME` env var or using default.
-fn get_data_source_name() -> &'static str {
-    DATA_SOURCE_NAME.get_or_init(|| {
-        env::var("INJECTION_DATA_SOURCE_NAME")
-            .unwrap_or_else(|_| DEFAULT_DATA_SOURCE_NAME.to_string())
+/// Atomic state tracking for whether counters data source is enabled.
+static COUNTERS_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Atomic state tracking for whether renderstages data source is enabled.
+static RENDERSTAGES_ENABLED: AtomicBool = AtomicBool::new(false);
+
+static GPU_COUNTERS_DATA_SOURCE: OnceLock<DataSource> = OnceLock::new();
+static GPU_RENDERSTAGES_DATA_SOURCE: OnceLock<DataSource> = OnceLock::new();
+
+static DATA_SOURCE_NAME_SUFFIX: OnceLock<String> = OnceLock::new();
+static COUNTERS_DATA_SOURCE_NAME: OnceLock<String> = OnceLock::new();
+static RENDERSTAGES_DATA_SOURCE_NAME: OnceLock<String> = OnceLock::new();
+
+/// Default suffix for data source names.
+/// Since this library uses CUPTI (CUDA Profiling Tools Interface), which is
+/// exclusively for NVIDIA GPUs, the default vendor suffix is "nv".
+const DEFAULT_DATA_SOURCE_NAME_SUFFIX: &str = "nv";
+
+/// Returns the data source name suffix, reading from `INJECTION_DATA_SOURCE_NAME_SUFFIX` env var or using default.
+fn get_data_source_name_suffix() -> &'static str {
+    DATA_SOURCE_NAME_SUFFIX.get_or_init(|| {
+        env::var("INJECTION_DATA_SOURCE_NAME_SUFFIX")
+            .unwrap_or_else(|_| DEFAULT_DATA_SOURCE_NAME_SUFFIX.to_string())
     })
 }
 
-/// Initializes and retrieves the static Perfetto data source.
+/// Returns the counters data source name in the format `gpu.counters.SUFFIX`.
+fn get_counters_data_source_name() -> &'static str {
+    COUNTERS_DATA_SOURCE_NAME
+        .get_or_init(|| format!("gpu.counters.{}", get_data_source_name_suffix()))
+}
+
+/// Returns the renderstages data source name in the format `gpu.renderstages.SUFFIX`.
+fn get_renderstages_data_source_name() -> &'static str {
+    RENDERSTAGES_DATA_SOURCE_NAME
+        .get_or_init(|| format!("gpu.renderstages.{}", get_data_source_name_suffix()))
+}
+
+/// Initializes and retrieves the static Perfetto counters data source.
 ///
 /// This function is thread-safe and ensures the data source is registered only once.
-/// The data source name can be overridden via the `INJECTION_DATA_SOURCE_NAME` environment variable.
-pub fn get_data_source() -> &'static DataSource<'static> {
+/// The data source name suffix can be overridden via the `INJECTION_DATA_SOURCE_NAME_SUFFIX`
+/// environment variable (default: "nv", resulting in "gpu.counters.nv").
+pub fn get_counters_data_source() -> &'static DataSource<'static> {
     GPU_COUNTERS_DATA_SOURCE.get_or_init(|| {
         let data_source_args = DataSourceArgsBuilder::new()
             .buffer_exhausted_policy(DataSourceBufferExhaustedPolicy::StallAndAbort)
             .on_start(move |inst_id, _| {
                 GOT_FIRST_COUNTERS.fetch_and(!(1 << inst_id), Ordering::SeqCst);
+                COUNTERS_ENABLED.store(true, Ordering::SeqCst);
+            })
+            .on_stop(move |_inst_id, _| {
+                COUNTERS_ENABLED.store(false, Ordering::SeqCst);
             });
         let mut data_source = DataSource::new();
         data_source
-            .register(get_data_source_name(), data_source_args.build())
-            .expect("failed to register data source");
+            .register(get_counters_data_source_name(), data_source_args.build())
+            .expect("failed to register counters data source");
         data_source
     })
+}
+
+/// Initializes and retrieves the static Perfetto renderstages data source.
+///
+/// This function is thread-safe and ensures the data source is registered only once.
+/// The data source name suffix can be overridden via the `INJECTION_DATA_SOURCE_NAME_SUFFIX`
+/// environment variable (default: "nv", resulting in "gpu.renderstages.nv").
+pub fn get_renderstages_data_source() -> &'static DataSource<'static> {
+    GPU_RENDERSTAGES_DATA_SOURCE.get_or_init(|| {
+        let data_source_args = DataSourceArgsBuilder::new()
+            .buffer_exhausted_policy(DataSourceBufferExhaustedPolicy::StallAndAbort)
+            .on_start(move |inst_id, _| {
+                GOT_FIRST_RENDERSTAGES.fetch_and(!(1 << inst_id), Ordering::SeqCst);
+                RENDERSTAGES_ENABLED.store(true, Ordering::SeqCst);
+            })
+            .on_stop(move |_inst_id, _| {
+                RENDERSTAGES_ENABLED.store(false, Ordering::SeqCst);
+            });
+        let mut data_source = DataSource::new();
+        data_source
+            .register(
+                get_renderstages_data_source_name(),
+                data_source_args.build(),
+            )
+            .expect("failed to register renderstages data source");
+        data_source
+    })
+}
+
+/// Checks if counters collection is active.
+pub fn is_counters_enabled() -> bool {
+    COUNTERS_ENABLED.load(Ordering::SeqCst)
+}
+
+/// Checks if renderstages collection is active.
+pub fn is_renderstages_enabled() -> bool {
+    RENDERSTAGES_ENABLED.load(Ordering::SeqCst)
 }
 
 /// Returns the current timestamp in nanoseconds from the trace clock.
@@ -96,5 +167,15 @@ mod tests {
         let id2 = get_next_event_id();
         assert_eq!(id2, id1 + 1);
         assert!(id1 > 0);
+    }
+
+    #[test]
+    fn test_counters_enabled_default() {
+        assert!(!is_counters_enabled());
+    }
+
+    #[test]
+    fn test_renderstages_enabled_default() {
+        assert!(!is_renderstages_enabled());
     }
 }

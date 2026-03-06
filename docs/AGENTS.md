@@ -9,7 +9,7 @@ This file provides guidance for AI Agents.
 cargo build --release
 ```
 
-The output artifact is `target/release/libperfetto_cupti_gpu_compute.so`.
+The output artifact is `target/release/libperfetto_gpu_compute_injection.so`.
 
 ## Testing
 
@@ -83,7 +83,7 @@ Hardware Counter Collection → Metric Evaluation → Perfetto TracePackets
 ## Usage
 
 ```bash
-CUDA_INJECTION64_PATH=target/release/libperfetto_cupti_gpu_compute.so \
+CUDA_INJECTION64_PATH=target/release/libperfetto_gpu_compute_injection.so \
 INJECTION_VERBOSE=1 \
 /path/to/cuda_app
 ```

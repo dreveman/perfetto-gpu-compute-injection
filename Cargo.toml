@@ -1,5 +1,5 @@
 [package]
-name = "perfetto-cupti-gpu-compute"
+name = "perfetto-gpu-compute-injection"
 version = "0.1.0"
 edition = "2021"
 

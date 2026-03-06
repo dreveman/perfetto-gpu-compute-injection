@@ -72,8 +72,8 @@ jobs:
     - name: Upload library
       uses: actions/upload-artifact@v4
       with:
-        name: perfetto_cupti_gpu_compute-linux-x86_64
-        path: target/release/libperfetto_cupti_gpu_compute.so
+        name: perfetto_gpu_compute_injection-linux-x86_64
+        path: target/release/libperfetto_gpu_compute_injection.so
 
   nightly-release:
     name: Nightly Release
@@ -88,13 +88,13 @@ jobs:
     - name: Download artifact
       uses: actions/download-artifact@v4
       with:
-        name: perfetto_cupti_gpu_compute-linux-x86_64
+        name: perfetto_gpu_compute_injection-linux-x86_64
         path: artifacts
 
     - name: Prepare release assets
       run: |
         cd artifacts
-        tar -czvf libperfetto_cupti_gpu_compute-linux-x86_64.tar.gz libperfetto_cupti_gpu_compute.so
+        tar -czvf libperfetto_gpu_compute_injection-linux-x86_64.tar.gz libperfetto_gpu_compute_injection.so
 
     - name: Delete existing nightly release
       env:
@@ -115,13 +115,13 @@ jobs:
         **Commit:** ${{ github.sha }}
 
         ## Assets
-        - \`libperfetto_cupti_gpu_compute-linux-x86_64.tar.gz\` - Prebuilt shared library for Linux x86_64
+        - \`libperfetto_gpu_compute_injection-linux-x86_64.tar.gz\` - Prebuilt shared library for Linux x86_64
 
         ## Usage
         \`\`\`bash
-        tar -xzf libperfetto_cupti_gpu_compute-linux-x86_64.tar.gz
-        CUDA_INJECTION64_PATH=\$(pwd)/libperfetto_cupti_gpu_compute.so /path/to/cuda_app
+        tar -xzf libperfetto_gpu_compute_injection-linux-x86_64.tar.gz
+        CUDA_INJECTION64_PATH=\$(pwd)/libperfetto_gpu_compute_injection.so /path/to/cuda_app
         \`\`\`
         " \
           --prerelease \
-          artifacts/libperfetto_cupti_gpu_compute-linux-x86_64.tar.gz
+          artifacts/libperfetto_gpu_compute_injection-linux-x86_64.tar.gz

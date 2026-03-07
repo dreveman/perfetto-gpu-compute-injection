@@ -37,12 +37,16 @@ use perfetto_sdk::{
 };
 use perfetto_sdk_protos_gpu::protos::{
     common::gpu_counter_descriptor::{
-        GpuCounterDescriptor, GpuCounterDescriptorGpuCounterGroup, GpuCounterSpec,
+        GpuCounterDescriptor, GpuCounterDescriptorGpuCounterGroup,
+        GpuCounterDescriptorGpuCounterSpec,
     },
     trace::{
         gpu::{
-            gpu_counter_event::{GpuCounter, GpuCounterEvent},
-            gpu_render_stage_event::{Description, ExtraData, GpuRenderStageEvent, Specifications},
+            gpu_counter_event::{GpuCounterEvent, GpuCounterEventGpuCounter},
+            gpu_render_stage_event::{
+                GpuRenderStageEvent, GpuRenderStageEventExtraData,
+                GpuRenderStageEventSpecifications, GpuRenderStageEventSpecificationsDescription,
+            },
         },
         trace_packet::TracePacketExt,
     },
@@ -116,7 +120,7 @@ extern "C" fn end_execution() {
                                                     for (i, metric) in
                                                         range.metric_and_values.iter().enumerate()
                                                     {
-                                                        desc.set_specs(|desc: &mut GpuCounterSpec| {
+                                                        desc.set_specs(|desc: &mut GpuCounterDescriptorGpuCounterSpec| {
                                                             desc.set_counter_id(i as u32);
                                                             desc.set_name(&metric.metric_name);
                                                             desc.set_groups(
@@ -137,7 +141,7 @@ extern "C" fn end_execution() {
                                         for (i, _metric) in
                                             range.metric_and_values.iter().enumerate()
                                         {
-                                            event.set_counters(|counter: &mut GpuCounter| {
+                                            event.set_counters(|counter: &mut GpuCounterEventGpuCounter| {
                                                 counter.set_counter_id(i as u32).set_int_value(0);
                                             });
                                         }
@@ -150,7 +154,7 @@ extern "C" fn end_execution() {
                                     .set_gpu_counter_event(|event: &mut GpuCounterEvent| {
                                         for (i, metric) in range.metric_and_values.iter().enumerate()
                                         {
-                                            event.set_counters(|counter: &mut GpuCounter| {
+                                            event.set_counters(|counter: &mut GpuCounterEventGpuCounter| {
                                                 counter
                                                     .set_counter_id(i as u32)
                                                     .set_double_value(metric.value);
@@ -396,7 +400,7 @@ extern "C" fn end_execution() {
                                             .set_hw_queue_id(0)
                                             .set_stage_id(0);
                                         extra_data(&mut |name: &str, value: &str| {
-                                            event.set_extra_data(|extra_data: &mut ExtraData| {
+                                            event.set_extra_data(|extra_data: &mut GpuRenderStageEventExtraData| {
                                                 extra_data.set_name(name);
                                                 extra_data.set_value(value);
                                             });
@@ -404,12 +408,12 @@ extern "C" fn end_execution() {
                                         if was_cleared
                                             || got_first_renderstages & (1 << inst_id) == 0
                                         {
-                                            event.set_specifications(|specs: &mut Specifications| {
+                                            event.set_specifications(|specs: &mut GpuRenderStageEventSpecifications| {
                                                 specs
-                                                    .set_hw_queue(|desc: &mut Description| {
+                                                    .set_hw_queue(|desc: &mut GpuRenderStageEventSpecificationsDescription| {
                                                         desc.set_name("Queue (0)");
                                                     })
-                                                    .set_stage(|desc: &mut Description| {
+                                                    .set_stage(|desc: &mut GpuRenderStageEventSpecificationsDescription| {
                                                         desc.set_name("Kernel");
                                                     });
                                             });

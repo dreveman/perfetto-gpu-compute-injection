@@ -31,7 +31,7 @@ typedef int CUpti_CallbackId;
 #define CUPTI_SUCCESS 0
 
 typedef struct {
-  void *pCounterAvailabilityImage;
+  void* pCounterAvailabilityImage;
   size_t counterAvailabilityImageSize;
 } CUpti_Profiler_GetCounterAvailability_Params;
 
@@ -61,38 +61,39 @@ typedef void CUpti_RangeProfiler_CounterDataImage_Initialize_Params;
 typedef void CUpti_RangeProfiler_DecodeData_Params;
 typedef void CUpti_RangeProfiler_GetCounterDataInfo_Params;
 typedef void CUpti_RangeProfiler_CounterData_GetRangeInfo_Params;
-typedef void *CUpti_SubscriberHandle;
-typedef void (*CUpti_CallbackFunc)(void *userdata, CUpti_CallbackDomain domain,
-                                   CUpti_CallbackId cbid, const void *cbdata);
-typedef void (*CUpti_BuffersCallbackRequestFunc)(uint8_t **buffer, size_t *size,
-                                                 size_t *maxNumRecords);
-typedef void (*CUpti_BuffersCallbackCompleteFunc)(uint8_t *buffer, size_t size,
+typedef void* CUpti_SubscriberHandle;
+typedef void (*CUpti_CallbackFunc)(void* userdata, CUpti_CallbackDomain domain,
+                                   CUpti_CallbackId cbid, const void* cbdata);
+typedef void (*CUpti_BuffersCallbackRequestFunc)(uint8_t** buffer, size_t* size,
+                                                 size_t* maxNumRecords);
+typedef void (*CUpti_BuffersCallbackCompleteFunc)(uint8_t* buffer, size_t size,
                                                   size_t validSize);
+typedef uint64_t (*CUpti_TimestampCallbackFunc)(void);
 typedef void CUpti_Activity;
 
 // Define stubs for CUDA/CUPTI functions used in Rust
 
 extern "C" {
 
-CUresult cuCtxGetDevice(CUdevice *device) {
+CUresult cuCtxGetDevice(CUdevice* device) {
   (void)device;
   return CUDA_SUCCESS;
 }
-CUresult cuDeviceGetAttribute(int *pi, CUdevice_attribute attrib,
+CUresult cuDeviceGetAttribute(int* pi, CUdevice_attribute attrib,
                               CUdevice dev) {
   (void)attrib;
   (void)dev;
   *pi = 0;
   return CUDA_SUCCESS;
 }
-CUresult cuFuncGetAttribute(int *pi, CUfunction_attribute attrib,
+CUresult cuFuncGetAttribute(int* pi, CUfunction_attribute attrib,
                             CUfunction hfunc) {
   (void)attrib;
   (void)hfunc;
   *pi = 0;
   return CUDA_SUCCESS;
 }
-CUresult cuOccupancyMaxActiveBlocksPerMultiprocessor(int *numBlocks,
+CUresult cuOccupancyMaxActiveBlocksPerMultiprocessor(int* numBlocks,
                                                      CUfunction func,
                                                      int blockSize,
                                                      size_t dynamicSMemSize) {
@@ -103,55 +104,55 @@ CUresult cuOccupancyMaxActiveBlocksPerMultiprocessor(int *numBlocks,
   return CUDA_SUCCESS;
 }
 
-CUptiResult cuptiProfilerInitialize(CUpti_Profiler_Initialize_Params *pParams) {
+CUptiResult cuptiProfilerInitialize(CUpti_Profiler_Initialize_Params* pParams) {
   (void)pParams;
   return CUPTI_SUCCESS;
 }
 CUptiResult cuptiProfilerDeInitialize(
-    CUpti_Profiler_DeInitialize_Params *pParams) {
+    CUpti_Profiler_DeInitialize_Params* pParams) {
   (void)pParams;
   return CUPTI_SUCCESS;
 }
 
 CUptiResult cuptiProfilerHostInitialize(
-    CUpti_Profiler_Host_Initialize_Params *pParams) {
+    CUpti_Profiler_Host_Initialize_Params* pParams) {
   (void)pParams;
   return CUPTI_SUCCESS;
 }
 CUptiResult cuptiProfilerHostDeinitialize(
-    CUpti_Profiler_Host_Deinitialize_Params *pParams) {
+    CUpti_Profiler_Host_Deinitialize_Params* pParams) {
   (void)pParams;
   return CUPTI_SUCCESS;
 }
 CUptiResult cuptiProfilerHostConfigAddMetrics(
-    CUpti_Profiler_Host_ConfigAddMetrics_Params *pParams) {
+    CUpti_Profiler_Host_ConfigAddMetrics_Params* pParams) {
   (void)pParams;
   return CUPTI_SUCCESS;
 }
 CUptiResult cuptiProfilerHostGetConfigImageSize(
-    CUpti_Profiler_Host_GetConfigImageSize_Params *pParams) {
+    CUpti_Profiler_Host_GetConfigImageSize_Params* pParams) {
   pParams->configImageSize = 100;  // Mock size
   return CUPTI_SUCCESS;
 }
 CUptiResult cuptiProfilerHostGetConfigImage(
-    CUpti_Profiler_Host_GetConfigImage_Params *pParams) {
+    CUpti_Profiler_Host_GetConfigImage_Params* pParams) {
   (void)pParams;
   return CUPTI_SUCCESS;
 }
 CUptiResult cuptiProfilerHostEvaluateToGpuValues(
-    CUpti_Profiler_Host_EvaluateToGpuValues_Params *pParams) {
+    CUpti_Profiler_Host_EvaluateToGpuValues_Params* pParams) {
   (void)pParams;
   return CUPTI_SUCCESS;
 }
 
-CUptiResult cuptiDeviceGetChipName(CUpti_Device_GetChipName_Params *pParams) {
+CUptiResult cuptiDeviceGetChipName(CUpti_Device_GetChipName_Params* pParams) {
   // Mock chip name
   (void)pParams;
   return CUPTI_SUCCESS;
 }
 
 CUptiResult cuptiProfilerGetCounterAvailability(
-    CUpti_Profiler_GetCounterAvailability_Params *pParams) {
+    CUpti_Profiler_GetCounterAvailability_Params* pParams) {
   if (pParams->pCounterAvailabilityImage == 0) {
     pParams->counterAvailabilityImageSize = 100;
   }
@@ -159,68 +160,68 @@ CUptiResult cuptiProfilerGetCounterAvailability(
 }
 
 CUptiResult cuptiRangeProfilerEnable(
-    CUpti_RangeProfiler_Enable_Params *pParams) {
+    CUpti_RangeProfiler_Enable_Params* pParams) {
   (void)pParams;
   return CUPTI_SUCCESS;
 }
 CUptiResult cuptiRangeProfilerDisable(
-    CUpti_RangeProfiler_Disable_Params *pParams) {
+    CUpti_RangeProfiler_Disable_Params* pParams) {
   (void)pParams;
   return CUPTI_SUCCESS;
 }
-CUptiResult cuptiRangeProfilerStart(CUpti_RangeProfiler_Start_Params *pParams) {
+CUptiResult cuptiRangeProfilerStart(CUpti_RangeProfiler_Start_Params* pParams) {
   (void)pParams;
   return CUPTI_SUCCESS;
 }
-CUptiResult cuptiRangeProfilerStop(CUpti_RangeProfiler_Stop_Params *pParams) {
+CUptiResult cuptiRangeProfilerStop(CUpti_RangeProfiler_Stop_Params* pParams) {
   (void)pParams;
   return CUPTI_SUCCESS;
 }
 CUptiResult cuptiRangeProfilerSetConfig(
-    CUpti_RangeProfiler_SetConfig_Params *pParams) {
+    CUpti_RangeProfiler_SetConfig_Params* pParams) {
   (void)pParams;
   return CUPTI_SUCCESS;
 }
 CUptiResult cuptiRangeProfilerGetCounterDataSize(
-    CUpti_RangeProfiler_GetCounterDataSize_Params *pParams) {
+    CUpti_RangeProfiler_GetCounterDataSize_Params* pParams) {
   pParams->counterDataSize = 100;
   return CUPTI_SUCCESS;
 }
 CUptiResult cuptiRangeProfilerCounterDataImageInitialize(
-    CUpti_RangeProfiler_CounterDataImage_Initialize_Params *pParams) {
+    CUpti_RangeProfiler_CounterDataImage_Initialize_Params* pParams) {
   (void)pParams;
   return CUPTI_SUCCESS;
 }
 CUptiResult cuptiRangeProfilerDecodeData(
-    CUpti_RangeProfiler_DecodeData_Params *pParams) {
+    CUpti_RangeProfiler_DecodeData_Params* pParams) {
   (void)pParams;
   return CUPTI_SUCCESS;
 }
 CUptiResult cuptiRangeProfilerGetCounterDataInfo(
-    CUpti_RangeProfiler_GetCounterDataInfo_Params *pParams) {
+    CUpti_RangeProfiler_GetCounterDataInfo_Params* pParams) {
   (void)pParams;
   return CUPTI_SUCCESS;
 }
 CUptiResult cuptiRangeProfilerCounterDataGetRangeInfo(
-    CUpti_RangeProfiler_CounterData_GetRangeInfo_Params *pParams) {
+    CUpti_RangeProfiler_CounterData_GetRangeInfo_Params* pParams) {
   (void)pParams;
   return CUPTI_SUCCESS;
 }
 
-CUptiResult cuptiGetContextId(CUcontext context, uint32_t *contextId) {
+CUptiResult cuptiGetContextId(CUcontext context, uint32_t* contextId) {
   (void)context;
   *contextId = 1;
   return CUPTI_SUCCESS;
 }
 CUptiResult cuptiGetLastError() { return CUPTI_SUCCESS; }
-CUptiResult cuptiGetResultString(CUptiResult result, const char **str) {
+CUptiResult cuptiGetResultString(CUptiResult result, const char** str) {
   (void)result;
   *str = "Success";
   return CUPTI_SUCCESS;
 }
 
-CUptiResult cuptiSubscribe(CUpti_SubscriberHandle *subscriber,
-                           CUpti_CallbackFunc callback, void *userdata) {
+CUptiResult cuptiSubscribe(CUpti_SubscriberHandle* subscriber,
+                           CUpti_CallbackFunc callback, void* userdata) {
   (void)subscriber;
   (void)callback;
   (void)userdata;
@@ -256,13 +257,18 @@ CUptiResult cuptiActivityRegisterCallbacks(
   (void)funcBufferCompleted;
   return CUPTI_SUCCESS;
 }
+CUptiResult cuptiActivityRegisterTimestampCallback(
+    CUpti_TimestampCallbackFunc funcTimestamp) {
+  (void)funcTimestamp;
+  return CUPTI_SUCCESS;
+}
 CUptiResult cuptiActivityFlushAll(uint32_t flag) {
   (void)flag;
   return CUPTI_SUCCESS;
 }
-CUptiResult cuptiActivityGetNextRecord(uint8_t *buffer,
+CUptiResult cuptiActivityGetNextRecord(uint8_t* buffer,
                                        size_t validBufferSizeBytes,
-                                       CUpti_Activity **record) {
+                                       CUpti_Activity** record) {
   (void)buffer;
   (void)validBufferSizeBytes;
   (void)record;

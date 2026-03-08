@@ -81,19 +81,7 @@ extern "C" fn end_execution() {
         // and only decode counter data and evaluate metrics if counters are enabled
         if counters_enabled {
             for (_, data) in state.context_data.iter_mut() {
-                if data.is_active {
-                    if let Some(rp) = &mut data.range_profiler {
-                        let _ = rp.stop();
-                        let _ = rp.decode_counter_data();
-                        if let Some(me) = &data.metric_evaluator {
-                            if let Ok(infos) =
-                                me.evaluate_all_ranges(&data.counter_data_image, &metric_names)
-                            {
-                                data.range_info.extend(infos);
-                            }
-                        }
-                    }
-                }
+                data.finalize_profiler(&metric_names, false);
                 // Finalize the last kernel launch with end timestamp
                 if let Some(last_launch) = data.kernel_launches.last_mut() {
                     if last_launch.end == 0 {

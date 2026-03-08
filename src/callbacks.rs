@@ -114,45 +114,7 @@ pub unsafe extern "C" fn profiler_callback_handler(
                             Some(active_ctx) if active_ctx != ctx => {
                                 let active_ctx_id = unsafe { profiler::get_context_id(active_ctx) };
                                 if let Some(old_data) = state.context_data.get_mut(&active_ctx_id) {
-                                    if let Some(rp) = &mut old_data.range_profiler {
-                                        let _ = rp.stop();
-                                        let _ = rp.decode_counter_data();
-                                        if let Some(me) = &old_data.metric_evaluator {
-                                            if let Ok(infos) = me.evaluate_all_ranges(
-                                                &old_data.counter_data_image,
-                                                &metric_names,
-                                            ) {
-                                                old_data.range_info.extend(infos);
-                                            }
-                                        }
-                                        let _ = rp.disable();
-                                    }
-                                    old_data.range_profiler = None;
-                                    old_data.is_active = false;
-                                }
-                                state.active_ctx = None;
-                            }
-                            _ => {}
-                        }
-                        match active_ctx {
-                            Some(active_ctx) if active_ctx != ctx => {
-                                let active_ctx_id = unsafe { profiler::get_context_id(active_ctx) };
-                                if let Some(old_data) = state.context_data.get_mut(&active_ctx_id) {
-                                    if let Some(rp) = &mut old_data.range_profiler {
-                                        let _ = rp.stop();
-                                        let _ = rp.decode_counter_data();
-                                        if let Some(me) = &old_data.metric_evaluator {
-                                            if let Ok(infos) = me.evaluate_all_ranges(
-                                                &old_data.counter_data_image,
-                                                &metric_names,
-                                            ) {
-                                                old_data.range_info.extend(infos);
-                                            }
-                                        }
-                                        let _ = rp.disable();
-                                    }
-                                    old_data.range_profiler = None;
-                                    old_data.is_active = false;
+                                    old_data.finalize_profiler(&metric_names, true);
                                 }
                                 state.active_ctx = None;
                             }
@@ -230,23 +192,7 @@ pub unsafe extern "C" fn profiler_callback_handler(
                         if let Some(active_ctx) = state.active_ctx {
                             let active_ctx_id = unsafe { profiler::get_context_id(active_ctx) };
                             if let Some(data) = state.context_data.get_mut(&active_ctx_id) {
-                                if data.is_active {
-                                    if let Some(rp) = &mut data.range_profiler {
-                                        let _ = rp.stop();
-                                        let _ = rp.decode_counter_data();
-                                        if let Some(me) = &data.metric_evaluator {
-                                            if let Ok(infos) = me.evaluate_all_ranges(
-                                                &data.counter_data_image,
-                                                &metric_names,
-                                            ) {
-                                                data.range_info.extend(infos);
-                                            }
-                                        }
-                                        let _ = rp.disable();
-                                    }
-                                    data.range_profiler = None;
-                                    data.is_active = false;
-                                }
+                                data.finalize_profiler(&metric_names, true);
                             }
                             state.active_ctx = None;
                         }
@@ -307,23 +253,7 @@ pub unsafe extern "C" fn profiler_callback_handler(
                 if let Ok(mut state) = GLOBAL_STATE.lock() {
                     let metric_names = state.config.metrics.clone();
                     if let Some(data) = state.context_data.get_mut(&ctx_id) {
-                        if data.is_active {
-                            if let Some(rp) = &mut data.range_profiler {
-                                let _ = rp.stop();
-                                let _ = rp.decode_counter_data();
-                                if let Some(me) = &data.metric_evaluator {
-                                    if let Ok(infos) = me.evaluate_all_ranges(
-                                        &data.counter_data_image,
-                                        &metric_names,
-                                    ) {
-                                        data.range_info.extend(infos);
-                                    }
-                                }
-                                let _ = rp.disable();
-                            }
-                            data.range_profiler = None;
-                            data.is_active = false;
-                        }
+                        data.finalize_profiler(&metric_names, true);
                     }
                 }
             }

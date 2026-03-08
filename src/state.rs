@@ -41,12 +41,61 @@ pub struct KernelActivity {
     pub start: u64,
     /// Kernel execution end timestamp (nanoseconds).
     pub end: u64,
+    /// CUDA device ID.
+    pub device_id: u32,
+    /// CUDA device UUID (16 bytes).
+    pub device_uuid: [u8; 16],
     /// CUDA context ID.
     pub context_id: u32,
+    /// CUDA stream ID.
+    pub stream_id: u32,
     /// Channel ID for the work submission channel.
     pub channel_id: u32,
     /// Channel type (compute, async memcpy, etc.).
     pub channel_type: u32,
+}
+
+impl KernelActivity {
+    /// Returns the device UUID as a hex string in standard UUID format.
+    pub fn device_uuid_string(&self) -> String {
+        format!(
+            "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+            self.device_uuid[0], self.device_uuid[1], self.device_uuid[2], self.device_uuid[3],
+            self.device_uuid[4], self.device_uuid[5],
+            self.device_uuid[6], self.device_uuid[7],
+            self.device_uuid[8], self.device_uuid[9],
+            self.device_uuid[10], self.device_uuid[11], self.device_uuid[12], self.device_uuid[13], self.device_uuid[14], self.device_uuid[15]
+        )
+    }
+
+    /// Returns a u32 gpu_id derived from the device UUID by XOR-folding.
+    pub fn gpu_id(&self) -> u32 {
+        let u0 = u32::from_le_bytes([
+            self.device_uuid[0],
+            self.device_uuid[1],
+            self.device_uuid[2],
+            self.device_uuid[3],
+        ]);
+        let u1 = u32::from_le_bytes([
+            self.device_uuid[4],
+            self.device_uuid[5],
+            self.device_uuid[6],
+            self.device_uuid[7],
+        ]);
+        let u2 = u32::from_le_bytes([
+            self.device_uuid[8],
+            self.device_uuid[9],
+            self.device_uuid[10],
+            self.device_uuid[11],
+        ]);
+        let u3 = u32::from_le_bytes([
+            self.device_uuid[12],
+            self.device_uuid[13],
+            self.device_uuid[14],
+            self.device_uuid[15],
+        ]);
+        u0 ^ u1 ^ u2 ^ u3
+    }
 }
 
 /// Profiling data associated with a specific CUDA context.

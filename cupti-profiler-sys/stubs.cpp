@@ -27,6 +27,10 @@ typedef int CUpti_ActivityKind;
 typedef int CUpti_CallbackDomain;
 typedef int CUpti_CallbackId;
 
+typedef struct {
+  char bytes[16];
+} CUuuid;
+
 #define CUDA_SUCCESS 0
 #define CUPTI_SUCCESS 0
 
@@ -101,6 +105,12 @@ CUresult cuOccupancyMaxActiveBlocksPerMultiprocessor(int* numBlocks,
   (void)blockSize;
   (void)dynamicSMemSize;
   *numBlocks = 1;
+  return CUDA_SUCCESS;
+}
+
+CUresult cuDeviceGetUuid_v2(CUuuid* uuid, CUdevice dev) {
+  (void)dev;
+  memset(uuid->bytes, 0, 16);
   return CUDA_SUCCESS;
 }
 

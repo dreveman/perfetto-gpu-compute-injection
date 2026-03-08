@@ -58,6 +58,8 @@ pub unsafe extern "C" fn buffer_completed(
                 if r.kind == CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL {
                     let k = &*(record as *const CUpti_ActivityKernel9);
                     if let Some(data) = state.context_data.get_mut(&k.contextId) {
+                        let device_uuid =
+                            profiler::get_device_uuid(k.deviceId as i32).unwrap_or([0u8; 16]);
                         data.kernel_activities.push(KernelActivity {
                             kernel_name: CStr::from_ptr(k.name).to_string_lossy().to_string(),
                             grid_size: (k.gridX, k.gridY, k.gridZ),
@@ -67,7 +69,10 @@ pub unsafe extern "C" fn buffer_completed(
                             static_shared_memory: k.staticSharedMemory,
                             start: k.start,
                             end: k.end,
+                            device_id: k.deviceId,
+                            device_uuid,
                             context_id: k.contextId,
+                            stream_id: k.streamId,
                             channel_id: k.channelID,
                             channel_type: k.channelType,
                         });

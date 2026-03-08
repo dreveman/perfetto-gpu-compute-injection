@@ -83,3 +83,14 @@ pub unsafe fn get_context_id(ctx: CUcontext) -> u32 {
     let _ = unsafe { cuptiGetContextId(ctx, &mut ctx_id) };
     ctx_id
 }
+
+/// Gets the UUID for a CUDA device as raw bytes.
+pub fn get_device_uuid(dev: CUdevice) -> Result<[u8; 16], u32> {
+    let mut uuid: CUuuid = CUuuid { bytes: [0; 16] };
+    let res = unsafe { cuDeviceGetUuid_v2(&mut uuid, dev) };
+    if res != 0 {
+        return Err(res);
+    }
+    // Convert c_char bytes to u8 bytes
+    Ok(unsafe { std::mem::transmute::<[i8; 16], [u8; 16]>(uuid.bytes) })
+}

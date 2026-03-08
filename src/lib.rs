@@ -52,7 +52,8 @@ use perfetto_sdk_protos_gpu::protos::{
             gpu_render_stage_event::{
                 GpuRenderStageEvent, GpuRenderStageEventExtraData,
                 InternedGpuRenderStageSpecification,
-                InternedGpuRenderStageSpecificationRenderStageCategory,
+                InternedGpuRenderStageSpecificationRenderStageCategory, InternedGraphicsContext,
+                InternedGraphicsContextApi,
             },
         },
         interned_data::interned_data::prelude::*,
@@ -95,8 +96,14 @@ extern "C" fn end_execution() {
         get_counters_data_source().trace(|ctx: &mut TraceContext| {
             let inst_id = ctx.instance_index();
             for (_, data) in state.context_data.iter() {
-                for (range, launch) in data.range_info.iter().zip(data.kernel_launches.iter()) {
+                for ((range, launch), activity) in data
+                    .range_info
+                    .iter()
+                    .zip(data.kernel_launches.iter())
+                    .zip(data.kernel_activities.iter())
+                {
                     let duration_ns = launch.end.saturating_sub(launch.start);
+                    let gpu_id = activity.gpu_id() as i32;
 
                     let got_first_counters =
                         GOT_FIRST_COUNTERS.fetch_or(1 << inst_id, Ordering::SeqCst);
@@ -106,8 +113,9 @@ extern "C" fn end_execution() {
                                 .set_timestamp(launch.start)
                                 .set_timestamp_clock_id(BuiltinClock::BuiltinClockBoottime.into())
                                 .set_gpu_counter_event(|event: &mut GpuCounterEvent| {
-                                    event.set_counter_descriptor(
-                                        |desc: &mut GpuCounterDescriptor| {
+                                    event
+                                        .set_gpu_id(gpu_id)
+                                        .set_counter_descriptor(|desc: &mut GpuCounterDescriptor| {
                                             for (i, metric) in
                                                 range.metric_and_values.iter().enumerate()
                                             {
@@ -121,8 +129,7 @@ extern "C" fn end_execution() {
                                                     },
                                                 );
                                             }
-                                        },
-                                    );
+                                        });
                                 });
                         });
 
@@ -142,6 +149,7 @@ extern "C" fn end_execution() {
                             .set_timestamp(launch.start)
                             .set_timestamp_clock_id(BuiltinClock::BuiltinClockBoottime.into())
                             .set_gpu_counter_event(|event: &mut GpuCounterEvent| {
+                                event.set_gpu_id(gpu_id);
                                 for (i, _metric) in range.metric_and_values.iter().enumerate() {
                                     event.set_counters(|counter: &mut GpuCounterEventGpuCounter| {
                                         counter.set_counter_id(i as u32).set_int_value(0);
@@ -154,6 +162,7 @@ extern "C" fn end_execution() {
                             .set_timestamp(launch.end)
                             .set_timestamp_clock_id(BuiltinClock::BuiltinClockBoottime.into())
                             .set_gpu_counter_event(|event: &mut GpuCounterEvent| {
+                                event.set_gpu_id(gpu_id);
                                 for (i, metric) in range.metric_and_values.iter().enumerate() {
                                     event.set_counters(|counter: &mut GpuCounterEventGpuCounter| {
                                         counter
@@ -306,7 +315,10 @@ extern "C" fn end_execution() {
                         emit("kernel_type", "Compute");
                         emit("process_id", &process_id.to_string());
                         emit("process_name", &process_name);
+                        emit("device_id", &activity.device_id.to_string());
+                        emit("device_uuid", &activity.device_uuid_string());
                         emit("context_id", &activity.context_id.to_string());
+                        emit("stream_id", &activity.stream_id.to_string());
                         emit("channel_id", &activity.channel_id.to_string());
                         emit("channel_type", &activity.channel_type.to_string());
                         emit("arch", &format!("CC_{}{}", major, minor));
@@ -396,8 +408,12 @@ extern "C" fn end_execution() {
                         GOT_FIRST_RENDERSTAGES.fetch_or(1 << inst_id, Ordering::SeqCst);
                     ctx.with_incremental_state(|ctx: &mut TraceContext, inc_state| {
                         let was_cleared = std::mem::replace(&mut inc_state.was_cleared, false);
-                        // Use channel_id + 1 as hw_queue_iid (0 is reserved)
-                        let hw_queue_iid = activity.channel_id as u64 + 1;
+                        // Stage IIDs use range 1-999, HW queue IIDs use range 1000+
+                        const KERNEL_STAGE_IID: u64 = 1;
+                        const HW_QUEUE_IID_OFFSET: u64 = 1000;
+                        let hw_queue_iid = activity.channel_id as u64 + HW_QUEUE_IID_OFFSET;
+                        let context_iid = activity.context_id as u64;
+                        let gpu_id = activity.gpu_id() as i32;
                         ctx.add_packet(|packet: &mut TracePacket| {
                             packet
                                 .set_timestamp(timestamp)
@@ -406,8 +422,10 @@ extern "C" fn end_execution() {
                                     event
                                         .set_event_id(get_next_event_id())
                                         .set_duration(duration_ns)
+                                        .set_gpu_id(gpu_id)
                                         .set_hw_queue_iid(hw_queue_iid)
-                                        .set_stage_iid(1);
+                                        .set_stage_iid(KERNEL_STAGE_IID)
+                                        .set_context(context_iid);
                                     extra_data(&mut |name: &str, value: &str| {
                                         event.set_extra_data(
                                             |extra_data: &mut GpuRenderStageEventExtraData| {
@@ -422,9 +440,20 @@ extern "C" fn end_execution() {
                                     TracePacketSequenceFlags::SeqIncrementalStateCleared as u32,
                                 );
                                 packet.set_interned_data(|interned: &mut InternedData| {
+                                    // Emit graphics context for each unique CUDA context
+                                    for context_id in &contexts {
+                                        interned.set_graphics_contexts(
+                                            |ctx: &mut InternedGraphicsContext| {
+                                                ctx.set_iid(*context_id as u64);
+                                                ctx.set_pid(process_id);
+                                                ctx.set_api(InternedGraphicsContextApi::Undefined);
+                                            },
+                                        );
+                                    }
                                     // Emit hw_queue specification for each unique channel
+                                    // HW queue IIDs start at 1000 to avoid conflict with stage IIDs
                                     for (channel_id, channel_type) in &channels {
-                                        let queue_iid = *channel_id as u64 + 1;
+                                        let queue_iid = *channel_id as u64 + HW_QUEUE_IID_OFFSET;
                                         let queue_category = match *channel_type {
                                             1 => InternedGpuRenderStageSpecificationRenderStageCategory::Compute,
                                             _ => InternedGpuRenderStageSpecificationRenderStageCategory::Other,
@@ -432,15 +461,15 @@ extern "C" fn end_execution() {
                                         interned.set_gpu_specifications(
                                             |spec: &mut InternedGpuRenderStageSpecification| {
                                                 spec.set_iid(queue_iid);
-                                                spec.set_name(&format!("Channel ({})", channel_id));
+                                                spec.set_name(format!("Channel ({})", channel_id));
                                                 spec.set_category(queue_category);
                                             },
                                         );
                                     }
-                                    // Emit stage specification (iid=1 for Kernel stage)
+                                    // Emit stage specification for Kernel stage
                                     interned.set_gpu_specifications(
                                         |spec: &mut InternedGpuRenderStageSpecification| {
-                                            spec.set_iid(1);
+                                            spec.set_iid(KERNEL_STAGE_IID);
                                             spec.set_name("Kernel");
                                             spec.set_description("CUDA Kernel");
                                             spec.set_category(

@@ -41,6 +41,12 @@ pub struct KernelActivity {
     pub start: u64,
     /// Kernel execution end timestamp (nanoseconds).
     pub end: u64,
+    /// CUDA context ID.
+    pub context_id: u32,
+    /// Channel ID for the work submission channel.
+    pub channel_id: u32,
+    /// Channel type (compute, async memcpy, etc.).
+    pub channel_type: u32,
 }
 
 /// Profiling data associated with a specific CUDA context.

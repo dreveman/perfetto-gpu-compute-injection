@@ -56,7 +56,7 @@ pub unsafe extern "C" fn buffer_completed(
             {
                 let r = &*record;
                 if r.kind == CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL {
-                    let k = &*(record as *const CUpti_ActivityKernel4);
+                    let k = &*(record as *const CUpti_ActivityKernel9);
                     if let Some(data) = state.context_data.get_mut(&k.contextId) {
                         data.kernel_activities.push(KernelActivity {
                             kernel_name: CStr::from_ptr(k.name).to_string_lossy().to_string(),
@@ -67,6 +67,9 @@ pub unsafe extern "C" fn buffer_completed(
                             static_shared_memory: k.staticSharedMemory,
                             start: k.start,
                             end: k.end,
+                            context_id: k.contextId,
+                            channel_id: k.channelID,
+                            channel_type: k.channelType,
                         });
                     }
                 }

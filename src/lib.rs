@@ -185,6 +185,15 @@ extern "C" fn end_execution() {
         // Emit renderstages data (only if renderstages data source enabled)
         get_renderstages_data_source().trace(|ctx: &mut TraceContext| {
             let inst_id = ctx.instance_index();
+            // Collect unique channel IDs and context IDs for generating specifications
+            let mut channels: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
+            let mut contexts: std::collections::HashSet<u32> = std::collections::HashSet::new();
+            for (_, data) in state.context_data.iter() {
+                for activity in data.kernel_activities.iter() {
+                    channels.insert((activity.channel_id, activity.channel_type));
+                    contexts.insert(activity.context_id);
+                }
+            }
             for (_, data) in state.context_data.iter() {
                 for (launch, activity) in data
                     .kernel_launches
@@ -297,6 +306,9 @@ extern "C" fn end_execution() {
                         emit("kernel_type", "Compute");
                         emit("process_id", &process_id.to_string());
                         emit("process_name", &process_name);
+                        emit("context_id", &activity.context_id.to_string());
+                        emit("channel_id", &activity.channel_id.to_string());
+                        emit("channel_type", &activity.channel_type.to_string());
                         emit("arch", &format!("CC_{}{}", major, minor));
                         #[allow(nonstandard_style)]
                         match cache_mode as u32 {
@@ -384,6 +396,8 @@ extern "C" fn end_execution() {
                         GOT_FIRST_RENDERSTAGES.fetch_or(1 << inst_id, Ordering::SeqCst);
                     ctx.with_incremental_state(|ctx: &mut TraceContext, inc_state| {
                         let was_cleared = std::mem::replace(&mut inc_state.was_cleared, false);
+                        // Use channel_id + 1 as hw_queue_iid (0 is reserved)
+                        let hw_queue_iid = activity.channel_id as u64 + 1;
                         ctx.add_packet(|packet: &mut TracePacket| {
                             packet
                                 .set_timestamp(timestamp)
@@ -392,8 +406,8 @@ extern "C" fn end_execution() {
                                     event
                                         .set_event_id(get_next_event_id())
                                         .set_duration(duration_ns)
-                                        .set_hw_queue_iid(1)
-                                        .set_stage_iid(2);
+                                        .set_hw_queue_iid(hw_queue_iid)
+                                        .set_stage_iid(1);
                                     extra_data(&mut |name: &str, value: &str| {
                                         event.set_extra_data(
                                             |extra_data: &mut GpuRenderStageEventExtraData| {
@@ -408,18 +422,25 @@ extern "C" fn end_execution() {
                                     TracePacketSequenceFlags::SeqIncrementalStateCleared as u32,
                                 );
                                 packet.set_interned_data(|interned: &mut InternedData| {
+                                    // Emit hw_queue specification for each unique channel
+                                    for (channel_id, channel_type) in &channels {
+                                        let queue_iid = *channel_id as u64 + 1;
+                                        let queue_category = match *channel_type {
+                                            1 => InternedGpuRenderStageSpecificationRenderStageCategory::Compute,
+                                            _ => InternedGpuRenderStageSpecificationRenderStageCategory::Other,
+                                        };
+                                        interned.set_gpu_specifications(
+                                            |spec: &mut InternedGpuRenderStageSpecification| {
+                                                spec.set_iid(queue_iid);
+                                                spec.set_name(&format!("Channel ({})", channel_id));
+                                                spec.set_category(queue_category);
+                                            },
+                                        );
+                                    }
+                                    // Emit stage specification (iid=1 for Kernel stage)
                                     interned.set_gpu_specifications(
                                         |spec: &mut InternedGpuRenderStageSpecification| {
                                             spec.set_iid(1);
-                                            spec.set_name("Queue (0)");
-                                            spec.set_category(
-                                                InternedGpuRenderStageSpecificationRenderStageCategory::Compute,
-                                            );
-                                        },
-                                    );
-                                    interned.set_gpu_specifications(
-                                        |spec: &mut InternedGpuRenderStageSpecification| {
-                                            spec.set_iid(2);
                                             spec.set_name("Kernel");
                                             spec.set_description("CUDA Kernel");
                                             spec.set_category(

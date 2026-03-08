@@ -33,7 +33,13 @@ use cupti_profiler::bindings::*;
 use perfetto_sdk::{
     data_source::TraceContext,
     producer::{Backends, Producer, ProducerInitArgsBuilder},
-    protos::{common::builtin_clock::BuiltinClock, trace::trace_packet::TracePacket},
+    protos::{
+        common::builtin_clock::BuiltinClock,
+        trace::{
+            interned_data::interned_data::InternedData,
+            trace_packet::{TracePacket, TracePacketSequenceFlags},
+        },
+    },
 };
 use perfetto_sdk_protos_gpu::protos::{
     common::gpu_counter_descriptor::{
@@ -45,10 +51,12 @@ use perfetto_sdk_protos_gpu::protos::{
             gpu_counter_event::{GpuCounterEvent, GpuCounterEventGpuCounter},
             gpu_render_stage_event::{
                 GpuRenderStageEvent, GpuRenderStageEventExtraData,
-                GpuRenderStageEventSpecifications, GpuRenderStageEventSpecificationsDescription,
+                InternedGpuRenderStageSpecification,
+                InternedGpuRenderStageSpecificationRenderStageCategory,
             },
         },
-        trace_packet::TracePacketExt,
+        interned_data::interned_data::prelude::*,
+        trace_packet::prelude::*,
     },
 };
 use std::{panic, ptr, sync::atomic::Ordering};
@@ -397,28 +405,41 @@ extern "C" fn end_execution() {
                                         event
                                             .set_event_id(get_next_event_id())
                                             .set_duration(duration_ns)
-                                            .set_hw_queue_id(0)
-                                            .set_stage_id(0);
+                                            .set_hw_queue_iid(1)
+                                            .set_stage_iid(2);
                                         extra_data(&mut |name: &str, value: &str| {
                                             event.set_extra_data(|extra_data: &mut GpuRenderStageEventExtraData| {
                                                 extra_data.set_name(name);
                                                 extra_data.set_value(value);
                                             });
                                         });
-                                        if was_cleared
-                                            || got_first_renderstages & (1 << inst_id) == 0
-                                        {
-                                            event.set_specifications(|specs: &mut GpuRenderStageEventSpecifications| {
-                                                specs
-                                                    .set_hw_queue(|desc: &mut GpuRenderStageEventSpecificationsDescription| {
-                                                        desc.set_name("Queue (0)");
-                                                    })
-                                                    .set_stage(|desc: &mut GpuRenderStageEventSpecificationsDescription| {
-                                                        desc.set_name("Kernel");
-                                                    });
-                                            });
-                                        }
                                     });
+                                if was_cleared || got_first_renderstages & (1 << inst_id) == 0 {
+                                    packet.set_sequence_flags(
+                                        TracePacketSequenceFlags::SeqIncrementalStateCleared as u32,
+                                    );
+                                    packet.set_interned_data(|interned: &mut InternedData| {
+                                        interned.set_gpu_specifications(
+                                            |spec: &mut InternedGpuRenderStageSpecification| {
+                                                spec.set_iid(1);
+                                                spec.set_name("Queue (0)");
+                                                spec.set_category(
+                                                    InternedGpuRenderStageSpecificationRenderStageCategory::Compute,
+                                                );
+                                            },
+                                        );
+                                        interned.set_gpu_specifications(
+                                            |spec: &mut InternedGpuRenderStageSpecification| {
+                                                spec.set_iid(2);
+                                                spec.set_name("Kernel");
+                                                spec.set_description("CUDA Kernel");
+                                                spec.set_category(
+                                                    InternedGpuRenderStageSpecificationRenderStageCategory::Compute,
+                                                );
+                                            },
+                                        );
+                                    });
+                                }
                             });
                         });
                     }

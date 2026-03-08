@@ -39,7 +39,12 @@ pub trait GpuActivity {
     /// Stage IID for this activity type.
     fn stage_iid(&self) -> u64;
     /// Emit extra_data fields specific to this activity type.
-    fn emit_extra_data(&self, process_id: i32, process_name: &str, emit: &mut dyn FnMut(&str, &str));
+    fn emit_extra_data(
+        &self,
+        process_id: i32,
+        process_name: &str,
+        emit: &mut dyn FnMut(&str, &str),
+    );
 
     /// Returns a u32 gpu_id derived from the device UUID by XOR-folding.
     fn gpu_id(&self) -> u32 {
@@ -105,6 +110,7 @@ pub struct KernelActivity {
 /// Stage IID constants for render stage events.
 pub const KERNEL_STAGE_IID: u64 = 1;
 pub const MEMCPY_STAGE_IID: u64 = 2;
+pub const MEMSET_STAGE_IID: u64 = 3;
 pub const HW_QUEUE_IID_OFFSET: u64 = 1000;
 
 impl GpuActivity for KernelActivity {
@@ -135,7 +141,12 @@ impl GpuActivity for KernelActivity {
     fn stage_iid(&self) -> u64 {
         KERNEL_STAGE_IID
     }
-    fn emit_extra_data(&self, process_id: i32, process_name: &str, emit: &mut dyn FnMut(&str, &str)) {
+    fn emit_extra_data(
+        &self,
+        process_id: i32,
+        process_name: &str,
+        emit: &mut dyn FnMut(&str, &str),
+    ) {
         emit("kernel_name", &self.kernel_name);
         emit("process_id", &process_id.to_string());
         emit("process_name", process_name);
@@ -219,9 +230,105 @@ impl GpuActivity for MemcpyActivity {
     fn stage_iid(&self) -> u64 {
         MEMCPY_STAGE_IID
     }
-    fn emit_extra_data(&self, process_id: i32, process_name: &str, emit: &mut dyn FnMut(&str, &str)) {
+    fn emit_extra_data(
+        &self,
+        process_id: i32,
+        process_name: &str,
+        emit: &mut dyn FnMut(&str, &str),
+    ) {
         emit("direction", self.direction_string());
         emit("size_bytes", &self.bytes.to_string());
+        emit("process_id", &process_id.to_string());
+        emit("process_name", process_name);
+        emit("device_id", &self.device_id.to_string());
+        emit("device_uuid", &self.device_uuid_string());
+        emit("context_id", &self.context_id.to_string());
+        emit("stream_id", &self.stream_id.to_string());
+        emit("channel_id", &self.channel_id.to_string());
+        emit("channel_type", &self.channel_type.to_string());
+    }
+}
+
+/// Detailed activity information for a memory set operation.
+pub struct MemsetActivity {
+    /// Value being set (typically 0 for zeroing memory).
+    pub value: u32,
+    /// Number of bytes being set.
+    pub bytes: u64,
+    /// Memory kind (device, array, etc.).
+    pub memory_kind: u16,
+    /// Memset start timestamp (nanoseconds).
+    pub start: u64,
+    /// Memset end timestamp (nanoseconds).
+    pub end: u64,
+    /// CUDA device ID.
+    pub device_id: u32,
+    /// CUDA device UUID (16 bytes).
+    pub device_uuid: [u8; 16],
+    /// CUDA context ID.
+    pub context_id: u32,
+    /// CUDA stream ID.
+    pub stream_id: u32,
+    /// Channel ID for the work submission channel.
+    pub channel_id: u32,
+    /// Channel type.
+    pub channel_type: u32,
+}
+
+impl MemsetActivity {
+    /// Returns the memory kind as a human-readable string.
+    pub fn memory_kind_string(&self) -> &'static str {
+        match self.memory_kind {
+            0 => "Unknown",
+            1 => "Pageable",
+            2 => "Pinned",
+            3 => "Device",
+            4 => "Array",
+            5 => "Managed",
+            6 => "DeviceStatic",
+            7 => "ManagedStatic",
+            _ => "Unknown",
+        }
+    }
+}
+
+impl GpuActivity for MemsetActivity {
+    fn start(&self) -> u64 {
+        self.start
+    }
+    fn end(&self) -> u64 {
+        self.end
+    }
+    fn device_id(&self) -> u32 {
+        self.device_id
+    }
+    fn device_uuid(&self) -> &[u8; 16] {
+        &self.device_uuid
+    }
+    fn context_id(&self) -> u32 {
+        self.context_id
+    }
+    fn stream_id(&self) -> u32 {
+        self.stream_id
+    }
+    fn channel_id(&self) -> u32 {
+        self.channel_id
+    }
+    fn channel_type(&self) -> u32 {
+        self.channel_type
+    }
+    fn stage_iid(&self) -> u64 {
+        MEMSET_STAGE_IID
+    }
+    fn emit_extra_data(
+        &self,
+        process_id: i32,
+        process_name: &str,
+        emit: &mut dyn FnMut(&str, &str),
+    ) {
+        emit("value", &format!("0x{:08X}", self.value));
+        emit("size_bytes", &self.bytes.to_string());
+        emit("memory_kind", self.memory_kind_string());
         emit("process_id", &process_id.to_string());
         emit("process_name", process_name);
         emit("device_id", &self.device_id.to_string());
@@ -249,6 +356,7 @@ pub struct CtxProfilerData {
     pub kernel_launches: Vec<KernelLaunch>,
     pub kernel_activities: Vec<KernelActivity>,
     pub memcpy_activities: Vec<MemcpyActivity>,
+    pub memset_activities: Vec<MemsetActivity>,
 }
 
 impl CtxProfilerData {

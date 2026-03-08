@@ -21,7 +21,10 @@ pub mod tracing;
 use crate::tracing::trace_time_ns;
 use callbacks::{buffer_completed, buffer_requested, profiler_callback_handler};
 use config::Config;
-use state::{GpuActivity, HW_QUEUE_IID_OFFSET, KERNEL_STAGE_IID, MEMCPY_STAGE_IID, GLOBAL_STATE};
+use state::{
+    GpuActivity, GLOBAL_STATE, HW_QUEUE_IID_OFFSET, KERNEL_STAGE_IID, MEMCPY_STAGE_IID,
+    MEMSET_STAGE_IID,
+};
 use tracing::{
     get_counters_data_source, get_next_event_id, get_renderstages_data_source, is_counters_enabled,
     GOT_FIRST_COUNTERS, GOT_FIRST_RENDERSTAGES,
@@ -101,6 +104,12 @@ fn emit_interned_specifications(
             spec.set_description("CUDA Memory Transfer");
             spec.set_category(InternedGpuRenderStageSpecificationRenderStageCategory::Other);
         });
+        interned.set_gpu_specifications(|spec: &mut InternedGpuRenderStageSpecification| {
+            spec.set_iid(MEMSET_STAGE_IID);
+            spec.set_name("MemorySet");
+            spec.set_description("CUDA Memory Set");
+            spec.set_category(InternedGpuRenderStageSpecificationRenderStageCategory::Other);
+        });
     });
 }
 
@@ -144,7 +153,12 @@ fn emit_render_stage_event<T: GpuActivity>(
                 }
             });
         if emit_interned {
-            emit_interned_specifications(packet, rs_ctx.channels, rs_ctx.contexts, rs_ctx.process_id);
+            emit_interned_specifications(
+                packet,
+                rs_ctx.channels,
+                rs_ctx.contexts,
+                rs_ctx.process_id,
+            );
         }
     });
 }
@@ -290,6 +304,10 @@ extern "C" fn end_execution() {
                     contexts.insert(activity.context_id);
                 }
                 for activity in data.memcpy_activities.iter() {
+                    channels.insert((activity.channel_id, activity.channel_type));
+                    contexts.insert(activity.context_id);
+                }
+                for activity in data.memset_activities.iter() {
                     channels.insert((activity.channel_id, activity.channel_type));
                     contexts.insert(activity.context_id);
                 }
@@ -567,6 +585,51 @@ extern "C" fn end_execution() {
                         );
                     });
                 }
+                // Emit render stage events for memset activities
+                for activity in data.memset_activities.iter() {
+                    let timestamp = activity.start;
+                    let duration_ns = activity.end.saturating_sub(activity.start);
+
+                    if verbose {
+                        println!("MemorySet Timestamp: {}", timestamp);
+                        println!(
+                            "-----------------------------------------------------------------------------------"
+                        );
+                        activity.emit_extra_data(process_id, &process_name, &mut |name, value| {
+                            println!("{}: {}", name, value);
+                        });
+                        println!(
+                            "-----------------------------------------------------------------------------------\n"
+                        );
+                    }
+
+                    let mut extra_data_vec: Vec<(String, String)> = Vec::new();
+                    activity.emit_extra_data(process_id, &process_name, &mut |name, value| {
+                        extra_data_vec.push((name.to_string(), value.to_string()));
+                    });
+
+                    let got_first_renderstages =
+                        GOT_FIRST_RENDERSTAGES.fetch_or(1 << inst_id, Ordering::SeqCst);
+                    ctx.with_incremental_state(|ctx: &mut TraceContext, inc_state| {
+                        let was_cleared = std::mem::replace(&mut inc_state.was_cleared, false);
+                        let emit_interned =
+                            was_cleared || got_first_renderstages & (1 << inst_id) == 0;
+                        let rs_ctx = RenderStageContext {
+                            channels: &channels,
+                            contexts: &contexts,
+                            process_id,
+                        };
+                        emit_render_stage_event(
+                            ctx,
+                            activity,
+                            timestamp,
+                            duration_ns,
+                            emit_interned,
+                            &rs_ctx,
+                            &extra_data_vec,
+                        );
+                    });
+                }
             }
         });
     });
@@ -612,6 +675,7 @@ fn register_profiler_callbacks() -> Result<(), CUptiResult> {
     unsafe { profiler::enable_domain(1, subscriber, CUpti_CallbackDomain_CUPTI_CB_DOMAIN_STATE) }?;
     profiler::activity_enable(CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL)?;
     profiler::activity_enable(CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_MEMCPY)?;
+    profiler::activity_enable(CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_MEMSET)?;
     unsafe {
         profiler::activity_register_callbacks(Some(buffer_requested), Some(buffer_completed))
     }?;

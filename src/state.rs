@@ -18,6 +18,53 @@ use cupti_profiler::*;
 use once_cell::sync::Lazy;
 use std::{collections::HashMap, sync::Mutex};
 
+/// Common interface for GPU activity types that can emit render stage events.
+pub trait GpuActivity {
+    /// Activity start timestamp (nanoseconds).
+    fn start(&self) -> u64;
+    /// Activity end timestamp (nanoseconds).
+    fn end(&self) -> u64;
+    /// CUDA device ID.
+    fn device_id(&self) -> u32;
+    /// CUDA device UUID (16 bytes).
+    fn device_uuid(&self) -> &[u8; 16];
+    /// CUDA context ID.
+    fn context_id(&self) -> u32;
+    /// CUDA stream ID.
+    fn stream_id(&self) -> u32;
+    /// Channel ID for work submission.
+    fn channel_id(&self) -> u32;
+    /// Channel type.
+    fn channel_type(&self) -> u32;
+    /// Stage IID for this activity type.
+    fn stage_iid(&self) -> u64;
+    /// Emit extra_data fields specific to this activity type.
+    fn emit_extra_data(&self, process_id: i32, process_name: &str, emit: &mut dyn FnMut(&str, &str));
+
+    /// Returns a u32 gpu_id derived from the device UUID by XOR-folding.
+    fn gpu_id(&self) -> u32 {
+        let uuid = self.device_uuid();
+        let u0 = u32::from_le_bytes([uuid[0], uuid[1], uuid[2], uuid[3]]);
+        let u1 = u32::from_le_bytes([uuid[4], uuid[5], uuid[6], uuid[7]]);
+        let u2 = u32::from_le_bytes([uuid[8], uuid[9], uuid[10], uuid[11]]);
+        let u3 = u32::from_le_bytes([uuid[12], uuid[13], uuid[14], uuid[15]]);
+        u0 ^ u1 ^ u2 ^ u3
+    }
+
+    /// Returns the device UUID as a hex string in standard UUID format.
+    fn device_uuid_string(&self) -> String {
+        let uuid = self.device_uuid();
+        format!(
+            "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+            uuid[0], uuid[1], uuid[2], uuid[3],
+            uuid[4], uuid[5],
+            uuid[6], uuid[7],
+            uuid[8], uuid[9],
+            uuid[10], uuid[11], uuid[12], uuid[13], uuid[14], uuid[15]
+        )
+    }
+}
+
 /// Represents a specific kernel launch event.
 pub struct KernelLaunch {
     pub function: CUfunction,
@@ -55,46 +102,134 @@ pub struct KernelActivity {
     pub channel_type: u32,
 }
 
-impl KernelActivity {
-    /// Returns the device UUID as a hex string in standard UUID format.
-    pub fn device_uuid_string(&self) -> String {
-        format!(
-            "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-            self.device_uuid[0], self.device_uuid[1], self.device_uuid[2], self.device_uuid[3],
-            self.device_uuid[4], self.device_uuid[5],
-            self.device_uuid[6], self.device_uuid[7],
-            self.device_uuid[8], self.device_uuid[9],
-            self.device_uuid[10], self.device_uuid[11], self.device_uuid[12], self.device_uuid[13], self.device_uuid[14], self.device_uuid[15]
-        )
-    }
+/// Stage IID constants for render stage events.
+pub const KERNEL_STAGE_IID: u64 = 1;
+pub const MEMCPY_STAGE_IID: u64 = 2;
+pub const HW_QUEUE_IID_OFFSET: u64 = 1000;
 
-    /// Returns a u32 gpu_id derived from the device UUID by XOR-folding.
-    pub fn gpu_id(&self) -> u32 {
-        let u0 = u32::from_le_bytes([
-            self.device_uuid[0],
-            self.device_uuid[1],
-            self.device_uuid[2],
-            self.device_uuid[3],
-        ]);
-        let u1 = u32::from_le_bytes([
-            self.device_uuid[4],
-            self.device_uuid[5],
-            self.device_uuid[6],
-            self.device_uuid[7],
-        ]);
-        let u2 = u32::from_le_bytes([
-            self.device_uuid[8],
-            self.device_uuid[9],
-            self.device_uuid[10],
-            self.device_uuid[11],
-        ]);
-        let u3 = u32::from_le_bytes([
-            self.device_uuid[12],
-            self.device_uuid[13],
-            self.device_uuid[14],
-            self.device_uuid[15],
-        ]);
-        u0 ^ u1 ^ u2 ^ u3
+impl GpuActivity for KernelActivity {
+    fn start(&self) -> u64 {
+        self.start
+    }
+    fn end(&self) -> u64 {
+        self.end
+    }
+    fn device_id(&self) -> u32 {
+        self.device_id
+    }
+    fn device_uuid(&self) -> &[u8; 16] {
+        &self.device_uuid
+    }
+    fn context_id(&self) -> u32 {
+        self.context_id
+    }
+    fn stream_id(&self) -> u32 {
+        self.stream_id
+    }
+    fn channel_id(&self) -> u32 {
+        self.channel_id
+    }
+    fn channel_type(&self) -> u32 {
+        self.channel_type
+    }
+    fn stage_iid(&self) -> u64 {
+        KERNEL_STAGE_IID
+    }
+    fn emit_extra_data(&self, process_id: i32, process_name: &str, emit: &mut dyn FnMut(&str, &str)) {
+        emit("kernel_name", &self.kernel_name);
+        emit("process_id", &process_id.to_string());
+        emit("process_name", process_name);
+        emit("device_id", &self.device_id.to_string());
+        emit("device_uuid", &self.device_uuid_string());
+        emit("context_id", &self.context_id.to_string());
+        emit("stream_id", &self.stream_id.to_string());
+        emit("channel_id", &self.channel_id.to_string());
+        emit("channel_type", &self.channel_type.to_string());
+    }
+}
+
+/// Detailed activity information for a memory transfer operation.
+pub struct MemcpyActivity {
+    /// Copy direction (HtoD, DtoH, DtoD, etc.)
+    pub copy_kind: u8,
+    /// Number of bytes transferred.
+    pub bytes: u64,
+    /// Transfer start timestamp (nanoseconds).
+    pub start: u64,
+    /// Transfer end timestamp (nanoseconds).
+    pub end: u64,
+    /// CUDA device ID.
+    pub device_id: u32,
+    /// CUDA device UUID (16 bytes).
+    pub device_uuid: [u8; 16],
+    /// CUDA context ID.
+    pub context_id: u32,
+    /// CUDA stream ID.
+    pub stream_id: u32,
+    /// Channel ID for the work submission channel.
+    pub channel_id: u32,
+    /// Channel type.
+    pub channel_type: u32,
+}
+
+impl MemcpyActivity {
+    /// Returns the copy direction as a human-readable string.
+    pub fn direction_string(&self) -> &'static str {
+        match self.copy_kind {
+            1 => "HostToDevice",
+            2 => "DeviceToHost",
+            3 => "HostToArray",
+            4 => "ArrayToHost",
+            5 => "ArrayToArray",
+            6 => "ArrayToDevice",
+            7 => "DeviceToArray",
+            8 => "DeviceToDevice",
+            9 => "HostToHost",
+            10 => "PeerToPeer",
+            _ => "Unknown",
+        }
+    }
+}
+
+impl GpuActivity for MemcpyActivity {
+    fn start(&self) -> u64 {
+        self.start
+    }
+    fn end(&self) -> u64 {
+        self.end
+    }
+    fn device_id(&self) -> u32 {
+        self.device_id
+    }
+    fn device_uuid(&self) -> &[u8; 16] {
+        &self.device_uuid
+    }
+    fn context_id(&self) -> u32 {
+        self.context_id
+    }
+    fn stream_id(&self) -> u32 {
+        self.stream_id
+    }
+    fn channel_id(&self) -> u32 {
+        self.channel_id
+    }
+    fn channel_type(&self) -> u32 {
+        self.channel_type
+    }
+    fn stage_iid(&self) -> u64 {
+        MEMCPY_STAGE_IID
+    }
+    fn emit_extra_data(&self, process_id: i32, process_name: &str, emit: &mut dyn FnMut(&str, &str)) {
+        emit("direction", self.direction_string());
+        emit("size_bytes", &self.bytes.to_string());
+        emit("process_id", &process_id.to_string());
+        emit("process_name", process_name);
+        emit("device_id", &self.device_id.to_string());
+        emit("device_uuid", &self.device_uuid_string());
+        emit("context_id", &self.context_id.to_string());
+        emit("stream_id", &self.stream_id.to_string());
+        emit("channel_id", &self.channel_id.to_string());
+        emit("channel_type", &self.channel_type.to_string());
     }
 }
 
@@ -113,6 +248,7 @@ pub struct CtxProfilerData {
     pub range_info: Vec<RangeInfo>,
     pub kernel_launches: Vec<KernelLaunch>,
     pub kernel_activities: Vec<KernelActivity>,
+    pub memcpy_activities: Vec<MemcpyActivity>,
 }
 
 impl CtxProfilerData {

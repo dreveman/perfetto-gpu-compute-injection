@@ -114,74 +114,74 @@ extern "C" fn end_execution() {
 
                         let got_first_counters =
                             GOT_FIRST_COUNTERS.fetch_or(1 << inst_id, Ordering::SeqCst);
-                        ctx.with_incremental_state(|ctx: &mut TraceContext, _state| {
-                            if got_first_counters & (1 << inst_id) == 0 {
-                                ctx.add_packet(|packet: &mut TracePacket| {
-                                    packet
-                                        .set_timestamp(launch.start)
-                                        .set_timestamp_clock_id(
-                                            BuiltinClock::BuiltinClockBoottime.into(),
-                                        )
-                                        .set_gpu_counter_event(|event: &mut GpuCounterEvent| {
-                                            event.set_counter_descriptor(
-                                                |desc: &mut GpuCounterDescriptor| {
-                                                    for (i, metric) in
-                                                        range.metric_and_values.iter().enumerate()
-                                                    {
-                                                        desc.set_specs(|desc: &mut GpuCounterDescriptorGpuCounterSpec| {
-                                                            desc.set_counter_id(i as u32);
-                                                            desc.set_name(&metric.metric_name);
-                                                            desc.set_groups(
-                                                            GpuCounterDescriptorGpuCounterGroup::Compute,
-                                                        );
-                                                        });
-                                                    }
-                                                },
-                                            );
-                                        });
-                                });
-                            }
+                        if got_first_counters & (1 << inst_id) == 0 {
                             ctx.add_packet(|packet: &mut TracePacket| {
                                 packet
                                     .set_timestamp(launch.start)
-                                    .set_timestamp_clock_id(BuiltinClock::BuiltinClockBoottime.into())
+                                    .set_timestamp_clock_id(
+                                        BuiltinClock::BuiltinClockBoottime.into(),
+                                    )
                                     .set_gpu_counter_event(|event: &mut GpuCounterEvent| {
-                                        for (i, _metric) in
-                                            range.metric_and_values.iter().enumerate()
-                                        {
-                                            event.set_counters(|counter: &mut GpuCounterEventGpuCounter| {
-                                                counter.set_counter_id(i as u32).set_int_value(0);
-                                            });
-                                        }
+                                        event.set_counter_descriptor(
+                                            |desc: &mut GpuCounterDescriptor| {
+                                                for (i, metric) in
+                                                    range.metric_and_values.iter().enumerate()
+                                                {
+                                                    desc.set_specs(|desc: &mut GpuCounterDescriptorGpuCounterSpec| {
+                                                        desc.set_counter_id(i as u32);
+                                                        desc.set_name(&metric.metric_name);
+                                                        desc.set_groups(
+                                                        GpuCounterDescriptorGpuCounterGroup::Compute,
+                                                    );
+                                                    });
+                                                }
+                                            },
+                                        );
                                     });
                             });
-                            ctx.add_packet(|packet: &mut TracePacket| {
-                                packet
-                                    .set_timestamp(launch.end)
-                                    .set_timestamp_clock_id(BuiltinClock::BuiltinClockBoottime.into())
-                                    .set_gpu_counter_event(|event: &mut GpuCounterEvent| {
-                                        for (i, metric) in range.metric_and_values.iter().enumerate()
-                                        {
-                                            event.set_counters(|counter: &mut GpuCounterEventGpuCounter| {
+                        }
+                        ctx.add_packet(|packet: &mut TracePacket| {
+                            packet
+                                .set_timestamp(launch.start)
+                                .set_timestamp_clock_id(BuiltinClock::BuiltinClockBoottime.into())
+                                .set_gpu_counter_event(|event: &mut GpuCounterEvent| {
+                                    for (i, _metric) in range.metric_and_values.iter().enumerate()
+                                    {
+                                        event.set_counters(
+                                            |counter: &mut GpuCounterEventGpuCounter| {
+                                                counter.set_counter_id(i as u32).set_int_value(0);
+                                            },
+                                        );
+                                    }
+                                });
+                        });
+                        ctx.add_packet(|packet: &mut TracePacket| {
+                            packet
+                                .set_timestamp(launch.end)
+                                .set_timestamp_clock_id(BuiltinClock::BuiltinClockBoottime.into())
+                                .set_gpu_counter_event(|event: &mut GpuCounterEvent| {
+                                    for (i, metric) in range.metric_and_values.iter().enumerate() {
+                                        event.set_counters(
+                                            |counter: &mut GpuCounterEventGpuCounter| {
                                                 counter
                                                     .set_counter_id(i as u32)
                                                     .set_double_value(metric.value);
-                                            });
-                                        }
-                                    });
-                            });
-
-                            if verbose {
-                                println!("Range Name: {}", range.range_name);
-                                println!("Timestamp: {}", launch.start);
-                                println!("Duration: {}", duration_ns);
-                                println!("-----------------------------------------------------------------------------------");
-                                for metric in &range.metric_and_values {
-                                    println!("{}: {}", metric.metric_name, metric.value);
-                                }
-                                println!("-----------------------------------------------------------------------------------\n");
-                            }
+                                            },
+                                        );
+                                    }
+                                });
                         });
+
+                        if verbose {
+                            println!("Range Name: {}", range.range_name);
+                            println!("Timestamp: {}", launch.start);
+                            println!("Duration: {}", duration_ns);
+                            println!("-----------------------------------------------------------------------------------");
+                            for metric in &range.metric_and_values {
+                                println!("{}: {}", metric.metric_name, metric.value);
+                            }
+                            println!("-----------------------------------------------------------------------------------\n");
+                        }
                     }
                 }
             });

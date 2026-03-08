@@ -137,11 +137,6 @@ pub fn is_counters_enabled() -> bool {
     COUNTERS_ENABLED.load(Ordering::SeqCst)
 }
 
-/// Checks if renderstages collection is active.
-pub fn is_renderstages_enabled() -> bool {
-    RENDERSTAGES_ENABLED.load(Ordering::SeqCst)
-}
-
 /// Returns the current timestamp in nanoseconds from the trace clock.
 ///
 /// Uses `CLOCK_BOOTTIME` on Linux and `CLOCK_MONOTONIC` on macOS.
@@ -172,10 +167,5 @@ mod tests {
     #[test]
     fn test_counters_enabled_default() {
         assert!(!is_counters_enabled());
-    }
-
-    #[test]
-    fn test_renderstages_enabled_default() {
-        assert!(!is_renderstages_enabled());
     }
 }

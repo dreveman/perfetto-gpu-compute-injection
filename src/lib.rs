@@ -21,7 +21,10 @@ pub mod tracing;
 use crate::tracing::trace_time_ns;
 use callbacks::{buffer_completed, buffer_requested, profiler_callback_handler};
 use config::Config;
-use state::GLOBAL_STATE;
+use state::{
+    GpuActivity, GLOBAL_STATE, HW_QUEUE_IID_OFFSET, KERNEL_STAGE_IID, MEMCPY_STAGE_IID,
+    MEMSET_STAGE_IID,
+};
 use tracing::{
     get_counters_data_source, get_next_event_id, get_renderstages_data_source, is_counters_enabled,
     GOT_FIRST_COUNTERS, GOT_FIRST_RENDERSTAGES,
@@ -61,6 +64,104 @@ use perfetto_sdk_protos_gpu::protos::{
     },
 };
 use std::{panic, ptr, sync::atomic::Ordering};
+
+fn emit_interned_specifications(
+    packet: &mut TracePacket,
+    channels: &std::collections::HashSet<(u32, u32)>,
+    contexts: &std::collections::HashSet<u32>,
+    process_id: i32,
+) {
+    packet.set_sequence_flags(TracePacketSequenceFlags::SeqIncrementalStateCleared as u32);
+    packet.set_interned_data(|interned: &mut InternedData| {
+        for context_id in contexts {
+            interned.set_graphics_contexts(|ctx: &mut InternedGraphicsContext| {
+                ctx.set_iid(*context_id as u64);
+                ctx.set_pid(process_id);
+                ctx.set_api(InternedGraphicsContextApi::Undefined);
+            });
+        }
+        for (channel_id, channel_type) in channels {
+            let queue_iid = *channel_id as u64 + HW_QUEUE_IID_OFFSET;
+            let queue_category = match *channel_type {
+                1 => InternedGpuRenderStageSpecificationRenderStageCategory::Compute,
+                _ => InternedGpuRenderStageSpecificationRenderStageCategory::Other,
+            };
+            interned.set_gpu_specifications(|spec: &mut InternedGpuRenderStageSpecification| {
+                spec.set_iid(queue_iid);
+                spec.set_name(format!("Channel ({})", channel_id));
+                spec.set_category(queue_category);
+            });
+        }
+        interned.set_gpu_specifications(|spec: &mut InternedGpuRenderStageSpecification| {
+            spec.set_iid(KERNEL_STAGE_IID);
+            spec.set_name("Kernel");
+            spec.set_description("CUDA Kernel");
+            spec.set_category(InternedGpuRenderStageSpecificationRenderStageCategory::Compute);
+        });
+        interned.set_gpu_specifications(|spec: &mut InternedGpuRenderStageSpecification| {
+            spec.set_iid(MEMCPY_STAGE_IID);
+            spec.set_name("MemoryTransfer");
+            spec.set_description("CUDA Memory Transfer");
+            spec.set_category(InternedGpuRenderStageSpecificationRenderStageCategory::Other);
+        });
+        interned.set_gpu_specifications(|spec: &mut InternedGpuRenderStageSpecification| {
+            spec.set_iid(MEMSET_STAGE_IID);
+            spec.set_name("MemorySet");
+            spec.set_description("CUDA Memory Set");
+            spec.set_category(InternedGpuRenderStageSpecificationRenderStageCategory::Other);
+        });
+    });
+}
+
+struct RenderStageContext<'a> {
+    channels: &'a std::collections::HashSet<(u32, u32)>,
+    contexts: &'a std::collections::HashSet<u32>,
+    process_id: i32,
+}
+
+fn emit_render_stage_event<T: GpuActivity>(
+    ctx: &mut TraceContext,
+    activity: &T,
+    timestamp: u64,
+    duration_ns: u64,
+    emit_interned: bool,
+    rs_ctx: &RenderStageContext,
+    extra_data: &[(String, String)],
+) {
+    let hw_queue_iid = activity.channel_id() as u64 + HW_QUEUE_IID_OFFSET;
+    let context_iid = activity.context_id() as u64;
+    let gpu_id = activity.gpu_id() as i32;
+    let stage_iid = activity.stage_iid();
+
+    ctx.add_packet(|packet: &mut TracePacket| {
+        packet
+            .set_timestamp(timestamp)
+            .set_timestamp_clock_id(BuiltinClock::BuiltinClockBoottime.into())
+            .set_gpu_render_stage_event(|event: &mut GpuRenderStageEvent| {
+                event
+                    .set_event_id(get_next_event_id())
+                    .set_duration(duration_ns)
+                    .set_gpu_id(gpu_id)
+                    .set_hw_queue_iid(hw_queue_iid)
+                    .set_stage_iid(stage_iid)
+                    .set_context(context_iid);
+                for (name, value) in extra_data {
+                    event.set_extra_data(|extra_data: &mut GpuRenderStageEventExtraData| {
+                        extra_data.set_name(name);
+                        extra_data.set_value(value);
+                    });
+                }
+            });
+        if emit_interned {
+            emit_interned_specifications(
+                packet,
+                rs_ctx.channels,
+                rs_ctx.contexts,
+                rs_ctx.process_id,
+            );
+        }
+    });
+}
 
 extern "C" fn end_execution() {
     let _ = panic::catch_unwind(|| {
@@ -199,6 +300,14 @@ extern "C" fn end_execution() {
             let mut contexts: std::collections::HashSet<u32> = std::collections::HashSet::new();
             for (_, data) in state.context_data.iter() {
                 for activity in data.kernel_activities.iter() {
+                    channels.insert((activity.channel_id, activity.channel_type));
+                    contexts.insert(activity.context_id);
+                }
+                for activity in data.memcpy_activities.iter() {
+                    channels.insert((activity.channel_id, activity.channel_type));
+                    contexts.insert(activity.context_id);
+                }
+                for activity in data.memset_activities.iter() {
                     channels.insert((activity.channel_id, activity.channel_type));
                     contexts.insert(activity.context_id);
                 }
@@ -404,82 +513,121 @@ extern "C" fn end_execution() {
                         );
                     }
 
+                    let mut extra_data_vec: Vec<(String, String)> = Vec::new();
+                    extra_data(&mut |name: &str, value: &str| {
+                        extra_data_vec.push((name.to_string(), value.to_string()));
+                    });
+
                     let got_first_renderstages =
                         GOT_FIRST_RENDERSTAGES.fetch_or(1 << inst_id, Ordering::SeqCst);
                     ctx.with_incremental_state(|ctx: &mut TraceContext, inc_state| {
                         let was_cleared = std::mem::replace(&mut inc_state.was_cleared, false);
-                        // Stage IIDs use range 1-999, HW queue IIDs use range 1000+
-                        const KERNEL_STAGE_IID: u64 = 1;
-                        const HW_QUEUE_IID_OFFSET: u64 = 1000;
-                        let hw_queue_iid = activity.channel_id as u64 + HW_QUEUE_IID_OFFSET;
-                        let context_iid = activity.context_id as u64;
-                        let gpu_id = activity.gpu_id() as i32;
-                        ctx.add_packet(|packet: &mut TracePacket| {
-                            packet
-                                .set_timestamp(timestamp)
-                                .set_timestamp_clock_id(BuiltinClock::BuiltinClockBoottime.into())
-                                .set_gpu_render_stage_event(|event: &mut GpuRenderStageEvent| {
-                                    event
-                                        .set_event_id(get_next_event_id())
-                                        .set_duration(duration_ns)
-                                        .set_gpu_id(gpu_id)
-                                        .set_hw_queue_iid(hw_queue_iid)
-                                        .set_stage_iid(KERNEL_STAGE_IID)
-                                        .set_context(context_iid);
-                                    extra_data(&mut |name: &str, value: &str| {
-                                        event.set_extra_data(
-                                            |extra_data: &mut GpuRenderStageEventExtraData| {
-                                                extra_data.set_name(name);
-                                                extra_data.set_value(value);
-                                            },
-                                        );
-                                    });
-                                });
-                            if was_cleared || got_first_renderstages & (1 << inst_id) == 0 {
-                                packet.set_sequence_flags(
-                                    TracePacketSequenceFlags::SeqIncrementalStateCleared as u32,
-                                );
-                                packet.set_interned_data(|interned: &mut InternedData| {
-                                    // Emit graphics context for each unique CUDA context
-                                    for context_id in &contexts {
-                                        interned.set_graphics_contexts(
-                                            |ctx: &mut InternedGraphicsContext| {
-                                                ctx.set_iid(*context_id as u64);
-                                                ctx.set_pid(process_id);
-                                                ctx.set_api(InternedGraphicsContextApi::Undefined);
-                                            },
-                                        );
-                                    }
-                                    // Emit hw_queue specification for each unique channel
-                                    // HW queue IIDs start at 1000 to avoid conflict with stage IIDs
-                                    for (channel_id, channel_type) in &channels {
-                                        let queue_iid = *channel_id as u64 + HW_QUEUE_IID_OFFSET;
-                                        let queue_category = match *channel_type {
-                                            1 => InternedGpuRenderStageSpecificationRenderStageCategory::Compute,
-                                            _ => InternedGpuRenderStageSpecificationRenderStageCategory::Other,
-                                        };
-                                        interned.set_gpu_specifications(
-                                            |spec: &mut InternedGpuRenderStageSpecification| {
-                                                spec.set_iid(queue_iid);
-                                                spec.set_name(format!("Channel ({})", channel_id));
-                                                spec.set_category(queue_category);
-                                            },
-                                        );
-                                    }
-                                    // Emit stage specification for Kernel stage
-                                    interned.set_gpu_specifications(
-                                        |spec: &mut InternedGpuRenderStageSpecification| {
-                                            spec.set_iid(KERNEL_STAGE_IID);
-                                            spec.set_name("Kernel");
-                                            spec.set_description("CUDA Kernel");
-                                            spec.set_category(
-                                                InternedGpuRenderStageSpecificationRenderStageCategory::Compute,
-                                            );
-                                        },
-                                    );
-                                });
-                            }
+                        let emit_interned =
+                            was_cleared || got_first_renderstages & (1 << inst_id) == 0;
+                        let rs_ctx = RenderStageContext {
+                            channels: &channels,
+                            contexts: &contexts,
+                            process_id,
+                        };
+                        emit_render_stage_event(
+                            ctx,
+                            activity,
+                            timestamp,
+                            duration_ns,
+                            emit_interned,
+                            &rs_ctx,
+                            &extra_data_vec,
+                        );
+                    });
+                }
+                // Emit render stage events for memcpy activities
+                for activity in data.memcpy_activities.iter() {
+                    let timestamp = activity.start;
+                    let duration_ns = activity.end.saturating_sub(activity.start);
+
+                    if verbose {
+                        println!("MemoryTransfer Timestamp: {}", timestamp);
+                        println!(
+                            "-----------------------------------------------------------------------------------"
+                        );
+                        activity.emit_extra_data(process_id, &process_name, &mut |name, value| {
+                            println!("{}: {}", name, value);
                         });
+                        println!(
+                            "-----------------------------------------------------------------------------------\n"
+                        );
+                    }
+
+                    let mut extra_data_vec: Vec<(String, String)> = Vec::new();
+                    activity.emit_extra_data(process_id, &process_name, &mut |name, value| {
+                        extra_data_vec.push((name.to_string(), value.to_string()));
+                    });
+
+                    let got_first_renderstages =
+                        GOT_FIRST_RENDERSTAGES.fetch_or(1 << inst_id, Ordering::SeqCst);
+                    ctx.with_incremental_state(|ctx: &mut TraceContext, inc_state| {
+                        let was_cleared = std::mem::replace(&mut inc_state.was_cleared, false);
+                        let emit_interned =
+                            was_cleared || got_first_renderstages & (1 << inst_id) == 0;
+                        let rs_ctx = RenderStageContext {
+                            channels: &channels,
+                            contexts: &contexts,
+                            process_id,
+                        };
+                        emit_render_stage_event(
+                            ctx,
+                            activity,
+                            timestamp,
+                            duration_ns,
+                            emit_interned,
+                            &rs_ctx,
+                            &extra_data_vec,
+                        );
+                    });
+                }
+                // Emit render stage events for memset activities
+                for activity in data.memset_activities.iter() {
+                    let timestamp = activity.start;
+                    let duration_ns = activity.end.saturating_sub(activity.start);
+
+                    if verbose {
+                        println!("MemorySet Timestamp: {}", timestamp);
+                        println!(
+                            "-----------------------------------------------------------------------------------"
+                        );
+                        activity.emit_extra_data(process_id, &process_name, &mut |name, value| {
+                            println!("{}: {}", name, value);
+                        });
+                        println!(
+                            "-----------------------------------------------------------------------------------\n"
+                        );
+                    }
+
+                    let mut extra_data_vec: Vec<(String, String)> = Vec::new();
+                    activity.emit_extra_data(process_id, &process_name, &mut |name, value| {
+                        extra_data_vec.push((name.to_string(), value.to_string()));
+                    });
+
+                    let got_first_renderstages =
+                        GOT_FIRST_RENDERSTAGES.fetch_or(1 << inst_id, Ordering::SeqCst);
+                    ctx.with_incremental_state(|ctx: &mut TraceContext, inc_state| {
+                        let was_cleared = std::mem::replace(&mut inc_state.was_cleared, false);
+                        let emit_interned =
+                            was_cleared || got_first_renderstages & (1 << inst_id) == 0;
+                        let rs_ctx = RenderStageContext {
+                            channels: &channels,
+                            contexts: &contexts,
+                            process_id,
+                        };
+                        emit_render_stage_event(
+                            ctx,
+                            activity,
+                            timestamp,
+                            duration_ns,
+                            emit_interned,
+                            &rs_ctx,
+                            &extra_data_vec,
+                        );
                     });
                 }
             }
@@ -526,6 +674,9 @@ fn register_profiler_callbacks() -> Result<(), CUptiResult> {
     }?;
     unsafe { profiler::enable_domain(1, subscriber, CUpti_CallbackDomain_CUPTI_CB_DOMAIN_STATE) }?;
     profiler::activity_enable(CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL)?;
+    profiler::activity_enable(CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_MEMCPY)?;
+    // DISABLED: MEMSET activity causes double-free crash in cuptiActivityFlushAll
+    // profiler::activity_enable(CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_MEMSET)?;
     unsafe {
         profiler::activity_register_callbacks(Some(buffer_requested), Some(buffer_completed))
     }?;

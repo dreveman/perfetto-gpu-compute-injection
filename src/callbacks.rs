@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::state::{KernelActivity, KernelLaunch, GLOBAL_STATE};
+use crate::state::{KernelActivity, KernelLaunch, MemcpyActivity, MemsetActivity, GLOBAL_STATE};
 use crate::tracing::{is_counters_enabled, trace_time_ns};
 use cupti_profiler::bindings::*;
 use cupti_profiler::{self as profiler, *};
@@ -75,6 +75,43 @@ pub unsafe extern "C" fn buffer_completed(
                             stream_id: k.streamId,
                             channel_id: k.channelID,
                             channel_type: k.channelType,
+                        });
+                    }
+                } else if r.kind == CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_MEMCPY {
+                    let m = &*(record as *const CUpti_ActivityMemcpy6);
+                    if let Some(data) = state.context_data.get_mut(&m.contextId) {
+                        let device_uuid =
+                            profiler::get_device_uuid(m.deviceId as i32).unwrap_or([0u8; 16]);
+                        data.memcpy_activities.push(MemcpyActivity {
+                            copy_kind: m.copyKind,
+                            bytes: m.bytes,
+                            start: m.start,
+                            end: m.end,
+                            device_id: m.deviceId,
+                            device_uuid,
+                            context_id: m.contextId,
+                            stream_id: m.streamId,
+                            channel_id: m.channelID,
+                            channel_type: m.channelType,
+                        });
+                    }
+                } else if r.kind == CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_MEMSET {
+                    let m = &*(record as *const CUpti_ActivityMemset4);
+                    if let Some(data) = state.context_data.get_mut(&m.contextId) {
+                        let device_uuid =
+                            profiler::get_device_uuid(m.deviceId as i32).unwrap_or([0u8; 16]);
+                        data.memset_activities.push(MemsetActivity {
+                            value: m.value,
+                            bytes: m.bytes,
+                            memory_kind: m.memoryKind,
+                            start: m.start,
+                            end: m.end,
+                            device_id: m.deviceId,
+                            device_uuid,
+                            context_id: m.contextId,
+                            stream_id: m.streamId,
+                            channel_id: m.channelID,
+                            channel_type: m.channelType,
                         });
                     }
                 }
@@ -222,6 +259,8 @@ pub unsafe extern "C" fn profiler_callback_handler(
                         range_info: Vec::new(),
                         kernel_launches: Vec::new(),
                         kernel_activities: Vec::new(),
+                        memcpy_activities: Vec::new(),
+                        memset_activities: Vec::new(),
                     });
                     // Only initialize profiler and metric evaluator when counters are enabled
                     // Otherwise, just track context data for renderstages

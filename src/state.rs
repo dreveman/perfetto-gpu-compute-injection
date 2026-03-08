@@ -60,6 +60,34 @@ pub struct CtxProfilerData {
     pub kernel_activities: Vec<KernelActivity>,
 }
 
+impl CtxProfilerData {
+    /// Finalizes the range profiler session by stopping it, decoding counter data,
+    /// and evaluating metrics. Optionally disables the profiler and clears state.
+    ///
+    /// Returns early if the context is not active or has no range profiler.
+    pub fn finalize_profiler(&mut self, metric_names: &[String], disable: bool) {
+        if !self.is_active {
+            return;
+        }
+        if let Some(rp) = &mut self.range_profiler {
+            let _ = rp.stop();
+            let _ = rp.decode_counter_data();
+            if let Some(me) = &self.metric_evaluator {
+                if let Ok(infos) = me.evaluate_all_ranges(&self.counter_data_image, metric_names) {
+                    self.range_info.extend(infos);
+                }
+            }
+            if disable {
+                let _ = rp.disable();
+            }
+        }
+        if disable {
+            self.range_profiler = None;
+            self.is_active = false;
+        }
+    }
+}
+
 unsafe impl Send for CtxProfilerData {}
 unsafe impl Sync for CtxProfilerData {}
 

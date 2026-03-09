@@ -168,6 +168,31 @@ fn emit_render_stage_event<T: GpuActivity>(
 
 extern "C" fn end_execution() {
     let _ = panic::catch_unwind(|| {
+        // Clear any pending CUPTI errors before cleanup
+        let _ = profiler::get_last_error();
+
+        // 1. Disable cudaDeviceReset callback first
+        if let Ok(state) = GLOBAL_STATE.lock() {
+            let subscriber = state.subscriber_handle;
+            if !subscriber.is_null() {
+                let _ = unsafe {
+                    profiler::enable_callback(
+                        0,
+                        subscriber,
+                        CUpti_CallbackDomain_CUPTI_CB_DOMAIN_RUNTIME_API,
+                        CUpti_runtime_api_trace_cbid_enum_CUPTI_RUNTIME_TRACE_CBID_cudaDeviceReset_v3020,
+                    )
+                };
+            }
+        }
+
+        // 2. Disable all activities BEFORE flush
+        let _ =
+            profiler::activity_disable(CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL);
+        let _ = profiler::activity_disable(CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_MEMCPY);
+        let _ = profiler::activity_disable(CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_MEMSET);
+
+        // 3. Force flush all activity buffers
         let _ = profiler::activity_flush_all(CUpti_ActivityFlag_CUPTI_ACTIVITY_FLAG_FLUSH_FORCED);
         let process_id = unsafe { libc::getpid() };
         let process_name = std::fs::read_to_string("/proc/self/comm")
@@ -598,11 +623,15 @@ unsafe extern "C" fn activity_timestamp_callback() -> u64 {
     trace_time_ns()
 }
 
-fn register_profiler_callbacks() -> Result<(), CUptiResult> {
+fn register_profiler_callbacks() -> Result<CUpti_SubscriberHandle, CUptiResult> {
     // Register custom timestamp callback so activity timestamps use our trace clock
     unsafe { profiler::activity_register_timestamp_callback(Some(activity_timestamp_callback)) }?;
+
+    // Subscribe to callbacks
     let subscriber =
         unsafe { profiler::subscribe(Some(profiler_callback_handler), ptr::null_mut()) }?;
+
+    // Enable driver API callbacks
     unsafe {
         profiler::enable_callback(
             1,
@@ -628,15 +657,37 @@ fn register_profiler_callbacks() -> Result<(), CUptiResult> {
         )
     }?;
     unsafe { profiler::enable_domain(1, subscriber, CUpti_CallbackDomain_CUPTI_CB_DOMAIN_STATE) }?;
-    profiler::activity_enable(CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL)?;
-    profiler::activity_enable(CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_MEMCPY)?;
-    // DISABLED: MEMSET activity causes double-free crash in cuptiActivityFlushAll
-    // profiler::activity_enable(CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_MEMSET)?;
+
+    // Enable cudaDeviceReset callback to flush buffers before reset
+    unsafe {
+        profiler::enable_callback(
+            1,
+            subscriber,
+            CUpti_CallbackDomain_CUPTI_CB_DOMAIN_RUNTIME_API,
+            CUpti_runtime_api_trace_cbid_enum_CUPTI_RUNTIME_TRACE_CBID_cudaDeviceReset_v3020,
+        )
+    }?;
+
+    // Register buffer callbacks BEFORE enabling activities
     unsafe {
         profiler::activity_register_callbacks(Some(buffer_requested), Some(buffer_completed))
     }?;
+
+    // Enable activities AFTER buffer callbacks are registered
+    profiler::activity_enable(CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL)?;
+    profiler::activity_enable(CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_MEMCPY)?;
+    // Only enable MEMSET when counters/range profiling is NOT enabled.
+    // There's a conflict between the Range Profiler API and MEMSET activity tracking
+    // that causes double-free crashes in cuptiActivityFlushAll when both are used together.
+    // The Range Profiler's kernel replay mode may interfere with activity buffer management.
+    if !is_counters_enabled() {
+        profiler::activity_enable(CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_MEMSET)?;
+    }
+
     unsafe { libc::atexit(end_execution) };
-    Ok(())
+
+    // Return subscriber handle so caller can store it
+    Ok(subscriber)
 }
 
 /// Entry point for the injection library.
@@ -655,9 +706,14 @@ pub extern "C" fn InitializeInjection() -> i32 {
                 state.injection_initialized = true;
                 state.config = Config::from_env();
 
-                if let Err(e) = register_profiler_callbacks() {
-                    eprintln!("Failed to register callbacks: {:?}", e);
-                    return 0;
+                match register_profiler_callbacks() {
+                    Ok(subscriber) => {
+                        state.subscriber_handle = subscriber;
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to register callbacks: {:?}", e);
+                        return 0;
+                    }
                 }
             }
         }

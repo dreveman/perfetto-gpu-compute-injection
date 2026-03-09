@@ -260,6 +260,10 @@ CUptiResult cuptiActivityEnable(CUpti_ActivityKind kind) {
   (void)kind;
   return CUPTI_SUCCESS;
 }
+CUptiResult cuptiActivityDisable(CUpti_ActivityKind kind) {
+  (void)kind;
+  return CUPTI_SUCCESS;
+}
 CUptiResult cuptiActivityRegisterCallbacks(
     CUpti_BuffersCallbackRequestFunc funcBufferRequested,
     CUpti_BuffersCallbackCompleteFunc funcBufferCompleted) {

@@ -398,6 +398,7 @@ pub struct GlobalState {
     pub active_ctx: Option<CUcontext>,
     pub injection_initialized: bool,
     pub config: Config,
+    pub subscriber_handle: CUpti_SubscriberHandle,
 }
 
 unsafe impl Send for GlobalState {}
@@ -411,5 +412,6 @@ pub static GLOBAL_STATE: Lazy<Mutex<GlobalState>> = Lazy::new(|| {
         active_ctx: None,
         injection_initialized: false,
         config: Config::default(),
+        subscriber_handle: std::ptr::null_mut(),
     })
 });

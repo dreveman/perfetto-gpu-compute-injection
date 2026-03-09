@@ -20,6 +20,11 @@ use crate::tracing::{is_counters_enabled, trace_time_ns};
 use libc::c_void;
 use std::{ffi::CStr, panic, ptr};
 
+/// Buffer size for activity records (8 MB).
+const BUF_SIZE: usize = 8 * 1024 * 1024;
+/// Alignment for activity buffers (8 bytes).
+const ALIGN_SIZE: usize = 8;
+
 /// Callback for CUPTI to request a buffer for storing activity records.
 /// # Safety
 ///
@@ -27,11 +32,20 @@ use std::{ffi::CStr, panic, ptr};
 pub unsafe extern "C" fn buffer_requested(
     buffer: *mut *mut u8,
     size: *mut usize,
-    _max_num_records: *mut usize,
+    max_num_records: *mut usize,
 ) {
     let _ = panic::catch_unwind(|| {
-        *size = 16 * 1024;
-        *buffer = libc::malloc(*size) as *mut u8;
+        // Use posix_memalign for aligned allocation
+        let mut aligned_buffer: *mut libc::c_void = ptr::null_mut();
+        let result = libc::posix_memalign(&mut aligned_buffer, ALIGN_SIZE, BUF_SIZE);
+        if result != 0 || aligned_buffer.is_null() {
+            *buffer = ptr::null_mut();
+            *size = 0;
+            return;
+        }
+        *buffer = aligned_buffer as *mut u8;
+        *size = BUF_SIZE;
+        *max_num_records = 0; // Let CUPTI determine the max records
     });
 }
 
@@ -318,6 +332,15 @@ pub unsafe extern "C" fn profiler_callback_handler(
             let msg = CStr::from_ptr(state_data.__bindgen_anon_1.notification.message);
             eprintln!("CUPTI Fatal Error: {}: {}", err_str, msg.to_string_lossy());
             std::process::exit(1);
+        } else if domain == CUpti_CallbackDomain_CUPTI_CB_DOMAIN_RUNTIME_API
+            && cbid
+                == CUpti_runtime_api_trace_cbid_enum_CUPTI_RUNTIME_TRACE_CBID_cudaDeviceReset_v3020
+        {
+            let cb_data = &*(cbdata as *const CUpti_CallbackData);
+            if cb_data.callbackSite == CUpti_ApiCallbackSite_CUPTI_API_ENTER {
+                injection_log!("cudaDeviceReset detected, flushing activity buffers");
+                let _ = profiler::activity_flush_all(0);
+            }
         }
     });
 }

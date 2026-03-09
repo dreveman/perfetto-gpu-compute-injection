@@ -20,6 +20,12 @@ pub fn activity_enable(kind: CUpti_ActivityKind) -> Result<(), CUptiResult> {
     Ok(())
 }
 
+/// Disables a CUPTI activity kind.
+pub fn activity_disable(kind: CUpti_ActivityKind) -> Result<(), CUptiResult> {
+    check_cupti!(unsafe { cuptiActivityDisable(kind) });
+    Ok(())
+}
+
 /// Registers callbacks for CUPTI activity buffering.
 /// # Safety
 ///

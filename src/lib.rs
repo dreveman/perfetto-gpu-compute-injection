@@ -177,7 +177,6 @@ extern "C" fn end_execution() {
         };
         let metric_names = state.config.metrics.clone();
         let counters_enabled = is_counters_enabled();
-        let verbose = state.config.verbose;
 
         // Finalize the last kernel launch for each context (set end timestamp)
         // and only decode counter data and evaluate metrics if counters are enabled
@@ -203,7 +202,6 @@ extern "C" fn end_execution() {
                     .zip(data.kernel_launches.iter())
                     .zip(data.kernel_activities.iter())
                 {
-                    let duration_ns = launch.end.saturating_sub(launch.start);
                     let gpu_id = activity.gpu_id() as i32;
 
                     let got_first_counters =
@@ -233,17 +231,6 @@ extern "C" fn end_execution() {
                                         });
                                 });
                         });
-
-                        if verbose {
-                            println!("Range Name: {}", range.range_name);
-                            println!("Timestamp: {}", launch.start);
-                            println!("Duration: {}", duration_ns);
-                            println!("-----------------------------------------------------------------------------------");
-                            for metric in &range.metric_and_values {
-                                println!("{}: {}", metric.metric_name, metric.value);
-                            }
-                            println!("-----------------------------------------------------------------------------------\n");
-                        }
                     }
                     ctx.add_packet(|packet: &mut TracePacket| {
                         packet
@@ -274,23 +261,18 @@ extern "C" fn end_execution() {
                             });
                     });
 
-                    if verbose {
-                        println!("Range Name: {}", range.range_name);
-                        println!("Timestamp: {}", launch.start);
-                        println!("Duration: {}", duration_ns);
-                        println!(
-                            "-----------------------------------------------------------------------------------"
-                        );
-                        for metric in &range.metric_and_values {
-                            println!("{}: {}", metric.metric_name, metric.value);
-                        }
-                        println!(
-                            "-----------------------------------------------------------------------------------\n"
-                        );
-                    }
                 }
             }
         });
+
+        cuda_log!(
+            "emitted {} counter events",
+            state
+                .context_data
+                .values()
+                .map(|d| d.range_info.len())
+                .sum::<usize>()
+        );
 
         // Emit renderstages data (only if renderstages data source enabled)
         get_renderstages_data_source().trace(|ctx: &mut TraceContext| {
@@ -500,19 +482,6 @@ extern "C" fn end_execution() {
                         );
                     };
 
-                    if verbose {
-                        println!("Timestamp: {}", timestamp);
-                        println!(
-                            "-----------------------------------------------------------------------------------"
-                        );
-                        extra_data(&mut |name: &str, value: &str| {
-                            println!("{}: {}", name, value);
-                        });
-                        println!(
-                            "-----------------------------------------------------------------------------------\n"
-                        );
-                    }
-
                     let mut extra_data_vec: Vec<(String, String)> = Vec::new();
                     extra_data(&mut |name: &str, value: &str| {
                         extra_data_vec.push((name.to_string(), value.to_string()));
@@ -544,19 +513,6 @@ extern "C" fn end_execution() {
                 for activity in data.memcpy_activities.iter() {
                     let timestamp = activity.start;
                     let duration_ns = activity.end.saturating_sub(activity.start);
-
-                    if verbose {
-                        println!("MemoryTransfer Timestamp: {}", timestamp);
-                        println!(
-                            "-----------------------------------------------------------------------------------"
-                        );
-                        activity.emit_extra_data(process_id, &process_name, &mut |name, value| {
-                            println!("{}: {}", name, value);
-                        });
-                        println!(
-                            "-----------------------------------------------------------------------------------\n"
-                        );
-                    }
 
                     let mut extra_data_vec: Vec<(String, String)> = Vec::new();
                     activity.emit_extra_data(process_id, &process_name, &mut |name, value| {
@@ -590,19 +546,6 @@ extern "C" fn end_execution() {
                     let timestamp = activity.start;
                     let duration_ns = activity.end.saturating_sub(activity.start);
 
-                    if verbose {
-                        println!("MemorySet Timestamp: {}", timestamp);
-                        println!(
-                            "-----------------------------------------------------------------------------------"
-                        );
-                        activity.emit_extra_data(process_id, &process_name, &mut |name, value| {
-                            println!("{}: {}", name, value);
-                        });
-                        println!(
-                            "-----------------------------------------------------------------------------------\n"
-                        );
-                    }
-
                     let mut extra_data_vec: Vec<(String, String)> = Vec::new();
                     activity.emit_extra_data(process_id, &process_name, &mut |name, value| {
                         extra_data_vec.push((name.to_string(), value.to_string()));
@@ -632,6 +575,15 @@ extern "C" fn end_execution() {
                 }
             }
         });
+
+        let total_render_stages: usize = state
+            .context_data
+            .values()
+            .map(|d| {
+                d.kernel_activities.len() + d.memcpy_activities.len() + d.memset_activities.len()
+            })
+            .sum();
+        cuda_log!("emitted {} render stage events", total_render_stages);
     });
 }
 

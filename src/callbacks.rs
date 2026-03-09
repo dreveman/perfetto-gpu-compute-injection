@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::cupti_profiler::bindings::*;
+use crate::cupti_profiler::{self as profiler, *};
 use crate::injection_log;
 use crate::state::{KernelActivity, KernelLaunch, MemcpyActivity, MemsetActivity, GLOBAL_STATE};
 use crate::tracing::{is_counters_enabled, trace_time_ns};
-use cupti_profiler::bindings::*;
-use cupti_profiler::{self as profiler, *};
 use libc::c_void;
 use std::{ffi::CStr, panic, ptr};
 

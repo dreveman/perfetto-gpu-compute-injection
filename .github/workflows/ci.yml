@@ -55,19 +55,19 @@ jobs:
       run: cargo fmt -- --check
 
     - name: Verify C/C++ formatting
-      run: clang-format --dry-run --Werror -style=Google cupti-profiler-sys/stubs.cpp cupti-profiler-sys/wrapper.h
+      run: clang-format --dry-run --Werror -style=Google stubs.cpp wrapper.h
 
     - name: Lint with Clippy
       run: cargo clippy -- -D warnings
 
     - name: Run tests
-      run: cargo test --workspace --verbose
+      run: cargo test --verbose
 
     - name: Run tests (with stubs)
-      run: cargo test --workspace --verbose --features cupti-profiler/stubs
+      run: cargo test --verbose --features stubs
 
     - name: Build (release)
-      run: cargo build --release --workspace --verbose
+      run: cargo build --release --verbose
 
     - name: Upload library
       uses: actions/upload-artifact@v4

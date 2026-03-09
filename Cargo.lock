@@ -106,23 +106,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cupti-profiler"
-version = "0.1.0"
-dependencies = [
- "cupti-profiler-sys",
- "libc",
-]
-
-[[package]]
-name = "cupti-profiler-sys"
-version = "0.1.0"
-dependencies = [
- "bindgen 0.69.5",
- "cc",
- "libc",
-]
-
-[[package]]
 name = "either"
 version = "1.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -246,8 +229,9 @@ checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 name = "perfetto-gpu-compute-injection"
 version = "0.1.0"
 dependencies = [
+ "bindgen 0.69.5",
+ "cc",
  "cpp_demangle",
- "cupti-profiler",
  "libc",
  "once_cell",
  "perfetto-sdk",

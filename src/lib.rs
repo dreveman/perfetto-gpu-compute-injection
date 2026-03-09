@@ -697,6 +697,10 @@ fn register_profiler_callbacks() -> Result<CUpti_SubscriberHandle, CUptiResult> 
 #[no_mangle]
 pub extern "C" fn InitializeInjection() -> i32 {
     let result = panic::catch_unwind(|| {
+        // Load config first to initialize VERBOSE_ENABLED and TRACE_STARTUP
+        // before registering data sources (which may check these values)
+        let config = Config::from_env();
+
         let producer_args = ProducerInitArgsBuilder::new().backends(Backends::SYSTEM);
         Producer::init(producer_args.build());
         let _ = get_counters_data_source();
@@ -704,7 +708,7 @@ pub extern "C" fn InitializeInjection() -> i32 {
         if let Ok(mut state) = GLOBAL_STATE.lock() {
             if !state.injection_initialized {
                 state.injection_initialized = true;
-                state.config = Config::from_env();
+                state.config = config;
 
                 match register_profiler_callbacks() {
                     Ok(subscriber) => {

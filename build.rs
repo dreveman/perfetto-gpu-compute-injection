@@ -45,11 +45,14 @@ fn main() {
             .expect("Couldn't write bindings!");
     }
     if use_stubs {
-        cc::Build::new()
-            .file("stubs.cpp")
-            // stubs.cpp is self-contained and does not need CUDA headers
-            .cpp(true)
-            .compile("cupti_stubs");
+        #[cfg(feature = "stubs")]
+        {
+            cc::Build::new()
+                .file("stubs.cpp")
+                // stubs.cpp is self-contained and does not need CUDA headers
+                .cpp(true)
+                .compile("cupti_stubs");
+        }
     } else {
         println!(
             "cargo:rustc-link-search=native={}/lib64",

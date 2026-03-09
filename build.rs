@@ -16,7 +16,7 @@ use std::env;
 
 fn main() {
     let use_stubs = env::var("CARGO_FEATURE_STUBS").is_ok();
-    #[cfg(feature = "gen")]
+    #[cfg(feature = "bindgen")]
     {
         let cuda_path = env::var("CUDA_HOME").unwrap_or_else(|_| "/usr/local/cuda".to_string());
         let cuda_include = format!("{}/include", cuda_path);

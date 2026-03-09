@@ -18,13 +18,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 static VERBOSE_ENABLED: AtomicBool = AtomicBool::new(false);
 
-/// Log a message to stderr with the CUDA injection prefix.
-/// Only logs if CUDA_INJECTION_VERBOSE is set.
+/// Log a message to stderr with the injection prefix.
+/// Only logs if INJECTION_VERBOSE is set.
 #[macro_export]
-macro_rules! cuda_log {
+macro_rules! injection_log {
     ($($arg:tt)*) => {
         if $crate::config::is_verbose() {
-            eprintln!("==CUDA INJECTION== {}", format!($($arg)*));
+            eprintln!("==INJECTION== {}", format!($($arg)*));
         }
     };
 }
@@ -59,10 +59,10 @@ impl Default for Config {
 impl Config {
     /// Loads configuration from environment variables.
     ///
-    /// - `CUDA_INJECTION_VERBOSE`: specifies if verbose logging is enabled.
+    /// - `INJECTION_VERBOSE`: specifies if verbose logging is enabled.
     /// - `INJECTION_METRICS`: semicolon or comma separated list of metrics.
     pub fn from_env() -> Self {
-        let verbose = env::var("CUDA_INJECTION_VERBOSE").is_ok();
+        let verbose = env::var("INJECTION_VERBOSE").is_ok();
         VERBOSE_ENABLED.store(verbose, Ordering::Relaxed);
         let metrics_str = env::var("INJECTION_METRICS").unwrap_or_default();
         let metrics = parse_metrics(&metrics_str);

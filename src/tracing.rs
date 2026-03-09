@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::cuda_log;
+use crate::injection_log;
 use libc::{clock_gettime, timespec};
 use perfetto_sdk::data_source::{
     DataSource, DataSourceArgsBuilder, DataSourceBufferExhaustedPolicy,
@@ -94,7 +94,7 @@ pub fn get_counters_data_source() -> &'static DataSource<'static> {
             .on_start(move |inst_id, _| {
                 GOT_FIRST_COUNTERS.fetch_and(!(1 << inst_id), Ordering::SeqCst);
                 COUNTERS_ENABLED.store(true, Ordering::SeqCst);
-                cuda_log!("counters data source started");
+                injection_log!("counters data source started");
             })
             .on_stop(move |_inst_id, _| {
                 COUNTERS_ENABLED.store(false, Ordering::SeqCst);
@@ -119,7 +119,7 @@ pub fn get_renderstages_data_source() -> &'static DataSource<'static> {
             .on_start(move |inst_id, _| {
                 GOT_FIRST_RENDERSTAGES.fetch_and(!(1 << inst_id), Ordering::SeqCst);
                 RENDERSTAGES_ENABLED.store(true, Ordering::SeqCst);
-                cuda_log!("renderstages data source started");
+                injection_log!("renderstages data source started");
             })
             .on_stop(move |_inst_id, _| {
                 RENDERSTAGES_ENABLED.store(false, Ordering::SeqCst);

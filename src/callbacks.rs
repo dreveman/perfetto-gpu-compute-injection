@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::cuda_log;
+use crate::injection_log;
 use crate::state::{KernelActivity, KernelLaunch, MemcpyActivity, MemsetActivity, GLOBAL_STATE};
 use crate::tracing::{is_counters_enabled, trace_time_ns};
 use cupti_profiler::bindings::*;
@@ -60,7 +60,7 @@ pub unsafe extern "C" fn buffer_completed(
                     let k = &*(record as *const CUpti_ActivityKernel9);
                     if let Some(data) = state.context_data.get_mut(&k.contextId) {
                         let kernel_name = CStr::from_ptr(k.name).to_string_lossy().to_string();
-                        cuda_log!("kernel activity: {}", kernel_name);
+                        injection_log!("kernel activity: {}", kernel_name);
                         let device_uuid =
                             profiler::get_device_uuid(k.deviceId as i32).unwrap_or([0u8; 16]);
                         data.kernel_activities.push(KernelActivity {
@@ -83,7 +83,7 @@ pub unsafe extern "C" fn buffer_completed(
                 } else if r.kind == CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_MEMCPY {
                     let m = &*(record as *const CUpti_ActivityMemcpy6);
                     if let Some(data) = state.context_data.get_mut(&m.contextId) {
-                        cuda_log!("memcpy activity: {} bytes", m.bytes);
+                        injection_log!("memcpy activity: {} bytes", m.bytes);
                         let device_uuid =
                             profiler::get_device_uuid(m.deviceId as i32).unwrap_or([0u8; 16]);
                         data.memcpy_activities.push(MemcpyActivity {
@@ -102,7 +102,7 @@ pub unsafe extern "C" fn buffer_completed(
                 } else if r.kind == CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_MEMSET {
                     let m = &*(record as *const CUpti_ActivityMemset4);
                     if let Some(data) = state.context_data.get_mut(&m.contextId) {
-                        cuda_log!("memset activity: {} bytes", m.bytes);
+                        injection_log!("memset activity: {} bytes", m.bytes);
                         let device_uuid =
                             profiler::get_device_uuid(m.deviceId as i32).unwrap_or([0u8; 16]);
                         data.memset_activities.push(MemsetActivity {

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::bindings::*;
+use crate::cupti_profiler::bindings::*;
 use std::ffi::{c_void, CStr, CString};
 use std::os::raw::c_char;
 use std::ptr;

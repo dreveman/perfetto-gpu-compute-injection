@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use crate::config::Config;
-use cupti_profiler::bindings::*;
-use cupti_profiler::*;
+use crate::cupti_profiler::bindings::*;
+use crate::cupti_profiler::*;
 use once_cell::sync::Lazy;
 use std::{collections::HashMap, sync::Mutex};
 

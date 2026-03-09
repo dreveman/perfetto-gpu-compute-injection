@@ -38,8 +38,8 @@ fn main() {
             .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
             .generate()
             .expect("Unable to generate bindings");
-        // Write to src/bindings.rs directly
-        let out_path = std::path::PathBuf::from("src/bindings.rs");
+        // Write to src/cupti_profiler_sys/bindings.rs directly
+        let out_path = std::path::PathBuf::from("src/cupti_profiler_sys/bindings.rs");
         bindings
             .write_to_file(out_path)
             .expect("Couldn't write bindings!");

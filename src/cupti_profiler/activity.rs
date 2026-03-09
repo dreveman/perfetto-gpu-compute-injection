@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::bindings::*;
+use crate::cupti_profiler::bindings::*;
 
 /// Enables a CUPTI activity kind.
 pub fn activity_enable(kind: CUpti_ActivityKind) -> Result<(), CUptiResult> {

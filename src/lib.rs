@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub mod cupti_profiler;
+pub mod cupti_profiler_sys;
+
 pub mod callbacks;
 pub mod config;
 pub mod metrics;
@@ -30,9 +33,9 @@ use tracing::{
     GOT_FIRST_COUNTERS, GOT_FIRST_RENDERSTAGES,
 };
 
+use crate::cupti_profiler as profiler;
+use crate::cupti_profiler::bindings::*;
 use cpp_demangle::Symbol;
-use cupti_profiler as profiler;
-use cupti_profiler::bindings::*;
 use perfetto_sdk::{
     data_source::TraceContext,
     producer::{Backends, Producer, ProducerInitArgsBuilder},

@@ -12,24 +12,28 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::bindings::*;
-use std::ffi::CStr;
-use std::os::raw::c_char;
-use std::ptr;
+pub use crate::cupti_profiler_sys::*;
 
-/// Gets the last CUPTI error.
-pub fn get_last_error() -> CUptiResult {
-    unsafe { cuptiGetLastError() }
-}
+#[macro_use]
+pub mod macros;
 
-/// Gets the string description for a CUPTI result code.
-pub fn get_result_string(result: CUptiResult) -> String {
-    let mut err_str: *const c_char = ptr::null();
-    unsafe {
-        cuptiGetResultString(result, &mut err_str);
-        if err_str.is_null() {
-            return format!("Unknown error {:?}", result);
-        }
-        CStr::from_ptr(err_str).to_string_lossy().into_owned()
-    }
-}
+pub mod error;
+pub use error::*;
+
+pub mod cuda;
+pub use cuda::*;
+
+pub mod activity;
+pub use activity::*;
+
+pub mod subscriber;
+pub use subscriber::*;
+
+pub mod profiler;
+pub use profiler::*;
+
+pub mod range_profiler;
+pub use range_profiler::*;
+
+pub mod metric_evaluator;
+pub use metric_evaluator::*;

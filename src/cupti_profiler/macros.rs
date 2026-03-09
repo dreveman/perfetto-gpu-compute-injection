@@ -16,7 +16,7 @@
 macro_rules! check_cupti {
     ($res:expr) => {
         let res = $res;
-        if res != $crate::bindings::CUptiResult_CUPTI_SUCCESS {
+        if res != $crate::cupti_profiler::bindings::CUptiResult_CUPTI_SUCCESS {
             eprintln!("CUPTI Error: {:?}", res);
             return Err(res);
         }
@@ -32,7 +32,7 @@ macro_rules! struct_size_up_to {
 
 #[cfg(test)]
 mod tests {
-    use crate::bindings::{CUptiResult, CUptiResult_CUPTI_SUCCESS};
+    use crate::cupti_profiler::bindings::{CUptiResult, CUptiResult_CUPTI_SUCCESS};
 
     #[test]
     fn test_check_cupti_macro() {
@@ -42,8 +42,9 @@ mod tests {
         }
 
         fn dummy_failure() -> Result<(), CUptiResult> {
-            // Using an arbitrary error code
-            check_cupti!(crate::bindings::CUptiResult_CUPTI_ERROR_INVALID_PARAMETER);
+            check_cupti!(
+                crate::cupti_profiler::bindings::CUptiResult_CUPTI_ERROR_INVALID_PARAMETER
+            );
             Ok(())
         }
 

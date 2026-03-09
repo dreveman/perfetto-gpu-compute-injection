@@ -265,7 +265,7 @@ extern "C" fn end_execution() {
             }
         });
 
-        cuda_log!(
+        injection_log!(
             "emitted {} counter events",
             state
                 .context_data
@@ -583,7 +583,7 @@ extern "C" fn end_execution() {
                 d.kernel_activities.len() + d.memcpy_activities.len() + d.memset_activities.len()
             })
             .sum();
-        cuda_log!("emitted {} render stage events", total_render_stages);
+        injection_log!("emitted {} render stage events", total_render_stages);
     });
 }
 

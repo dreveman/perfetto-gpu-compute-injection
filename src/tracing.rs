@@ -12,18 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::config::trace_startup_has;
 use crate::injection_log;
 use libc::{clock_gettime, timespec};
 use perfetto_sdk::data_source::{
     DataSource, DataSourceArgsBuilder, DataSourceBufferExhaustedPolicy,
 };
-use std::{
-    env,
-    sync::{
-        atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
-        OnceLock,
-    },
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
+    Condvar, Mutex, OnceLock,
 };
+use std::time::Duration;
 
 #[cfg(target_os = "linux")]
 use libc::CLOCK_BOOTTIME as TRACE_TIME_CLOCK;
@@ -50,6 +49,12 @@ static COUNTERS_ENABLED: AtomicBool = AtomicBool::new(false);
 /// Atomic state tracking for whether renderstages data source is enabled.
 static RENDERSTAGES_ENABLED: AtomicBool = AtomicBool::new(false);
 
+/// Condvar flag for waiting on counters data source to start.
+static COUNTERS_STARTED: (Mutex<bool>, Condvar) = (Mutex::new(false), Condvar::new());
+
+/// Condvar flag for waiting on renderstages data source to start.
+static RENDERSTAGES_STARTED: (Mutex<bool>, Condvar) = (Mutex::new(false), Condvar::new());
+
 static GPU_COUNTERS_DATA_SOURCE: OnceLock<DataSource> = OnceLock::new();
 static GPU_RENDERSTAGES_DATA_SOURCE: OnceLock<DataSource> = OnceLock::new();
 
@@ -65,7 +70,7 @@ const DEFAULT_DATA_SOURCE_NAME_SUFFIX: &str = "nv";
 /// Returns the data source name suffix, reading from `INJECTION_DATA_SOURCE_NAME_SUFFIX` env var or using default.
 fn get_data_source_name_suffix() -> &'static str {
     DATA_SOURCE_NAME_SUFFIX.get_or_init(|| {
-        env::var("INJECTION_DATA_SOURCE_NAME_SUFFIX")
+        std::env::var("INJECTION_DATA_SOURCE_NAME_SUFFIX")
             .unwrap_or_else(|_| DEFAULT_DATA_SOURCE_NAME_SUFFIX.to_string())
     })
 }
@@ -82,6 +87,34 @@ fn get_renderstages_data_source_name() -> &'static str {
         .get_or_init(|| format!("gpu.renderstages.{}", get_data_source_name_suffix()))
 }
 
+/// Waits for a `(Mutex<bool>, Condvar)` flag to become true, with a 30s timeout.
+/// Logs a warning every 10s while waiting. Exits the process on timeout.
+fn wait_for_start(flag: &(Mutex<bool>, Condvar), label: &str) {
+    injection_log!("waiting for {} to start...", label);
+    let (lock, cvar) = flag;
+    let mut guard = lock.lock().expect("mutex poisoned");
+    for attempt in 1..=3 {
+        let (g, _timeout) = cvar
+            .wait_timeout_while(guard, Duration::from_secs(10), |started| !*started)
+            .expect("mutex poisoned");
+        guard = g;
+        if *guard {
+            injection_log!("{} started", label);
+            return;
+        }
+        if attempt < 3 {
+            injection_log!(
+                "WARNING: {} not started after {}s, still waiting...",
+                label,
+                attempt * 10
+            );
+        } else {
+            injection_log!("ERROR: {} never started (timed out after 30s)", label);
+            std::process::exit(1);
+        }
+    }
+}
+
 /// Initializes and retrieves the static Perfetto counters data source.
 ///
 /// This function is thread-safe and ensures the data source is registered only once.
@@ -95,14 +128,24 @@ pub fn get_counters_data_source() -> &'static DataSource<'static> {
                 GOT_FIRST_COUNTERS.fetch_and(!(1 << inst_id), Ordering::SeqCst);
                 COUNTERS_ENABLED.store(true, Ordering::SeqCst);
                 injection_log!("counters data source started");
+                // Signal that the data source has started
+                let (lock, cvar) = &COUNTERS_STARTED;
+                *lock.lock().expect("mutex poisoned") = true;
+                cvar.notify_all();
             })
             .on_stop(move |_inst_id, _| {
                 COUNTERS_ENABLED.store(false, Ordering::SeqCst);
             });
         let mut data_source = DataSource::new();
+        let ds_name = get_counters_data_source_name();
         data_source
-            .register(get_counters_data_source_name(), data_source_args.build())
+            .register(ds_name, data_source_args.build())
             .expect("failed to register counters data source");
+
+        if trace_startup_has(ds_name) {
+            wait_for_start(&COUNTERS_STARTED, ds_name);
+        }
+
         data_source
     })
 }
@@ -120,17 +163,24 @@ pub fn get_renderstages_data_source() -> &'static DataSource<'static> {
                 GOT_FIRST_RENDERSTAGES.fetch_and(!(1 << inst_id), Ordering::SeqCst);
                 RENDERSTAGES_ENABLED.store(true, Ordering::SeqCst);
                 injection_log!("renderstages data source started");
+                // Signal that the data source has started
+                let (lock, cvar) = &RENDERSTAGES_STARTED;
+                *lock.lock().expect("mutex poisoned") = true;
+                cvar.notify_all();
             })
             .on_stop(move |_inst_id, _| {
                 RENDERSTAGES_ENABLED.store(false, Ordering::SeqCst);
             });
         let mut data_source = DataSource::new();
+        let ds_name = get_renderstages_data_source_name();
         data_source
-            .register(
-                get_renderstages_data_source_name(),
-                data_source_args.build(),
-            )
+            .register(ds_name, data_source_args.build())
             .expect("failed to register renderstages data source");
+
+        if trace_startup_has(ds_name) {
+            wait_for_start(&RENDERSTAGES_STARTED, ds_name);
+        }
+
         data_source
     })
 }

@@ -15,8 +15,10 @@
 use crate::metrics::{parse_metrics, DEFAULT_METRICS};
 use std::env;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 
 static VERBOSE_ENABLED: AtomicBool = AtomicBool::new(false);
+static TRACE_STARTUP: OnceLock<Vec<String>> = OnceLock::new();
 
 /// Log a message to stderr with the injection prefix.
 /// Only logs if INJECTION_VERBOSE is set.
@@ -32,6 +34,14 @@ macro_rules! injection_log {
 /// Check if verbose logging is enabled.
 pub fn is_verbose() -> bool {
     VERBOSE_ENABLED.load(Ordering::Relaxed)
+}
+
+/// Returns true if `__TRACE_STARTUP` environment variable contains the given data source name.
+pub fn trace_startup_has(name: &str) -> bool {
+    TRACE_STARTUP
+        .get()
+        .map(|v| v.iter().any(|s| s == name))
+        .unwrap_or(false)
 }
 
 /// Configuration for the injection library.
@@ -61,9 +71,18 @@ impl Config {
     ///
     /// - `INJECTION_VERBOSE`: specifies if verbose logging is enabled.
     /// - `INJECTION_METRICS`: semicolon or comma separated list of metrics.
+    /// - `__TRACE_STARTUP`: comma-separated list of data sources to wait for at startup.
     pub fn from_env() -> Self {
         let verbose = env::var("INJECTION_VERBOSE").is_ok();
         VERBOSE_ENABLED.store(verbose, Ordering::Relaxed);
+
+        // Parse __TRACE_STARTUP into a list of data source names
+        let _ = TRACE_STARTUP.get_or_init(|| {
+            env::var("__TRACE_STARTUP")
+                .map(|v| v.split(',').map(|s| s.to_string()).collect())
+                .unwrap_or_default()
+        });
+
         let metrics_str = env::var("INJECTION_METRICS").unwrap_or_default();
         let metrics = parse_metrics(&metrics_str);
 

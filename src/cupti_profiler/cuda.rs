@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::cupti_profiler::bindings::*;
+use std::ffi::c_char;
 
 /// Safe wrapper for `cuCtxGetDevice`.
 /// # Safety
@@ -92,5 +93,5 @@ pub fn get_device_uuid(dev: CUdevice) -> Result<[u8; 16], u32> {
         return Err(res);
     }
     // Convert c_char bytes to u8 bytes
-    Ok(unsafe { std::mem::transmute::<[i8; 16], [u8; 16]>(uuid.bytes) })
+    Ok(unsafe { std::mem::transmute::<[c_char; 16], [u8; 16]>(uuid.bytes) })
 }

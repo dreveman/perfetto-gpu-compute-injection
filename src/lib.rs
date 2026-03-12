@@ -25,8 +25,8 @@ use crate::tracing::trace_time_ns;
 use callbacks::{buffer_completed, buffer_requested, profiler_callback_handler};
 use config::Config;
 use state::{
-    GpuActivity, GLOBAL_STATE, HW_QUEUE_IID_OFFSET, KERNEL_STAGE_IID, MEMCPY_STAGE_IID,
-    MEMSET_STAGE_IID,
+    ConsumerStartOffsets, GpuActivity, GLOBAL_STATE, HW_QUEUE_IID_OFFSET, KERNEL_STAGE_IID,
+    MEMCPY_STAGE_IID, MEMSET_STAGE_IID,
 };
 use tracing::{
     get_counters_data_source, get_next_event_id, get_renderstages_data_source, is_counters_enabled,
@@ -37,7 +37,7 @@ use crate::cupti_profiler as profiler;
 use crate::cupti_profiler::bindings::*;
 use cpp_demangle::Symbol;
 use perfetto_sdk::{
-    data_source::TraceContext,
+    data_source::{StopGuard, TraceContext},
     producer::{Backends, Producer, ProducerInitArgsBuilder},
     protos::{
         common::builtin_clock::BuiltinClock,
@@ -66,7 +66,16 @@ use perfetto_sdk_protos_gpu::protos::{
         trace_packet::prelude::*,
     },
 };
-use std::{panic, ptr, sync::atomic::Ordering};
+use std::{
+    panic, ptr,
+    sync::atomic::{AtomicU8, Ordering},
+};
+
+/// 3-state teardown guard: 0=not started, 1=in progress, 2=done.
+/// Using three states instead of a simple bool allows threads that lose
+/// the CAS race to spin-wait until teardown is fully complete before
+/// proceeding to emit events that depend on the flushed/finalized data.
+static CUPTI_TEARDOWN_STATE: AtomicU8 = AtomicU8::new(0);
 
 fn emit_interned_specifications(
     packet: &mut TracePacket,
@@ -166,72 +175,166 @@ fn emit_render_stage_event<T: GpuActivity>(
     });
 }
 
-extern "C" fn end_execution() {
-    let _ = panic::catch_unwind(|| {
-        // Clear any pending CUPTI errors before cleanup
-        let _ = profiler::get_last_error();
+// ---------------------------------------------------------------------------
+// CUPTI lifecycle helpers — called from on_start / on_stop in tracing.rs
+// ---------------------------------------------------------------------------
 
-        // 1. Disable cudaDeviceReset callback first
-        if let Ok(state) = GLOBAL_STATE.lock() {
-            let subscriber = state.subscriber_handle;
-            if !subscriber.is_null() {
-                let _ = unsafe {
-                    profiler::enable_callback(
-                        0,
-                        subscriber,
-                        CUpti_CallbackDomain_CUPTI_CB_DOMAIN_RUNTIME_API,
-                        CUpti_runtime_api_trace_cbid_enum_CUPTI_RUNTIME_TRACE_CBID_cudaDeviceReset_v3020,
-                    )
-                };
+/// Called when the very first consumer of any type starts (CUPTI was quiescent).
+/// Resets the teardown guard and enables base CUPTI activities.
+pub(crate) fn on_first_consumer_start() {
+    CUPTI_TEARDOWN_STATE.store(0, Ordering::SeqCst);
+    let _ = profiler::activity_enable(CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL);
+    let _ = profiler::activity_enable(CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_MEMCPY);
+    if let Ok(state) = GLOBAL_STATE.lock() {
+        let subscriber = state.subscriber_handle;
+        if !subscriber.is_null() {
+            let _ = unsafe {
+                profiler::enable_callback(
+                    1,
+                    subscriber,
+                    CUpti_CallbackDomain_CUPTI_CB_DOMAIN_RUNTIME_API,
+                    CUpti_runtime_api_trace_cbid_enum_CUPTI_RUNTIME_TRACE_CBID_cudaDeviceReset_v3020,
+                )
+            };
+        }
+    }
+}
+
+/// Called when the first counters consumer starts. Disables MEMSET to avoid a
+/// conflict with the Range Profiler's kernel replay mode.
+pub(crate) fn on_first_counters_start() {
+    let _ = profiler::activity_disable(CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_MEMSET);
+}
+
+/// Called when the last counters consumer stops while renderstages are still running.
+/// Re-enables MEMSET since the Range Profiler is no longer active.
+pub(crate) fn on_last_counters_stop() {
+    let _ = profiler::activity_enable(CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_MEMSET);
+}
+
+/// Called when the first renderstages consumer starts with no counters running.
+/// Enables MEMSET activity collection.
+pub(crate) fn on_renderstages_start_no_counters() {
+    let _ = profiler::activity_enable(CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_MEMSET);
+}
+
+/// Snapshot start offsets for a new counters consumer.
+pub(crate) fn register_counters_consumer(inst_id: u32) {
+    if let Ok(mut state) = GLOBAL_STATE.lock() {
+        let offsets = ConsumerStartOffsets::snapshot(&state.context_data);
+        state.counters_consumers.insert(inst_id, offsets);
+    }
+}
+
+/// Snapshot start offsets for a new renderstages consumer.
+pub(crate) fn register_renderstages_consumer(inst_id: u32) {
+    if let Ok(mut state) = GLOBAL_STATE.lock() {
+        let offsets = ConsumerStartOffsets::snapshot(&state.context_data);
+        state.renderstages_consumers.insert(inst_id, offsets);
+    }
+}
+
+/// Flush CUPTI activity buffers without disabling activities.
+/// Used when a consumer stops while other consumers are still running.
+pub(crate) fn flush_activity_buffers() {
+    let _ = profiler::activity_flush_all(CUpti_ActivityFlag_CUPTI_ACTIVITY_FLAG_FLUSH_FORCED);
+}
+
+/// Finalize the range profiler for all contexts without disabling CUPTI activities.
+/// Called when the last counters consumer stops but renderstages consumers are
+/// still running.
+pub(crate) fn finalize_range_profiler() {
+    if let Ok(mut state) = GLOBAL_STATE.lock() {
+        let metric_names = state.config.metrics.clone();
+        for (_, data) in state.context_data.iter_mut() {
+            data.finalize_profiler(&metric_names, false);
+            if let Some(last_launch) = data.kernel_launches.iter_mut().rev().find(|l| l.profiled) {
+                if last_launch.end == 0 {
+                    last_launch.end = trace_time_ns();
+                }
             }
         }
+    }
+}
 
-        // 2. Disable all activities BEFORE flush
-        let _ =
-            profiler::activity_disable(CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL);
-        let _ = profiler::activity_disable(CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_MEMCPY);
-        let _ = profiler::activity_disable(CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_MEMSET);
+/// Full CUPTI teardown: disable all activities, flush buffers, finalize range profiler.
+/// Only runs when ALL consumers (counters and renderstages) have stopped.
+/// Uses a 3-state atomic so concurrent callers from different on_stop threads serialize.
+pub(crate) fn run_cupti_teardown() {
+    if CUPTI_TEARDOWN_STATE
+        .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+        .is_ok()
+    {
+        let _ = panic::catch_unwind(|| {
+            let _ = profiler::get_last_error();
 
-        // 3. Force flush all activity buffers
-        let _ = profiler::activity_flush_all(CUpti_ActivityFlag_CUPTI_ACTIVITY_FLAG_FLUSH_FORCED);
-        let process_id = unsafe { libc::getpid() };
-        let process_name = std::fs::read_to_string("/proc/self/comm")
-            .unwrap_or_else(|_| "unknown".to_string())
-            .trim_end_matches('\n')
-            .to_owned();
+            if let Ok(state) = GLOBAL_STATE.lock() {
+                let subscriber = state.subscriber_handle;
+                if !subscriber.is_null() {
+                    let _ = unsafe {
+                        profiler::enable_callback(
+                            0,
+                            subscriber,
+                            CUpti_CallbackDomain_CUPTI_CB_DOMAIN_RUNTIME_API,
+                            CUpti_runtime_api_trace_cbid_enum_CUPTI_RUNTIME_TRACE_CBID_cudaDeviceReset_v3020,
+                        )
+                    };
+                }
+            }
+
+            let _ = profiler::activity_disable(
+                CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL,
+            );
+            let _ = profiler::activity_disable(CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_MEMCPY);
+            let _ = profiler::activity_disable(CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_MEMSET);
+            let _ =
+                profiler::activity_flush_all(CUpti_ActivityFlag_CUPTI_ACTIVITY_FLAG_FLUSH_FORCED);
+
+            finalize_range_profiler();
+        });
+        CUPTI_TEARDOWN_STATE.store(2, Ordering::SeqCst);
+    } else {
+        while CUPTI_TEARDOWN_STATE.load(Ordering::SeqCst) != 2 {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-consumer event emission
+// ---------------------------------------------------------------------------
+
+/// Emit counter events for a specific data source instance using its recorded
+/// start offsets.  Only data added to each context's vectors after this consumer
+/// started is emitted.  The consumer entry is removed from the map before
+/// emission so the atexit fallback doesn't double-emit it.
+pub(crate) fn emit_counter_events_for_instance(inst_id: u32, stop_guard: Option<StopGuard>) {
+    let _ = panic::catch_unwind(|| {
         let mut state = match GLOBAL_STATE.lock() {
             Ok(s) => s,
             Err(_) => return,
         };
-        let metric_names = state.config.metrics.clone();
-        let counters_enabled = is_counters_enabled();
-
-        // Finalize the last kernel launch for each context (set end timestamp)
-        // and only decode counter data and evaluate metrics if counters are enabled
-        if counters_enabled {
-            for (_, data) in state.context_data.iter_mut() {
-                data.finalize_profiler(&metric_names, false);
-                // Finalize the last kernel launch with end timestamp
-                if let Some(last_launch) = data.kernel_launches.last_mut() {
-                    if last_launch.end == 0 {
-                        last_launch.end = trace_time_ns();
-                    }
-                }
-            }
-        }
-
-        // Emit counters data (only if counters data source enabled)
+        let start_offsets = match state.counters_consumers.remove(&inst_id) {
+            Some(o) => o,
+            None => return,
+        };
+        let mut stop_guard_opt = stop_guard;
         get_counters_data_source().trace(|ctx: &mut TraceContext| {
-            let inst_id = ctx.instance_index();
-            for (_, data) in state.context_data.iter() {
-                for ((range, launch), activity) in data
-                    .range_info
+            if ctx.instance_index() != inst_id {
+                return;
+            }
+            for (ctx_id, data) in state.context_data.iter() {
+                let range_start = start_offsets.range_info.get(ctx_id).copied().unwrap_or(0);
+                let launch_start =
+                    start_offsets.kernel_launches.get(ctx_id).copied().unwrap_or(0);
+                let activity_start =
+                    start_offsets.kernel_activities.get(ctx_id).copied().unwrap_or(0);
+                for ((range, launch), activity) in data.range_info[range_start..]
                     .iter()
-                    .zip(data.kernel_launches.iter())
-                    .zip(data.kernel_activities.iter())
+                    .zip(data.kernel_launches[launch_start..].iter())
+                    .zip(data.kernel_activities[activity_start..].iter())
                 {
                     let gpu_id = activity.gpu_id() as i32;
-
                     let got_first_counters =
                         GOT_FIRST_COUNTERS.fetch_or(1 << inst_id, Ordering::SeqCst);
                     if got_first_counters & (1 << inst_id) == 0 {
@@ -240,9 +343,8 @@ extern "C" fn end_execution() {
                                 .set_timestamp(launch.start)
                                 .set_timestamp_clock_id(BuiltinClock::BuiltinClockBoottime.into())
                                 .set_gpu_counter_event(|event: &mut GpuCounterEvent| {
-                                    event
-                                        .set_gpu_id(gpu_id)
-                                        .set_counter_descriptor(|desc: &mut GpuCounterDescriptor| {
+                                    event.set_gpu_id(gpu_id).set_counter_descriptor(
+                                        |desc: &mut GpuCounterDescriptor| {
                                             for (i, metric) in
                                                 range.metric_and_values.iter().enumerate()
                                             {
@@ -256,7 +358,8 @@ extern "C" fn end_execution() {
                                                     },
                                                 );
                                             }
-                                        });
+                                        },
+                                    );
                                 });
                         });
                     }
@@ -288,49 +391,80 @@ extern "C" fn end_execution() {
                                 }
                             });
                     });
-
                 }
             }
+            let mut sg = Some(stop_guard_opt.take());
+            ctx.flush(move || drop(sg.take()));
         });
+        drop(stop_guard_opt);
+        let emitted: usize = state
+            .context_data
+            .iter()
+            .map(|(ctx_id, data)| {
+                let start = start_offsets.range_info.get(ctx_id).copied().unwrap_or(0);
+                data.range_info.len().saturating_sub(start)
+            })
+            .sum();
+        injection_log!("emitted {} counter events (instance {})", emitted, inst_id);
+    });
+}
 
-        injection_log!(
-            "emitted {} counter events",
-            state
-                .context_data
-                .values()
-                .map(|d| d.range_info.len())
-                .sum::<usize>()
-        );
+/// Emit renderstage events for a specific data source instance.
+pub(crate) fn emit_renderstage_events_for_instance(inst_id: u32, stop_guard: Option<StopGuard>) {
+    let _ = panic::catch_unwind(|| {
+        let process_id = unsafe { libc::getpid() };
+        let process_name = std::fs::read_to_string("/proc/self/comm")
+            .unwrap_or_else(|_| "unknown".to_string())
+            .trim_end_matches('\n')
+            .to_owned();
 
-        // Emit renderstages data (only if renderstages data source enabled)
+        let mut state = match GLOBAL_STATE.lock() {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let start_offsets = match state.renderstages_consumers.remove(&inst_id) {
+            Some(o) => o,
+            None => return,
+        };
+        let mut stop_guard_opt = stop_guard;
         get_renderstages_data_source().trace(|ctx: &mut TraceContext| {
-            let inst_id = ctx.instance_index();
-            // Collect unique channel IDs and context IDs for generating specifications
-            let mut channels: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
+            if ctx.instance_index() != inst_id {
+                return;
+            }
+            // Collect unique channels and contexts from this consumer's data slice.
+            let mut channels: std::collections::HashSet<(u32, u32)> =
+                std::collections::HashSet::new();
             let mut contexts: std::collections::HashSet<u32> = std::collections::HashSet::new();
-            for (_, data) in state.context_data.iter() {
-                for activity in data.kernel_activities.iter() {
+            for (ctx_id, data) in state.context_data.iter() {
+                let ka_start =
+                    start_offsets.kernel_activities.get(ctx_id).copied().unwrap_or(0);
+                let mc_start =
+                    start_offsets.memcpy_activities.get(ctx_id).copied().unwrap_or(0);
+                let ms_start =
+                    start_offsets.memset_activities.get(ctx_id).copied().unwrap_or(0);
+                for activity in data.kernel_activities[ka_start..].iter() {
                     channels.insert((activity.channel_id, activity.channel_type));
                     contexts.insert(activity.context_id);
                 }
-                for activity in data.memcpy_activities.iter() {
+                for activity in data.memcpy_activities[mc_start..].iter() {
                     channels.insert((activity.channel_id, activity.channel_type));
                     contexts.insert(activity.context_id);
                 }
-                for activity in data.memset_activities.iter() {
+                for activity in data.memset_activities[ms_start..].iter() {
                     channels.insert((activity.channel_id, activity.channel_type));
                     contexts.insert(activity.context_id);
                 }
             }
-            for (_, data) in state.context_data.iter() {
-                for (launch, activity) in data
-                    .kernel_launches
+            for (ctx_id, data) in state.context_data.iter() {
+                let launch_start =
+                    start_offsets.kernel_launches.get(ctx_id).copied().unwrap_or(0);
+                let ka_start =
+                    start_offsets.kernel_activities.get(ctx_id).copied().unwrap_or(0);
+                for (launch, activity) in data.kernel_launches[launch_start..]
                     .iter()
-                    .zip(data.kernel_activities.iter())
+                    .zip(data.kernel_activities[ka_start..].iter())
                 {
-                    // When counters are enabled, use launch timestamps captured around profiler
-                    // When counters are disabled, use activity timestamps directly (they are valid)
-                    let (timestamp, duration_ns) = if counters_enabled {
+                    let (timestamp, duration_ns) = if launch.profiled {
                         (launch.start, launch.end.saturating_sub(launch.start))
                     } else {
                         (activity.start, activity.end.saturating_sub(activity.start))
@@ -509,7 +643,6 @@ extern "C" fn end_execution() {
                             &max_active_warps_pct.to_string(),
                         );
                     };
-
                     let mut extra_data_vec: Vec<(String, String)> = Vec::new();
                     extra_data(&mut |name: &str, value: &str| {
                         extra_data_vec.push((name.to_string(), value.to_string()));
@@ -537,16 +670,14 @@ extern "C" fn end_execution() {
                         );
                     });
                 }
-                // Emit render stage events for memcpy activities
-                for activity in data.memcpy_activities.iter() {
+                let mc_start = start_offsets.memcpy_activities.get(ctx_id).copied().unwrap_or(0);
+                for activity in data.memcpy_activities[mc_start..].iter() {
                     let timestamp = activity.start;
                     let duration_ns = activity.end.saturating_sub(activity.start);
-
                     let mut extra_data_vec: Vec<(String, String)> = Vec::new();
                     activity.emit_extra_data(process_id, &process_name, &mut |name, value| {
                         extra_data_vec.push((name.to_string(), value.to_string()));
                     });
-
                     let got_first_renderstages =
                         GOT_FIRST_RENDERSTAGES.fetch_or(1 << inst_id, Ordering::SeqCst);
                     ctx.with_incremental_state(|ctx: &mut TraceContext, inc_state| {
@@ -569,16 +700,14 @@ extern "C" fn end_execution() {
                         );
                     });
                 }
-                // Emit render stage events for memset activities
-                for activity in data.memset_activities.iter() {
+                let ms_start = start_offsets.memset_activities.get(ctx_id).copied().unwrap_or(0);
+                for activity in data.memset_activities[ms_start..].iter() {
                     let timestamp = activity.start;
                     let duration_ns = activity.end.saturating_sub(activity.start);
-
                     let mut extra_data_vec: Vec<(String, String)> = Vec::new();
                     activity.emit_extra_data(process_id, &process_name, &mut |name, value| {
                         extra_data_vec.push((name.to_string(), value.to_string()));
                     });
-
                     let got_first_renderstages =
                         GOT_FIRST_RENDERSTAGES.fetch_or(1 << inst_id, Ordering::SeqCst);
                     ctx.with_incremental_state(|ctx: &mut TraceContext, inc_state| {
@@ -602,16 +731,68 @@ extern "C" fn end_execution() {
                     });
                 }
             }
+            let mut sg = Some(stop_guard_opt.take());
+            ctx.flush(move || drop(sg.take()));
         });
-
-        let total_render_stages: usize = state
+        drop(stop_guard_opt);
+        let emitted: usize = state
             .context_data
-            .values()
-            .map(|d| {
-                d.kernel_activities.len() + d.memcpy_activities.len() + d.memset_activities.len()
+            .iter()
+            .map(|(ctx_id, data)| {
+                let ka = start_offsets
+                    .kernel_activities
+                    .get(ctx_id)
+                    .copied()
+                    .unwrap_or(0);
+                let mc = start_offsets
+                    .memcpy_activities
+                    .get(ctx_id)
+                    .copied()
+                    .unwrap_or(0);
+                let ms = start_offsets
+                    .memset_activities
+                    .get(ctx_id)
+                    .copied()
+                    .unwrap_or(0);
+                data.kernel_activities.len().saturating_sub(ka)
+                    + data.memcpy_activities.len().saturating_sub(mc)
+                    + data.memset_activities.len().saturating_sub(ms)
             })
             .sum();
-        injection_log!("emitted {} render stage events", total_render_stages);
+        injection_log!(
+            "emitted {} render stage events (instance {})",
+            emitted,
+            inst_id
+        );
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Atexit fallback
+// ---------------------------------------------------------------------------
+
+/// Atexit handler: emit for all consumers that are still registered (i.e. whose
+/// `on_stop` was never called because the process is exiting with active sessions).
+/// When all consumers have already stopped via `on_stop`, the consumer maps are
+/// empty and teardown is already done, making this a near-no-op.
+extern "C" fn end_execution() {
+    let _ = panic::catch_unwind(|| {
+        run_cupti_teardown();
+        // Collect remaining consumer inst_ids (those whose on_stop never fired).
+        let counter_ids: Vec<u32> = GLOBAL_STATE
+            .lock()
+            .map(|s| s.counters_consumers.keys().copied().collect())
+            .unwrap_or_default();
+        let renderstage_ids: Vec<u32> = GLOBAL_STATE
+            .lock()
+            .map(|s| s.renderstages_consumers.keys().copied().collect())
+            .unwrap_or_default();
+        for inst_id in counter_ids {
+            emit_counter_events_for_instance(inst_id, None);
+        }
+        for inst_id in renderstage_ids {
+            emit_renderstage_events_for_instance(inst_id, None);
+        }
     });
 }
 

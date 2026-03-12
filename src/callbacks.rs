@@ -203,14 +203,18 @@ pub unsafe extern "C" fn profiler_callback_handler(
                                 data.range_profiler = Some(rp);
                                 data.is_active = true;
                             }
-                            // Record kernel launch with start timestamp
-                            // When counters enabled: start is captured now, end will be set in API_EXIT
-                            // When counters disabled: start/end are not used (activity timestamps are used instead)
+                            // Record kernel launch with start timestamp.
+                            // When counters are enabled the range profiler introduces GPU kernel
+                            // replay which distorts GPU timestamps, so renderstage emission must
+                            // use the CPU-side launch timestamps instead. The `profiled` flag
+                            // records this choice per-kernel so it remains correct across sessions
+                            // where counters may have been enabled for some launches but not others.
                             let start = trace_time_ns();
                             data.kernel_launches.push(KernelLaunch {
                                 function: params.f,
                                 start,
                                 end: 0, // Will be set in API_EXIT when profiler completes
+                                profiled: counters_enabled,
                             });
                         }
                     }

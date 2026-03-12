@@ -77,6 +77,10 @@ pub struct KernelLaunch {
     pub start: u64,
     /// Trace timestamp captured after range profiler pop completes all passes (when counters enabled).
     pub end: u64,
+    /// Whether this launch was profiled by the range profiler (counters were enabled).
+    /// When true, `start`/`end` are valid CPU-side timestamps to use for renderstage events.
+    /// When false, activity timestamps from CUPTI activity records should be used instead.
+    pub profiled: bool,
 }
 
 /// Detailed activity information for a kernel execution.
@@ -340,6 +344,40 @@ impl GpuActivity for MemsetActivity {
     }
 }
 
+/// Records the starting index in each per-context data vector at the moment a
+/// data-source consumer (instance) started.  Emission for that consumer spans
+/// from these offsets to the current end of each vector.
+///
+/// Contexts that did not exist when the consumer started are absent from the
+/// maps; an offset of 0 is used for them (emit everything, since all of their
+/// data post-dates the consumer start).
+#[derive(Default)]
+pub struct ConsumerStartOffsets {
+    pub range_info: HashMap<u32, usize>,
+    pub kernel_launches: HashMap<u32, usize>,
+    pub kernel_activities: HashMap<u32, usize>,
+    pub memcpy_activities: HashMap<u32, usize>,
+    pub memset_activities: HashMap<u32, usize>,
+}
+
+impl ConsumerStartOffsets {
+    /// Snapshot the current vector lengths for all existing contexts.
+    pub fn snapshot(context_data: &HashMap<u32, Box<CtxProfilerData>>) -> Self {
+        let mut s = Self::default();
+        for (&ctx_id, data) in context_data {
+            s.range_info.insert(ctx_id, data.range_info.len());
+            s.kernel_launches.insert(ctx_id, data.kernel_launches.len());
+            s.kernel_activities
+                .insert(ctx_id, data.kernel_activities.len());
+            s.memcpy_activities
+                .insert(ctx_id, data.memcpy_activities.len());
+            s.memset_activities
+                .insert(ctx_id, data.memset_activities.len());
+        }
+        s
+    }
+}
+
 /// Profiling data associated with a specific CUDA context.
 ///
 /// Handles the lifecycle of the range profiler, metric evaluator, and stores collected
@@ -399,6 +437,10 @@ pub struct GlobalState {
     pub injection_initialized: bool,
     pub config: Config,
     pub subscriber_handle: CUpti_SubscriberHandle,
+    /// Start offsets per active counters consumer instance (keyed by inst_id 0-7).
+    pub counters_consumers: HashMap<u32, ConsumerStartOffsets>,
+    /// Start offsets per active renderstages consumer instance (keyed by inst_id 0-7).
+    pub renderstages_consumers: HashMap<u32, ConsumerStartOffsets>,
 }
 
 unsafe impl Send for GlobalState {}
@@ -413,5 +455,7 @@ pub static GLOBAL_STATE: Lazy<Mutex<GlobalState>> = Lazy::new(|| {
         injection_initialized: false,
         config: Config::default(),
         subscriber_handle: std::ptr::null_mut(),
+        counters_consumers: HashMap::new(),
+        renderstages_consumers: HashMap::new(),
     })
 });

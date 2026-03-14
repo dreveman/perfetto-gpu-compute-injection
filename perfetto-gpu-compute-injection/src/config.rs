@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::metrics::{parse_metrics, DEFAULT_METRICS};
 use std::env;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
@@ -29,6 +28,16 @@ macro_rules! injection_log {
             eprintln!("==INJECTION== {}", format!($($arg)*));
         }
     };
+}
+
+/// Log a fatal error to stderr and exit the process.
+/// Always prints regardless of INJECTION_VERBOSE.
+#[macro_export]
+macro_rules! injection_fatal {
+    ($($arg:tt)*) => {{
+        eprintln!("==INJECTION== FATAL: {}", format!($($arg)*));
+        std::process::exit(1);
+    }};
 }
 
 /// Check if verbose logging is enabled.
@@ -53,15 +62,17 @@ pub struct Config {
     ///
     /// Note: This is only used when the counters data source is enabled.
     /// When only the renderstages data source is enabled, metrics collection
-    /// is skipped for better performance.
+    /// is skipped for better performance. Metrics parsing lives in the
+    /// backend-specific crate (e.g. perfetto-cuda-injection).
     pub metrics: Vec<String>,
 }
 
+#[allow(clippy::derivable_impls)]
 impl Default for Config {
     fn default() -> Self {
         Self {
             verbose: false,
-            metrics: DEFAULT_METRICS.iter().map(|s| s.to_string()).collect(),
+            metrics: Vec::new(),
         }
     }
 }
@@ -70,8 +81,9 @@ impl Config {
     /// Loads configuration from environment variables.
     ///
     /// - `INJECTION_VERBOSE`: specifies if verbose logging is enabled.
-    /// - `INJECTION_METRICS`: semicolon or comma separated list of metrics.
     /// - `__TRACE_STARTUP`: comma-separated list of data sources to wait for at startup.
+    ///
+    /// Note: `INJECTION_METRICS` is handled by backend-specific crates, not here.
     pub fn from_env() -> Self {
         let verbose = env::var("INJECTION_VERBOSE").is_ok();
         VERBOSE_ENABLED.store(verbose, Ordering::Relaxed);
@@ -83,9 +95,9 @@ impl Config {
                 .unwrap_or_default()
         });
 
-        let metrics_str = env::var("INJECTION_METRICS").unwrap_or_default();
-        let metrics = parse_metrics(&metrics_str);
-
-        Self { verbose, metrics }
+        Self {
+            verbose,
+            metrics: Vec::new(),
+        }
     }
 }

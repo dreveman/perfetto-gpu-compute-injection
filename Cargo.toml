@@ -1,34 +1,7 @@
-[package]
-edition = "2021"
-name = "perfetto-gpu-compute-injection"
-version = "0.3.0"
-build = "build.rs"
-authors = ["David Reveman <reveman@meta.com>"]
-description = "Perfetto GPU Compute Injection"
-readme = "README.md"
-keywords = [
-    "tracing",
-    "perfetto",
+[workspace]
+members = [
+    "perfetto-gpu-compute-injection",
+    "perfetto-cuda-injection",
+    "perfetto-hip-injection",
 ]
-categories = ["development-tools::profiling"]
-license = "Apache-2.0"
-homepage = "https://www.perfetto.dev"
-repository = "https://github.com/dreveman/perfetto-gpu-compute-injection"
-
-[lib]
-crate-type = ["cdylib"]
-
-[dependencies]
-cpp_demangle = "0.5"
-libc = "0.2"
-once_cell = "1"
-perfetto-sdk = "0.3"
-perfetto-sdk-protos-gpu = "0.3"
-
-[features]
-stubs = ["dep:cc"]
-bindgen = ["dep:bindgen"]
-
-[build-dependencies]
-bindgen = { version = "0.72", optional = true }
-cc = { version = "1", optional = true }
+resolver = "2"

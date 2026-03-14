@@ -166,14 +166,38 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
-name = "perfetto-gpu-compute-injection"
-version = "0.2.1"
+name = "perfetto-cuda-injection"
+version = "0.4.0"
 dependencies = [
  "bindgen",
  "cc",
  "cpp_demangle",
  "libc",
  "once_cell",
+ "perfetto-gpu-compute-injection",
+ "perfetto-sdk",
+ "perfetto-sdk-protos-gpu",
+]
+
+[[package]]
+name = "perfetto-gpu-compute-injection"
+version = "0.4.0"
+dependencies = [
+ "libc",
+ "once_cell",
+ "perfetto-sdk",
+]
+
+[[package]]
+name = "perfetto-hip-injection"
+version = "0.4.0"
+dependencies = [
+ "bindgen",
+ "cc",
+ "cpp_demangle",
+ "libc",
+ "once_cell",
+ "perfetto-gpu-compute-injection",
  "perfetto-sdk",
  "perfetto-sdk-protos-gpu",
 ]

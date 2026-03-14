@@ -17,7 +17,7 @@ macro_rules! check_cupti {
     ($res:expr) => {
         let res = $res;
         if res != $crate::cupti_profiler::bindings::CUptiResult_CUPTI_SUCCESS {
-            eprintln!("CUPTI Error: {:?}", res);
+            ::perfetto_gpu_compute_injection::injection_log!("CUPTI Error: {:?}", res);
             return Err(res);
         }
     };

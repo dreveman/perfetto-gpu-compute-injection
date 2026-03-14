@@ -16,6 +16,7 @@ use crate::cupti_profiler::bindings::*;
 use crate::cupti_profiler::profiler::{
     get_chip_name, get_counter_availability_image, ProfilerHost,
 };
+use perfetto_gpu_compute_injection::injection_log;
 use std::ffi::CString;
 use std::os::raw::c_char;
 use std::ptr;
@@ -28,6 +29,7 @@ pub struct RangeProfiler {
     pub pass_index: usize,
     pub target_nesting_level: usize,
     pub is_all_pass_submitted: bool,
+    validated_metric_names: Vec<String>,
 }
 
 unsafe impl Send for RangeProfiler {}
@@ -43,6 +45,7 @@ impl RangeProfiler {
             pass_index: 0,
             target_nesting_level: 0,
             is_all_pass_submitted: false,
+            validated_metric_names: Vec::new(),
         }
     }
 
@@ -111,10 +114,16 @@ impl RangeProfiler {
             counter_avail,
             CUpti_ProfilerType_CUPTI_PROFILER_TYPE_RANGE_PROFILER,
         )?;
-        self.config_image = host.create_config_image(metric_names)?;
-        if counter_data_image.is_empty() {
-            self.create_counter_data_image(max_num_ranges, metric_names, counter_data_image)?;
+        let valid_metrics = host.filter_valid_metrics(metric_names);
+        if valid_metrics.is_empty() {
+            injection_log!("no valid metrics available, skipping counter collection");
+            return Ok(());
         }
+        self.config_image = host.create_config_image(&valid_metrics)?;
+        if counter_data_image.is_empty() {
+            self.create_counter_data_image(max_num_ranges, &valid_metrics, counter_data_image)?;
+        }
+        self.validated_metric_names = valid_metrics;
         let mut params: CUpti_RangeProfiler_SetConfig_Params = unsafe { std::mem::zeroed() };
         params.structSize =
             struct_size_up_to!(CUpti_RangeProfiler_SetConfig_Params, targetNestingLevel: u16);
@@ -173,6 +182,11 @@ impl RangeProfiler {
         params.pRangeProfilerObject = self.range_profiler_object;
         check_cupti!(unsafe { cuptiRangeProfilerDecodeData(&mut params) });
         Ok(())
+    }
+
+    /// Returns the metric names that were validated as available during `set_config`.
+    pub fn validated_metric_names(&self) -> &[String] {
+        &self.validated_metric_names
     }
 
     pub fn initialize_counter_data_image(

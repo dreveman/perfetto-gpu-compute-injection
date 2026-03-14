@@ -12,12 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::cupti_profiler::bindings::*;
 use crate::cupti_profiler::{self as profiler, *};
-use crate::injection_log;
 use crate::state::{KernelActivity, KernelLaunch, MemcpyActivity, MemsetActivity, GLOBAL_STATE};
-use crate::tracing::{is_counters_enabled, trace_time_ns};
 use libc::c_void;
+use perfetto_gpu_compute_injection::tracing::{is_counters_enabled, trace_time_ns};
+use perfetto_gpu_compute_injection::{injection_fatal, injection_log};
 use std::{ffi::CStr, panic, ptr};
 
 /// Buffer size for activity records (8 MB).
@@ -170,7 +169,6 @@ pub unsafe extern "C" fn profiler_callback_handler(
             let params = &*(cb_data.functionParams as *const cuLaunchKernel_params);
             if cb_data.callbackSite == CUpti_ApiCallbackSite_CUPTI_API_ENTER {
                 if let Ok(mut state) = GLOBAL_STATE.lock() {
-                    let metric_names = state.config.metrics.clone();
                     let active_ctx = state.active_ctx;
                     // Only manage range profiler sessions when counters are enabled
                     if counters_enabled {
@@ -178,7 +176,7 @@ pub unsafe extern "C" fn profiler_callback_handler(
                             Some(active_ctx) if active_ctx != ctx => {
                                 let active_ctx_id = unsafe { profiler::get_context_id(active_ctx) };
                                 if let Some(old_data) = state.context_data.get_mut(&active_ctx_id) {
-                                    old_data.finalize_profiler(&metric_names, true);
+                                    old_data.finalize_profiler(true);
                                 }
                                 state.active_ctx = None;
                             }
@@ -186,6 +184,7 @@ pub unsafe extern "C" fn profiler_callback_handler(
                         }
                     }
                     let ctx_id = unsafe { profiler::get_context_id(ctx) };
+                    let metric_names = state.config.metrics.clone();
                     if state.context_data.contains_key(&ctx_id) {
                         state.active_ctx = Some(ctx);
                         if let Some(data) = state.context_data.get_mut(&ctx_id) {
@@ -204,11 +203,6 @@ pub unsafe extern "C" fn profiler_callback_handler(
                                 data.is_active = true;
                             }
                             // Record kernel launch with start timestamp.
-                            // When counters are enabled the range profiler introduces GPU kernel
-                            // replay which distorts GPU timestamps, so renderstage emission must
-                            // use the CPU-side launch timestamps instead. The `profiled` flag
-                            // records this choice per-kernel so it remains correct across sessions
-                            // where counters may have been enabled for some launches but not others.
                             let start = trace_time_ns();
                             data.kernel_launches.push(KernelLaunch {
                                 function: params.f,
@@ -223,11 +217,11 @@ pub unsafe extern "C" fn profiler_callback_handler(
                 // Handle kernel launch completion - decode profiler data and set end timestamp
                 if counters_enabled {
                     if let Ok(mut state) = GLOBAL_STATE.lock() {
-                        let metric_names = state.config.metrics.clone();
                         let ctx_id = unsafe { profiler::get_context_id(ctx) };
                         if let Some(data) = state.context_data.get_mut(&ctx_id) {
                             if let Some(rp) = &mut data.range_profiler {
                                 let _ = rp.decode_counter_data();
+                                let metric_names = rp.validated_metric_names().to_vec();
                                 if let Some(me) = &data.metric_evaluator {
                                     if let Ok(infos) = me.evaluate_all_ranges(
                                         &data.counter_data_image,
@@ -254,13 +248,12 @@ pub unsafe extern "C" fn profiler_callback_handler(
                 let res_data = &*(cbdata as *const CUpti_ResourceData);
                 let ctx = res_data.context;
                 if let Ok(mut state) = GLOBAL_STATE.lock() {
-                    let metric_names = state.config.metrics.clone();
                     // Only manage active context's range profiler when counters are enabled
                     if counters_enabled {
                         if let Some(active_ctx) = state.active_ctx {
                             let active_ctx_id = unsafe { profiler::get_context_id(active_ctx) };
                             if let Some(data) = state.context_data.get_mut(&active_ctx_id) {
-                                data.finalize_profiler(&metric_names, true);
+                                data.finalize_profiler(true);
                             }
                             state.active_ctx = None;
                         }
@@ -292,6 +285,7 @@ pub unsafe extern "C" fn profiler_callback_handler(
                             if let Ok(me) = unsafe { MetricEvaluator::new(ctx) } {
                                 data.metric_evaluator = Some(me);
                             }
+                            let metric_names = state.config.metrics.clone();
                             let mut rp = RangeProfiler::new(ctx);
                             if rp.enable().is_ok()
                                 && rp
@@ -309,7 +303,7 @@ pub unsafe extern "C" fn profiler_callback_handler(
                                 state.active_ctx = Some(ctx);
                             }
                         } else {
-                            eprintln!("Failed to initialize profiler");
+                            injection_log!("Failed to initialize profiler");
                         }
                     }
                     let ctx_id = unsafe { profiler::get_context_id(ctx) };
@@ -321,9 +315,8 @@ pub unsafe extern "C" fn profiler_callback_handler(
                 let ctx = res_data.context;
                 let ctx_id = unsafe { profiler::get_context_id(ctx) };
                 if let Ok(mut state) = GLOBAL_STATE.lock() {
-                    let metric_names = state.config.metrics.clone();
                     if let Some(data) = state.context_data.get_mut(&ctx_id) {
-                        data.finalize_profiler(&metric_names, true);
+                        data.finalize_profiler(true);
                     }
                 }
             }
@@ -334,8 +327,7 @@ pub unsafe extern "C" fn profiler_callback_handler(
             let err_str =
                 profiler::get_result_string(state_data.__bindgen_anon_1.notification.result);
             let msg = CStr::from_ptr(state_data.__bindgen_anon_1.notification.message);
-            eprintln!("CUPTI Fatal Error: {}: {}", err_str, msg.to_string_lossy());
-            std::process::exit(1);
+            injection_fatal!("CUPTI Fatal Error: {}: {}", err_str, msg.to_string_lossy());
         } else if domain == CUpti_CallbackDomain_CUPTI_CB_DOMAIN_RUNTIME_API
             && cbid
                 == CUpti_runtime_api_trace_cbid_enum_CUPTI_RUNTIME_TRACE_CBID_cudaDeviceReset_v3020

@@ -52,28 +52,31 @@ jobs:
           ls -l $CUDA_HOME
 
     - name: Verify formatting
-      run: cargo fmt -- --check
+      run: cargo fmt --all -- --check
 
     - name: Verify C/C++ formatting
-      run: clang-format --dry-run --Werror -style=Google stubs.cpp wrapper.h
+      run: |
+          clang-format --dry-run --Werror -style=Google \
+            perfetto-cuda-injection/stubs.cpp perfetto-cuda-injection/wrapper.h \
+            perfetto-hip-injection/stubs.cpp perfetto-hip-injection/wrapper.h
 
     - name: Lint with Clippy
-      run: cargo clippy -- -D warnings
+      run: cargo clippy --workspace --features stubs -- -D warnings
 
     - name: Run tests
-      run: cargo test --verbose
+      run: cargo test --workspace --verbose -p perfetto-gpu-compute-injection -p perfetto-cuda-injection
 
     - name: Run tests (with stubs)
-      run: cargo test --verbose --features stubs
+      run: cargo test --workspace --verbose --features stubs
 
-    - name: Build (release)
-      run: cargo build --release --verbose
+    - name: Build CUDA backend (release)
+      run: cargo build --release --verbose -p perfetto-cuda-injection
 
-    - name: Upload library
+    - name: Upload CUDA library
       uses: actions/upload-artifact@v4
       with:
-        name: perfetto_gpu_compute_injection-linux-x86_64
-        path: target/release/libperfetto_gpu_compute_injection.so
+        name: perfetto_cuda_injection-linux-x86_64
+        path: target/release/libperfetto_cuda_injection.so
 
   nightly-release:
     name: Nightly Release
@@ -88,13 +91,13 @@ jobs:
     - name: Download artifact
       uses: actions/download-artifact@v4
       with:
-        name: perfetto_gpu_compute_injection-linux-x86_64
+        name: perfetto_cuda_injection-linux-x86_64
         path: artifacts
 
     - name: Prepare release assets
       run: |
         cd artifacts
-        tar -czvf libperfetto_gpu_compute_injection-linux-x86_64.tar.gz libperfetto_gpu_compute_injection.so
+        tar -czvf libperfetto_cuda_injection-linux-x86_64.tar.gz libperfetto_cuda_injection.so
 
     - name: Delete existing nightly release
       env:
@@ -115,13 +118,13 @@ jobs:
         **Commit:** ${{ github.sha }}
 
         ## Assets
-        - \`libperfetto_gpu_compute_injection-linux-x86_64.tar.gz\` - Prebuilt shared library for Linux x86_64
+        - \`libperfetto_cuda_injection-linux-x86_64.tar.gz\` - Prebuilt NVIDIA (CUPTI) shared library for Linux x86_64
 
         ## Usage
         \`\`\`bash
-        tar -xzf libperfetto_gpu_compute_injection-linux-x86_64.tar.gz
-        CUDA_INJECTION64_PATH=\$(pwd)/libperfetto_gpu_compute_injection.so /path/to/cuda_app
+        tar -xzf libperfetto_cuda_injection-linux-x86_64.tar.gz
+        CUDA_INJECTION64_PATH=\$(pwd)/libperfetto_cuda_injection.so /path/to/cuda_app
         \`\`\`
         " \
           --prerelease \
-          artifacts/libperfetto_gpu_compute_injection-linux-x86_64.tar.gz
+          artifacts/libperfetto_cuda_injection-linux-x86_64.tar.gz

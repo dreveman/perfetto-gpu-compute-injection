@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::config::Config;
 use crate::cupti_profiler::bindings::*;
 use crate::cupti_profiler::*;
 use once_cell::sync::Lazy;
+use perfetto_gpu_compute_injection::config::Config;
 use std::{collections::HashMap, sync::Mutex};
 
 /// Common interface for GPU activity types that can emit render stage events.
@@ -402,15 +402,16 @@ impl CtxProfilerData {
     /// and evaluating metrics. Optionally disables the profiler and clears state.
     ///
     /// Returns early if the context is not active or has no range profiler.
-    pub fn finalize_profiler(&mut self, metric_names: &[String], disable: bool) {
+    pub fn finalize_profiler(&mut self, disable: bool) {
         if !self.is_active {
             return;
         }
         if let Some(rp) = &mut self.range_profiler {
             let _ = rp.stop();
             let _ = rp.decode_counter_data();
+            let metric_names = rp.validated_metric_names().to_vec();
             if let Some(me) = &self.metric_evaluator {
-                if let Ok(infos) = me.evaluate_all_ranges(&self.counter_data_image, metric_names) {
+                if let Ok(infos) = me.evaluate_all_ranges(&self.counter_data_image, &metric_names) {
                     self.range_info.extend(infos);
                 }
             }

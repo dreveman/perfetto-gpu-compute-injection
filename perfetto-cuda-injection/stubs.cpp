@@ -55,6 +55,7 @@ typedef void CUpti_Profiler_Host_Deinitialize_Params;
 typedef void CUpti_Profiler_Host_ConfigAddMetrics_Params;
 typedef void CUpti_Profiler_Host_GetConfigImage_Params;
 typedef void CUpti_Profiler_Host_EvaluateToGpuValues_Params;
+typedef void CUpti_Profiler_Host_GetMetricProperties_Params;
 typedef void CUpti_Device_GetChipName_Params;
 typedef void CUpti_RangeProfiler_Enable_Params;
 typedef void CUpti_RangeProfiler_Disable_Params;
@@ -146,6 +147,11 @@ CUptiResult cuptiProfilerHostGetConfigImageSize(
 }
 CUptiResult cuptiProfilerHostGetConfigImage(
     CUpti_Profiler_Host_GetConfigImage_Params* pParams) {
+  (void)pParams;
+  return CUPTI_SUCCESS;
+}
+CUptiResult cuptiProfilerHostGetMetricProperties(
+    CUpti_Profiler_Host_GetMetricProperties_Params* pParams) {
   (void)pParams;
   return CUPTI_SUCCESS;
 }

@@ -16,7 +16,7 @@ use crate::config::trace_startup_has;
 use crate::injection_log;
 use libc::{clock_gettime, timespec};
 use perfetto_sdk::data_source::{
-    DataSource, DataSourceArgsBuilder, DataSourceBufferExhaustedPolicy,
+    DataSource, DataSourceArgsBuilder, DataSourceBufferExhaustedPolicy, StopGuard,
 };
 use std::sync::{
     atomic::{AtomicU64, AtomicU8, Ordering},
@@ -28,6 +28,69 @@ use std::time::Duration;
 use libc::CLOCK_BOOTTIME as TRACE_TIME_CLOCK;
 #[cfg(target_os = "macos")]
 use libc::CLOCK_MONOTONIC as TRACE_TIME_CLOCK;
+
+// ---------------------------------------------------------------------------
+// GpuBackend trait
+// ---------------------------------------------------------------------------
+
+/// Abstraction over NVIDIA and AMD GPU tracing backends.
+///
+/// Each backend crate (`perfetto-cuda-injection`, `perfetto-hip-injection`) provides
+/// one implementation and registers it at startup via [`register_backend`].
+pub trait GpuBackend: Send + Sync {
+    /// Short suffix used in data source names, e.g. `"nv"` or `"amd"`.
+    fn default_data_source_suffix(&self) -> &'static str;
+
+    /// Called when the first consumer of any type (counters or renderstages) starts.
+    fn on_first_consumer_start(&self);
+
+    /// Called when a renderstages consumer starts and no counters consumer is active.
+    fn on_renderstages_start_no_counters(&self);
+
+    /// Full teardown when all consumers are gone.
+    fn run_teardown(&self);
+
+    /// Flush buffered GPU activity records to the in-memory store.
+    fn flush_activity_buffers(&self);
+
+    /// Emit renderstage Perfetto events for one consumer instance and drop the stop guard.
+    fn emit_renderstage_events_for_instance(&self, inst_id: u32, stop_guard: Option<StopGuard>);
+
+    /// Snapshot start offsets for a renderstages consumer instance.
+    fn register_renderstages_consumer(&self, inst_id: u32);
+
+    // ----- NVIDIA counters-only hooks — default to no-ops for AMD -----
+
+    /// Called when the first counters consumer starts.
+    fn on_first_counters_start(&self) {}
+
+    /// Called when the last counters consumer stops (while renderstages is still running).
+    fn on_last_counters_stop(&self) {}
+
+    /// Emit counter Perfetto events for one consumer instance and drop the stop guard.
+    fn emit_counter_events_for_instance(&self, _inst_id: u32, _stop_guard: Option<StopGuard>) {}
+
+    /// Snapshot start offsets for a counters consumer instance.
+    fn register_counters_consumer(&self, _inst_id: u32) {}
+
+    /// Finalize the range profiler without disabling activities.
+    fn finalize_range_profiler(&self) {}
+}
+
+static BACKEND: OnceLock<Box<dyn GpuBackend + Send + Sync>> = OnceLock::new();
+
+/// Register the GPU backend. Must be called exactly once before any data source is used.
+pub fn register_backend<B: GpuBackend + Send + Sync + 'static>(backend: B) {
+    let _ = BACKEND.set(Box::new(backend));
+}
+
+fn backend() -> &'static dyn GpuBackend {
+    &**BACKEND.get().expect("no GPU backend registered")
+}
+
+// ---------------------------------------------------------------------------
+// Shared tracing state
+// ---------------------------------------------------------------------------
 
 /// Monotonically increasing counter for trace event IDs.
 pub static NEXT_EVENT_ID: AtomicU64 = AtomicU64::new(1);
@@ -45,6 +108,7 @@ pub static GOT_FIRST_RENDERSTAGES: AtomicU8 = AtomicU8::new(0);
 
 /// Bitmask of currently active counters data source instances (one bit per inst_id 0-7).
 /// Non-zero means at least one counters consumer is running.
+/// Always stays 0 for AMD since the AMD backend never registers the counters data source.
 static COUNTERS_ACTIVE_MASK: AtomicU8 = AtomicU8::new(0);
 
 /// Bitmask of currently active renderstages data source instances (one bit per inst_id 0-7).
@@ -64,16 +128,12 @@ static DATA_SOURCE_NAME_SUFFIX: OnceLock<String> = OnceLock::new();
 static COUNTERS_DATA_SOURCE_NAME: OnceLock<String> = OnceLock::new();
 static RENDERSTAGES_DATA_SOURCE_NAME: OnceLock<String> = OnceLock::new();
 
-/// Default suffix for data source names.
-/// Since this library uses CUPTI (CUDA Profiling Tools Interface), which is
-/// exclusively for NVIDIA GPUs, the default vendor suffix is "nv".
-const DEFAULT_DATA_SOURCE_NAME_SUFFIX: &str = "nv";
-
-/// Returns the data source name suffix, reading from `INJECTION_DATA_SOURCE_NAME_SUFFIX` env var or using default.
+/// Returns the data source name suffix, reading from `INJECTION_DATA_SOURCE_NAME_SUFFIX`
+/// env var or using the registered backend's default.
 fn get_data_source_name_suffix() -> &'static str {
     DATA_SOURCE_NAME_SUFFIX.get_or_init(|| {
         std::env::var("INJECTION_DATA_SOURCE_NAME_SUFFIX")
-            .unwrap_or_else(|_| DEFAULT_DATA_SOURCE_NAME_SUFFIX.to_string())
+            .unwrap_or_else(|_| backend().default_data_source_suffix().to_string())
     })
 }
 
@@ -121,7 +181,7 @@ fn wait_for_start(flag: &(Mutex<bool>, Condvar), label: &str) {
 ///
 /// This function is thread-safe and ensures the data source is registered only once.
 /// The data source name suffix can be overridden via the `INJECTION_DATA_SOURCE_NAME_SUFFIX`
-/// environment variable (default: "nv", resulting in "gpu.counters.nv").
+/// environment variable (default determined by the registered backend).
 pub fn get_counters_data_source() -> &'static DataSource<'static> {
     GPU_COUNTERS_DATA_SOURCE.get_or_init(|| {
         let data_source_args = DataSourceArgsBuilder::new()
@@ -131,14 +191,14 @@ pub fn get_counters_data_source() -> &'static DataSource<'static> {
                 GOT_FIRST_COUNTERS.fetch_and(!(1 << inst_id), Ordering::SeqCst);
                 let prev = COUNTERS_ACTIVE_MASK.fetch_or(1 << inst_id, Ordering::SeqCst);
                 // Snapshot start offsets before any kernels are recorded for this instance.
-                crate::register_counters_consumer(inst_id);
+                backend().register_counters_consumer(inst_id);
                 if prev == 0 && !is_renderstages_enabled() {
-                    // Transitioning from no consumers at all: enable base CUPTI activities.
-                    crate::on_first_consumer_start();
+                    // Transitioning from no consumers at all: enable base activities.
+                    backend().on_first_consumer_start();
                 }
                 if prev == 0 {
                     // First counters consumer: disable MEMSET to avoid Range Profiler conflict.
-                    crate::on_first_counters_start();
+                    backend().on_first_counters_start();
                 }
                 injection_log!("counters data source started (instance {})", inst_id);
                 let (lock, cvar) = &COUNTERS_STARTED;
@@ -152,7 +212,7 @@ pub fn get_counters_data_source() -> &'static DataSource<'static> {
                 if remaining == 0 && is_renderstages_enabled() {
                     // Last counters consumer stopped while renderstages still runs:
                     // re-enable MEMSET now that there is no Range Profiler conflict.
-                    crate::on_last_counters_stop();
+                    backend().on_last_counters_stop();
                 }
                 injection_log!(
                     "counters data source stopping (instance {}), emitting buffered events...",
@@ -160,15 +220,15 @@ pub fn get_counters_data_source() -> &'static DataSource<'static> {
                 );
                 std::thread::spawn(move || {
                     if !is_counters_enabled() && !is_renderstages_enabled() {
-                        // All consumers gone: full CUPTI teardown (flush + finalize).
-                        crate::run_cupti_teardown();
+                        // All consumers gone: full teardown (flush + finalize).
+                        backend().run_teardown();
                     } else if !is_counters_enabled() {
                         // Last counters consumer stopped; renderstages still running.
                         // Finalize the range profiler without disabling activities.
-                        crate::finalize_range_profiler();
+                        backend().finalize_range_profiler();
                     }
                     // else: other counters consumers still running; no finalization needed.
-                    crate::emit_counter_events_for_instance(inst_id, Some(stop_guard));
+                    backend().emit_counter_events_for_instance(inst_id, Some(stop_guard));
                 });
             });
         let mut data_source = DataSource::new();
@@ -189,7 +249,7 @@ pub fn get_counters_data_source() -> &'static DataSource<'static> {
 ///
 /// This function is thread-safe and ensures the data source is registered only once.
 /// The data source name suffix can be overridden via the `INJECTION_DATA_SOURCE_NAME_SUFFIX`
-/// environment variable (default: "nv", resulting in "gpu.renderstages.nv").
+/// environment variable (default determined by the registered backend).
 pub fn get_renderstages_data_source() -> &'static DataSource<'static> {
     GPU_RENDERSTAGES_DATA_SOURCE.get_or_init(|| {
         let data_source_args = DataSourceArgsBuilder::new()
@@ -198,11 +258,11 @@ pub fn get_renderstages_data_source() -> &'static DataSource<'static> {
             .on_start(move |inst_id, _| {
                 GOT_FIRST_RENDERSTAGES.fetch_and(!(1 << inst_id), Ordering::SeqCst);
                 let prev = RENDERSTAGES_ACTIVE_MASK.fetch_or(1 << inst_id, Ordering::SeqCst);
-                crate::register_renderstages_consumer(inst_id);
+                backend().register_renderstages_consumer(inst_id);
                 if prev == 0 && !is_counters_enabled() {
                     // First consumer of any type AND no counters: enable activities + MEMSET.
-                    crate::on_first_consumer_start();
-                    crate::on_renderstages_start_no_counters();
+                    backend().on_first_consumer_start();
+                    backend().on_renderstages_start_no_counters();
                 }
                 // If counters is already running: activities are already enabled and MEMSET
                 // is already disabled — nothing extra to do.
@@ -221,13 +281,13 @@ pub fn get_renderstages_data_source() -> &'static DataSource<'static> {
                 std::thread::spawn(move || {
                     if !is_counters_enabled() && !is_renderstages_enabled() {
                         // All consumers gone: full teardown.
-                        crate::run_cupti_teardown();
+                        backend().run_teardown();
                     } else {
                         // Other consumers still running: flush activity buffers so this
                         // instance sees all pending records without disabling activities.
-                        crate::flush_activity_buffers();
+                        backend().flush_activity_buffers();
                     }
-                    crate::emit_renderstage_events_for_instance(inst_id, Some(stop_guard));
+                    backend().emit_renderstage_events_for_instance(inst_id, Some(stop_guard));
                 });
             });
         let mut data_source = DataSource::new();

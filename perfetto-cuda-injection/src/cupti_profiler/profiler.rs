@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::cupti_profiler::bindings::*;
+use perfetto_gpu_compute_injection::injection_log;
 use std::ffi::{c_void, CStr, CString};
 use std::os::raw::c_char;
 use std::ptr;
@@ -65,7 +66,7 @@ impl ProfilerHost {
         profiler_type: CUpti_ProfilerType,
     ) -> Result<(), CUptiResult> {
         if !self.host_object.is_null() {
-            eprintln!("ProfilerHost already initialized");
+            injection_log!("ProfilerHost already initialized");
             return Ok(());
         }
         Profiler::initialize()?;
@@ -93,6 +94,32 @@ impl ProfilerHost {
         check_cupti!(unsafe { cuptiProfilerHostDeinitialize(&mut params) });
         self.host_object = ptr::null_mut();
         Ok(())
+    }
+
+    /// Validates each metric name against the profiler host object and returns
+    /// only the metrics that are available on this GPU.
+    pub fn filter_valid_metrics(&self, metric_names: &[String]) -> Vec<String> {
+        metric_names
+            .iter()
+            .filter(|name| {
+                let c_name = CString::new(name.as_str()).unwrap();
+                let mut params: CUpti_Profiler_Host_GetMetricProperties_Params =
+                    unsafe { std::mem::zeroed() };
+                params.structSize = struct_size_up_to!(
+                    CUpti_Profiler_Host_GetMetricProperties_Params,
+                    metricCollectionScope: CUpti_MetricCollectionScope
+                );
+                params.pHostObject = self.host_object;
+                params.pMetricName = c_name.as_ptr();
+                let result = unsafe { cuptiProfilerHostGetMetricProperties(&mut params) };
+                if result != CUptiResult_CUPTI_SUCCESS {
+                    injection_log!("metric '{}' not available, skipping", name);
+                    return false;
+                }
+                true
+            })
+            .cloned()
+            .collect()
     }
 
     /// Creates a configuration image for the specified metrics.

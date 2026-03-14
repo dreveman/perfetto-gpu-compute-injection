@@ -16,6 +16,7 @@ use std::env;
 
 fn main() {
     let use_stubs = env::var("CARGO_FEATURE_STUBS").is_ok();
+
     #[cfg(feature = "bindgen")]
     {
         let cuda_path = env::var("CUDA_HOME").unwrap_or_else(|_| "/usr/local/cuda".to_string());
@@ -44,6 +45,7 @@ fn main() {
             .write_to_file(out_path)
             .expect("Couldn't write bindings!");
     }
+
     if use_stubs {
         #[cfg(feature = "stubs")]
         {

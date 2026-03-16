@@ -106,6 +106,7 @@ Hardware Counter Collection → Metric Evaluation → Perfetto TracePackets
 - `INJECTION_VERBOSE`: Enable detailed stdout logging
 - `INJECTION_DATA_SOURCE_NAME_SUFFIX`: Suffix for Perfetto data source names (default: `nv` for NVIDIA, `amd` for AMD). Data sources are named `gpu.counters.<suffix>` and `gpu.renderstages.<suffix>`.
 - `CUDA_HOME`: CUDA installation path (build-time, defaults to `/usr/local/cuda`)
+- `ROCM_PATH`: ROCm installation path (build-time, defaults to `/opt/rocm`)
 
 ### Data Sources
 

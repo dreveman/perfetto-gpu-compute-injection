@@ -116,6 +116,7 @@ data_sources: {
 - `INJECTION_VERBOSE`: Set to any value to enable detailed stdout logging.
 - `INJECTION_DATA_SOURCE_NAME_SUFFIX`: Set the suffix for data source names (default: `nv` for NVIDIA, `amd` for AMD).
 - `CUDA_HOME`: CUDA installation path (build-time, defaults to `/usr/local/cuda`).
+- `ROCM_PATH`: ROCm installation path (build-time, defaults to `/opt/rocm`).
 
 ## Build Requirements
 

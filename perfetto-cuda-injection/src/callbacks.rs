@@ -188,19 +188,40 @@ pub unsafe extern "C" fn profiler_callback_handler(
                     if state.context_data.contains_key(&ctx_id) {
                         state.active_ctx = Some(ctx);
                         if let Some(data) = state.context_data.get_mut(&ctx_id) {
-                            // Only start/stop range profiler sessions if counters are enabled
+                            // Initialize range profiler if not yet done
                             if counters_enabled && data.range_profiler.is_none() {
                                 let mut rp = RangeProfiler::new(ctx);
-                                let _ = rp.enable();
-                                let _ = rp.set_config(
-                                    &metric_names,
-                                    &mut data.counter_data_image,
-                                    data.max_num_ranges,
-                                    CUpti_ProfilerReplayMode_CUPTI_KernelReplay,
-                                );
-                                let _ = rp.start();
-                                data.range_profiler = Some(rp);
-                                data.is_active = true;
+                                if rp.enable().is_ok()
+                                    && rp
+                                        .set_config(
+                                            &metric_names,
+                                            &mut data.counter_data_image,
+                                            data.max_num_ranges,
+                                            CUpti_ProfilerReplayMode_CUPTI_KernelReplay,
+                                        )
+                                        .is_ok()
+                                {
+                                    data.range_profiler = Some(rp);
+                                    data.is_active = true;
+                                }
+                            }
+                            // Start profiling pass and push range for this kernel launch
+                            if counters_enabled {
+                                if let Some(rp) = &data.range_profiler {
+                                    let _ = rp.start();
+                                    // Push a range so the profiler records counter data.
+                                    // Even in AutoRange mode, an explicit range scope is required.
+                                    let range_name = if !cb_data.symbolName.is_null() {
+                                        CStr::from_ptr(cb_data.symbolName)
+                                            .to_string_lossy()
+                                            .to_string()
+                                    } else {
+                                        format!("kernel_{}", data.kernel_launches.len())
+                                    };
+                                    let c_range_name =
+                                        std::ffi::CString::new(range_name.as_str()).unwrap();
+                                    let _ = rp.push_range(&c_range_name);
+                                }
                             }
                             // Record kernel launch with start timestamp.
                             let start = trace_time_ns();
@@ -220,6 +241,9 @@ pub unsafe extern "C" fn profiler_callback_handler(
                         let ctx_id = unsafe { profiler::get_context_id(ctx) };
                         if let Some(data) = state.context_data.get_mut(&ctx_id) {
                             if let Some(rp) = &mut data.range_profiler {
+                                // Pop the range and stop profiling
+                                let _ = rp.pop_range();
+                                let _ = rp.stop();
                                 let _ = rp.decode_counter_data();
                                 let metric_names = rp.validated_metric_names().to_vec();
                                 if let Some(me) = &data.metric_evaluator {
@@ -297,7 +321,6 @@ pub unsafe extern "C" fn profiler_callback_handler(
                                     )
                                     .is_ok()
                             {
-                                let _ = rp.start();
                                 data.range_profiler = Some(rp);
                                 data.is_active = true;
                                 state.active_ctx = Some(ctx);

@@ -17,7 +17,25 @@ macro_rules! check_cupti {
     ($res:expr) => {
         let res = $res;
         if res != $crate::cupti_profiler::bindings::CUptiResult_CUPTI_SUCCESS {
-            ::perfetto_gpu_compute_injection::injection_log!("CUPTI Error: {:?}", res);
+            let err_name = $crate::cupti_profiler::error::get_result_string(res);
+            ::perfetto_gpu_compute_injection::injection_log!("CUPTI Error: {} ({})", err_name, res);
+            if res
+                == $crate::cupti_profiler::bindings::CUptiResult_CUPTI_ERROR_INSUFFICIENT_PRIVILEGES
+            {
+                ::perfetto_gpu_compute_injection::injection_log!(
+                    "  Hint: run as root (e.g. sudo <binary> ...) or grant CAP_SYS_ADMIN \
+                     and CAP_DAC_OVERRIDE \
+                     (e.g. sudo setcap cap_sys_admin,cap_dac_override=ep <binary>)"
+                );
+            }
+            if res == $crate::cupti_profiler::bindings::CUptiResult_CUPTI_ERROR_HARDWARE_BUSY {
+                ::perfetto_gpu_compute_injection::injection_log!(
+                    "  GPU profiling hardware is held by another process."
+                );
+                if let Ok(hint) = std::env::var("INJECTION_HARDWARE_BUSY_HINT") {
+                    ::perfetto_gpu_compute_injection::injection_log!("  {}", hint);
+                }
+            }
             return Err(res);
         }
     };

@@ -175,6 +175,26 @@ impl RangeProfiler {
         Ok(())
     }
 
+    /// Push a named profiling range (for UserRange mode).
+    pub fn push_range(&self, name: &CString) -> Result<(), CUptiResult> {
+        let mut params: CUpti_RangeProfiler_PushRange_Params = unsafe { std::mem::zeroed() };
+        params.structSize =
+            struct_size_up_to!(CUpti_RangeProfiler_PushRange_Params, pRangeName: *const c_char);
+        params.pRangeProfilerObject = self.range_profiler_object;
+        params.pRangeName = name.as_ptr();
+        check_cupti!(unsafe { cuptiRangeProfilerPushRange(&mut params) });
+        Ok(())
+    }
+
+    /// Pop the current profiling range (for UserRange mode).
+    pub fn pop_range(&self) -> Result<(), CUptiResult> {
+        let mut params: CUpti_RangeProfiler_PopRange_Params = unsafe { std::mem::zeroed() };
+        params.structSize = struct_size_up_to!(CUpti_RangeProfiler_PopRange_Params, pRangeProfilerObject: *mut CUpti_RangeProfiler_Object);
+        params.pRangeProfilerObject = self.range_profiler_object;
+        check_cupti!(unsafe { cuptiRangeProfilerPopRange(&mut params) });
+        Ok(())
+    }
+
     pub fn decode_counter_data(&self) -> Result<(), CUptiResult> {
         let mut params: CUpti_RangeProfiler_DecodeData_Params = unsafe { std::mem::zeroed() };
         params.structSize =

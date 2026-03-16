@@ -64,6 +64,8 @@ typedef void CUpti_RangeProfiler_Stop_Params;
 typedef void CUpti_RangeProfiler_SetConfig_Params;
 typedef void CUpti_RangeProfiler_CounterDataImage_Initialize_Params;
 typedef void CUpti_RangeProfiler_DecodeData_Params;
+typedef void CUpti_RangeProfiler_PushRange_Params;
+typedef void CUpti_RangeProfiler_PopRange_Params;
 typedef void CUpti_RangeProfiler_GetCounterDataInfo_Params;
 typedef void CUpti_RangeProfiler_CounterData_GetRangeInfo_Params;
 typedef void* CUpti_SubscriberHandle;
@@ -213,6 +215,16 @@ CUptiResult cuptiRangeProfilerDecodeData(
   (void)pParams;
   return CUPTI_SUCCESS;
 }
+CUptiResult cuptiRangeProfilerPushRange(
+    CUpti_RangeProfiler_PushRange_Params* pParams) {
+  (void)pParams;
+  return CUPTI_SUCCESS;
+}
+CUptiResult cuptiRangeProfilerPopRange(
+    CUpti_RangeProfiler_PopRange_Params* pParams) {
+  (void)pParams;
+  return CUPTI_SUCCESS;
+}
 CUptiResult cuptiRangeProfilerGetCounterDataInfo(
     CUpti_RangeProfiler_GetCounterDataInfo_Params* pParams) {
   (void)pParams;
@@ -230,6 +242,10 @@ CUptiResult cuptiGetContextId(CUcontext context, uint32_t* contextId) {
   return CUPTI_SUCCESS;
 }
 CUptiResult cuptiGetLastError() { return CUPTI_SUCCESS; }
+CUptiResult cuptiGetVersion(uint32_t* version) {
+  *version = 0;
+  return CUPTI_SUCCESS;
+}
 CUptiResult cuptiGetResultString(CUptiResult result, const char** str) {
   (void)result;
   *str = "Success";

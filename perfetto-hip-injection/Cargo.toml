@@ -24,7 +24,7 @@ stubs = ["dep:cc"]
 bindgen = ["dep:bindgen"]
 
 [dependencies]
-perfetto-gpu-compute-injection = { path = "../perfetto-gpu-compute-injection" }
+perfetto-gpu-compute-injection = { path = "../perfetto-gpu-compute-injection", version = "0.4" }
 cpp_demangle = "0.5"
 libc = "0.2"
 once_cell = "1"

@@ -24,8 +24,8 @@ use metrics::parse_metrics;
 use perfetto_gpu_compute_injection::config::Config;
 use perfetto_gpu_compute_injection::injection_log;
 use perfetto_gpu_compute_injection::tracing::{
-    get_counters_data_source, get_next_event_id, get_renderstages_data_source, is_counters_enabled,
-    register_backend, trace_time_ns, GpuBackend, GOT_FIRST_COUNTERS, GOT_FIRST_RENDERSTAGES,
+    get_counters_data_source, get_next_event_id, get_renderstages_data_source, register_backend,
+    trace_time_ns, GpuBackend, GOT_FIRST_COUNTERS, GOT_FIRST_RENDERSTAGES,
 };
 use perfetto_sdk::{
     data_source::{StopGuard, TraceContext},
@@ -87,6 +87,7 @@ impl GpuBackend for CuptiBackend {
         CUPTI_TEARDOWN_STATE.store(0, Ordering::SeqCst);
         let _ = profiler::activity_enable(CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL);
         let _ = profiler::activity_enable(CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_MEMCPY);
+        let _ = profiler::activity_enable(CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_MEMSET);
         if let Ok(state) = GLOBAL_STATE.lock() {
             let subscriber = state.subscriber_handle;
             if !subscriber.is_null() {
@@ -102,17 +103,11 @@ impl GpuBackend for CuptiBackend {
         }
     }
 
-    fn on_first_counters_start(&self) {
-        let _ = profiler::activity_disable(CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_MEMSET);
-    }
+    fn on_first_counters_start(&self) {}
 
-    fn on_last_counters_stop(&self) {
-        let _ = profiler::activity_enable(CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_MEMSET);
-    }
+    fn on_last_counters_stop(&self) {}
 
-    fn on_renderstages_start_no_counters(&self) {
-        let _ = profiler::activity_enable(CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_MEMSET);
-    }
+    fn on_renderstages_start_no_counters(&self) {}
 
     fn register_counters_consumer(&self, inst_id: u32) {
         if let Ok(mut state) = GLOBAL_STATE.lock() {
@@ -842,9 +837,7 @@ fn register_profiler_callbacks() -> Result<CUpti_SubscriberHandle, CUptiResult> 
 
     profiler::activity_enable(CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL)?;
     profiler::activity_enable(CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_MEMCPY)?;
-    if !is_counters_enabled() {
-        profiler::activity_enable(CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_MEMSET)?;
-    }
+    profiler::activity_enable(CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_MEMSET)?;
 
     unsafe { libc::atexit(end_execution) };
 
@@ -860,6 +853,12 @@ fn register_profiler_callbacks() -> Result<CUpti_SubscriberHandle, CUptiResult> 
 pub extern "C" fn InitializeInjection() -> i32 {
     let result = panic::catch_unwind(|| {
         let mut config = Config::from_env();
+
+        // Log CUPTI version for debugging compatibility issues
+        let mut cupti_version: u32 = 0;
+        unsafe { profiler::bindings::cuptiGetVersion(&mut cupti_version) };
+        injection_log!("CUPTI version: {}", cupti_version);
+
         let metrics_str = std::env::var("INJECTION_METRICS").unwrap_or_default();
         config.metrics = parse_metrics(&metrics_str);
 

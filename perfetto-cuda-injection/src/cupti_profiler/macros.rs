@@ -22,18 +22,19 @@ macro_rules! check_cupti {
             if res
                 == $crate::cupti_profiler::bindings::CUptiResult_CUPTI_ERROR_INSUFFICIENT_PRIVILEGES
             {
-                eprintln!(
-                    "==INJECTION==   Hint: run as root (e.g. sudo <binary> ...) or grant CAP_SYS_ADMIN \
-                     and CAP_DAC_OVERRIDE \
-                     (e.g. sudo setcap cap_sys_admin,cap_dac_override=ep <binary>)"
-                );
+                eprintln!("==INJECTION==   Insufficient privileges for GPU profiling.");
+                if let Ok(hint) = std::env::var("INJECTION_INSUFFICIENT_PRIVILEGES_HINT") {
+                    for line in hint.lines() {
+                        eprintln!("==INJECTION==   {}", line);
+                    }
+                }
             }
             if res == $crate::cupti_profiler::bindings::CUptiResult_CUPTI_ERROR_HARDWARE_BUSY {
-                eprintln!(
-                    "==INJECTION==   GPU profiling hardware is held by another process."
-                );
+                eprintln!("==INJECTION==   GPU profiling hardware is held by another process.");
                 if let Ok(hint) = std::env::var("INJECTION_HARDWARE_BUSY_HINT") {
-                    eprintln!("==INJECTION==   {}", hint);
+                    for line in hint.lines() {
+                        eprintln!("==INJECTION==   {}", line);
+                    }
                 }
             }
             return Err(res);

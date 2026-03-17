@@ -42,6 +42,12 @@ static LIB_HANDLE: OnceLock<usize> = OnceLock::new();
 fn get_lib_handle() -> *mut c_void {
     *LIB_HANDLE.get_or_init(|| {
         let handle = unsafe { dlopen(c"librocprofiler-sdk.so".as_ptr(), RTLD_NOLOAD | RTLD_LAZY) };
+        if handle.is_null() {
+            eprintln!(
+                "==INJECTION== could not find librocprofiler-sdk.so \
+                 (expected to be loaded by host runtime)"
+            );
+        }
         handle as usize
     }) as *mut c_void
 }
@@ -55,6 +61,7 @@ macro_rules! dispatch_fn {
         $fn_name:ident ( $($arg_name:ident : $arg_ty:ty),* $(,)? ) -> $ret_ty:ty
     ) => {
         #[allow(non_snake_case)]
+        #[allow(clippy::missing_safety_doc)]
         pub unsafe fn $fn_name ( $($arg_name: $arg_ty),* ) -> $ret_ty {
             static CACHE: OnceLock<Option<usize>> = OnceLock::new();
             let fp = *CACHE.get_or_init(|| {
@@ -64,6 +71,15 @@ macro_rules! dispatch_fn {
                 }
                 let sym = dlsym(handle, concat!(stringify!($fn_name), "\0").as_ptr() as *const c_char);
                 if sym.is_null() {
+                    eprintln!(
+                        "==INJECTION== Error: could not resolve symbol: {}",
+                        stringify!($fn_name)
+                    );
+                    if let Ok(hint) = std::env::var("INJECTION_SYMBOL_LOOKUP_HINT") {
+                        for line in hint.lines() {
+                            eprintln!("==INJECTION==   {}", line);
+                        }
+                    }
                     None
                 } else {
                     Some(sym as usize)

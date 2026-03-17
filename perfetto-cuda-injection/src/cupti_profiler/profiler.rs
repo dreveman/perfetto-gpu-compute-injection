@@ -107,7 +107,7 @@ impl ProfilerHost {
                     unsafe { std::mem::zeroed() };
                 params.structSize = struct_size_up_to!(
                     CUpti_Profiler_Host_GetMetricProperties_Params,
-                    metricCollectionScope: CUpti_MetricCollectionScope
+                    metricType: CUpti_MetricType
                 );
                 params.pHostObject = self.host_object;
                 params.pMetricName = c_name.as_ptr();

@@ -167,7 +167,7 @@ checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
 name = "perfetto-cuda-injection"
-version = "0.4.1"
+version = "0.4.3"
 dependencies = [
  "bindgen",
  "cc",
@@ -190,7 +190,7 @@ dependencies = [
 
 [[package]]
 name = "perfetto-hip-injection"
-version = "0.4.0"
+version = "0.4.2"
 dependencies = [
  "bindgen",
  "cc",

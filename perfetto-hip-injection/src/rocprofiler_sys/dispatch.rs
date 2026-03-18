@@ -75,7 +75,7 @@ macro_rules! dispatch_fn {
                         "==INJECTION== Error: could not resolve symbol: {}",
                         stringify!($fn_name)
                     );
-                    if let Ok(hint) = std::env::var("INJECTION_SYMBOL_LOOKUP_HINT") {
+                    if let Ok(hint) = std::env::var("INJECTION_HIP_SYMBOL_LOOKUP_HINT") {
                         for line in hint.lines() {
                             eprintln!("==INJECTION==   {}", line);
                         }

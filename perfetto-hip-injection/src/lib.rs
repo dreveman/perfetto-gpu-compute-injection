@@ -480,6 +480,9 @@ impl GpuBackend for RocprofilerBackend {
         }
 
         // Configure callback dispatch counting service on the tracing context.
+        // The context may already be started (by on_first_consumer_start), so we
+        // must stop it first — rocprofiler requires service configuration before
+        // context start.
         let has_counter_configs = GLOBAL_STATE
             .lock()
             .ok()
@@ -489,6 +492,8 @@ impl GpuBackend for RocprofilerBackend {
             let context_handle = GLOBAL_STATE.lock().ok().and_then(|s| s.tracing_context);
             if let Some(handle) = context_handle {
                 let tracing_ctx = rocprofiler_context_id_t { handle };
+                // Stop context so we can add the counting service.
+                let _ = unsafe { rocprofiler_stop_context(tracing_ctx) };
                 let status = unsafe {
                     rocprofiler_configure_callback_dispatch_counting_service(
                         tracing_ctx,
@@ -501,6 +506,14 @@ impl GpuBackend for RocprofilerBackend {
                 if status != ROCPROFILER_STATUS_SUCCESS {
                     injection_log!(
                         "rocprofiler_configure_callback_dispatch_counting_service failed: {}",
+                        status
+                    );
+                }
+                // Restart context with the counting service now configured.
+                let status = unsafe { rocprofiler_start_context(tracing_ctx) };
+                if status != ROCPROFILER_STATUS_SUCCESS {
+                    injection_log!(
+                        "rocprofiler_start_context after counter config failed: {}",
                         status
                     );
                 }

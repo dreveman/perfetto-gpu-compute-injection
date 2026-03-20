@@ -48,6 +48,8 @@ pub struct KernelDispatch {
     pub device_index: i32,
     /// Pseudo GPU-ID derived from the agent handle (for Perfetto gpu_id field).
     pub gpu_id: u32,
+    /// GPU architecture name (e.g. `gfx90a`).
+    pub arch: String,
 }
 
 /// A captured memory copy event.
@@ -88,8 +90,8 @@ pub struct GlobalState {
     pub counter_results: Vec<CounterResult>,
     /// kernel_id → kernel_name, populated by code object callbacks.
     pub kernel_names: HashMap<u64, String>,
-    /// agent_id.handle → logical_node_type_id (GPU device index, 0-based among GPUs).
-    pub agents: HashMap<u64, i32>,
+    /// agent_id.handle → (logical_node_type_id, arch name) for GPU agents.
+    pub agents: HashMap<u64, (i32, String)>,
     /// agent_id.handle → counter_config_id.handle (per-agent counter configs).
     pub counter_configs: HashMap<u64, u64>,
     /// Ordered list of configured counter names (same order as CounterResult.values).

@@ -78,12 +78,12 @@ pub unsafe extern "C" fn buffer_callback(
                     .cloned()
                     .unwrap_or_else(|| format!("kernel_{}", info.kernel_id));
 
-                // Look up device index from agent map.
-                let device_index = state
+                // Look up device index and arch from agent map.
+                let (device_index, arch) = state
                     .agents
                     .get(&info.agent_id.handle)
-                    .copied()
-                    .unwrap_or(0);
+                    .map(|(idx, arch)| (*idx, arch.clone()))
+                    .unwrap_or((0, String::new()));
 
                 let gpu_id = agent_handle_to_gpu_id(info.agent_id.handle);
 
@@ -100,6 +100,7 @@ pub unsafe extern "C" fn buffer_callback(
                     queue_handle: info.queue_id.handle,
                     device_index,
                     gpu_id,
+                    arch,
                 });
             } else if kind == ROCPROFILER_BUFFER_TRACING_MEMORY_COPY {
                 if hdr.payload.is_null() {
@@ -111,12 +112,12 @@ pub unsafe extern "C" fn buffer_callback(
                 let device_index = state
                     .agents
                     .get(&rec.dst_agent_id.handle)
-                    .copied()
+                    .map(|(idx, _)| *idx)
                     .unwrap_or_else(|| {
                         state
                             .agents
                             .get(&rec.src_agent_id.handle)
-                            .copied()
+                            .map(|(idx, _)| *idx)
                             .unwrap_or(0)
                     });
 
@@ -204,9 +205,14 @@ pub unsafe extern "C" fn agents_callback(
                 }
                 let agent = &*(agent_ptr as *const rocprofiler_agent_v0_t);
                 if agent.agent_type() == ROCPROFILER_AGENT_TYPE_GPU {
+                    let arch = if agent.name.is_null() {
+                        String::new()
+                    } else {
+                        CStr::from_ptr(agent.name).to_string_lossy().into_owned()
+                    };
                     state
                         .agents
-                        .insert(agent.id.handle, agent.logical_node_type_id);
+                        .insert(agent.id.handle, (agent.logical_node_type_id, arch));
                 }
             }
         }
@@ -278,7 +284,7 @@ pub unsafe extern "C" fn record_counting_callback(
         let device_index = state
             .agents
             .get(&info.agent_id.handle)
-            .copied()
+            .map(|(idx, _)| *idx)
             .unwrap_or(0);
         let gpu_id = agent_handle_to_gpu_id(info.agent_id.handle);
 

@@ -32,6 +32,11 @@ use perfetto_sdk::{
             trace_packet::{TracePacket, TracePacketSequenceFlags},
         },
     },
+    track_event::{
+        EventContext, TrackEvent, TrackEventProtoField, TrackEventProtoTrack, TrackEventTimestamp,
+        TrackEventTrack, TrackEventType,
+    },
+    track_event_categories,
 };
 use perfetto_sdk_protos_gpu::protos::{
     common::gpu_counter_descriptor::{
@@ -54,7 +59,18 @@ use perfetto_sdk_protos_gpu::protos::{
 };
 use rocprofiler_sys::*;
 use state::{ConsumerStartOffsets, CounterConsumerStartOffsets, GLOBAL_STATE};
-use std::{panic, sync::atomic::Ordering};
+use std::{ffi::CString, panic, sync::atomic::Ordering, time::Duration};
+
+// ---------------------------------------------------------------------------
+// Track event categories for HIP API call tracing
+// ---------------------------------------------------------------------------
+
+track_event_categories! {
+    pub mod hip_te_ns {
+        ( "hip", "HIP Runtime API calls", [ "api" ] ),
+    }
+}
+use hip_te_ns as perfetto_te_ns;
 
 // IID for the HIP Compute stage specification.
 const AMD_KERNEL_STAGE_IID: u64 = 1;
@@ -623,6 +639,114 @@ impl GpuBackend for RocprofilerBackend {
 }
 
 // ---------------------------------------------------------------------------
+// HIP API call track event emission
+// ---------------------------------------------------------------------------
+
+fn emit_hip_api_activities() {
+    let (activities, thread_names) = {
+        let mut state = match GLOBAL_STATE.lock() {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let acts = std::mem::take(&mut state.hip_api_activities);
+        let names = state.thread_names.clone();
+        (acts, names)
+    };
+
+    let category_index = perfetto_te_ns::category_index("hip");
+    if activities.is_empty() || !perfetto_te_ns::is_category_enabled(category_index) {
+        return;
+    }
+
+    let process_uuid = TrackEventTrack::process_track_uuid();
+    let process_id = unsafe { libc::getpid() } as u64;
+
+    // Sort by (thread_id, start) for proper nesting per thread.
+    let mut sorted: Vec<&state::ApiActivity> = activities.iter().collect();
+    sorted.sort_by_key(|a| (a.thread_id, a.start));
+
+    for activity in &sorted {
+        // Resolve operation name via rocprofiler.
+        let op_name = {
+            let mut name_ptr: *const std::os::raw::c_char = std::ptr::null();
+            let mut name_len: usize = 0;
+            let status = unsafe {
+                rocprofiler_query_buffer_tracing_kind_operation_name(
+                    activity.kind,
+                    activity.operation,
+                    &mut name_ptr,
+                    &mut name_len,
+                )
+            };
+            if status == ROCPROFILER_STATUS_SUCCESS && !name_ptr.is_null() {
+                unsafe { std::ffi::CStr::from_ptr(name_ptr) }
+                    .to_string_lossy()
+                    .into_owned()
+            } else {
+                format!("hip_op_{}", activity.operation)
+            }
+        };
+
+        let c_name =
+            CString::new(op_name.as_str()).unwrap_or_else(|_| CString::new("unknown").unwrap());
+        let name_ptr = c_name.as_ptr();
+
+        // Build thread descriptor with optional thread_name (field 5).
+        let thread_name = thread_names.get(&activity.thread_id);
+        let thread_fields_named;
+        let thread_fields_unnamed;
+        let thread_fields: &[TrackEventProtoField] = if let Some(tname) = thread_name {
+            thread_fields_named = [
+                TrackEventProtoField::VarInt(1, process_id), // pid
+                TrackEventProtoField::VarInt(2, activity.thread_id), // tid
+                TrackEventProtoField::Cstr(5, tname),        // thread_name
+            ];
+            &thread_fields_named
+        } else {
+            thread_fields_unnamed = [
+                TrackEventProtoField::VarInt(1, process_id), // pid
+                TrackEventProtoField::VarInt(2, activity.thread_id), // tid
+            ];
+            &thread_fields_unnamed
+        };
+        let track_fields = [
+            TrackEventProtoField::VarInt(5, process_uuid), // parent_uuid
+            TrackEventProtoField::Nested(4, thread_fields), // thread
+        ];
+        let thread_track = TrackEventProtoTrack {
+            uuid: process_uuid ^ activity.thread_id,
+            fields: &track_fields,
+        };
+
+        // SliceBegin
+        let mut ctx = EventContext::default();
+        ctx.set_timestamp(TrackEventTimestamp::Boot(Duration::from_nanos(
+            activity.start,
+        )));
+        ctx.set_proto_track(&thread_track);
+        ctx.add_debug_arg(
+            "correlation_id",
+            perfetto_sdk::track_event::TrackEventDebugArg::Uint64(activity.correlation_id),
+        );
+        perfetto_te_ns::emit(
+            category_index,
+            TrackEventType::SliceBegin(name_ptr),
+            &mut ctx,
+        );
+
+        // SliceEnd
+        let mut ctx = EventContext::default();
+        ctx.set_timestamp(TrackEventTimestamp::Boot(Duration::from_nanos(
+            activity.end,
+        )));
+        ctx.set_proto_track(&thread_track);
+        perfetto_te_ns::emit(category_index, TrackEventType::SliceEnd, &mut ctx);
+    }
+
+    injection_log!("emitted {} HIP API call track events", activities.len());
+}
+
+// ---------------------------------------------------------------------------
 // Atexit fallback
 // ---------------------------------------------------------------------------
 
@@ -645,6 +769,7 @@ extern "C" fn end_execution() {
         for inst_id in counter_ids {
             amd.emit_counter_events_for_instance(inst_id, None);
         }
+        emit_hip_api_activities();
     });
 }
 
@@ -747,6 +872,25 @@ fn initialize_rocprofiler() -> rocprofiler_status_t {
         return status;
     }
 
+    // Configure HIP runtime API buffer tracing. Records are always collected;
+    // emission is gated on the "hip" track event category being enabled.
+    let status = unsafe {
+        rocprofiler_configure_buffer_tracing_service(
+            tracing_ctx,
+            ROCPROFILER_BUFFER_TRACING_HIP_RUNTIME_API,
+            std::ptr::null_mut(),
+            0,
+            buffer_id,
+        )
+    };
+    if status != ROCPROFILER_STATUS_SUCCESS {
+        injection_log!(
+            "rocprofiler_configure_buffer_tracing_service (HIP_RUNTIME_API) failed: {}",
+            status
+        );
+        // Non-fatal: API call tracing is optional.
+    }
+
     // Store context and buffer handles in global state.
     if let Ok(mut state) = GLOBAL_STATE.lock() {
         state.utility_context = Some(utility_ctx.handle);
@@ -819,6 +963,12 @@ pub extern "C" fn rocprofiler_configure(
             Producer::init(producer_args.build());
             let _ = get_renderstages_data_source();
             let _ = get_counters_data_source();
+
+            // Initialize track event categories for HIP API call tracing.
+            // HIP API buffer tracing is configured in initialize_rocprofiler();
+            // the category callback only controls whether events are emitted.
+            TrackEvent::init();
+            let _ = perfetto_te_ns::register();
 
             unsafe { libc::atexit(end_execution) };
 

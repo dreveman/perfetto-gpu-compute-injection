@@ -81,6 +81,17 @@ pub struct MemcopyActivity {
     pub direction: i32,
 }
 
+/// A captured HIP runtime API call event from buffer tracing.
+#[derive(Debug, Clone)]
+pub struct ApiActivity {
+    pub kind: u32,
+    pub operation: i32,
+    pub start: u64,
+    pub end: u64,
+    pub thread_id: u64,
+    pub correlation_id: u64,
+}
+
 /// Snapshot of buffer lengths taken when a Perfetto consumer starts.
 /// Used to emit only events recorded after the consumer started.
 #[derive(Debug, Clone, Default)]
@@ -103,6 +114,8 @@ pub struct GlobalState {
     pub kernel_dispatches: Vec<KernelDispatch>,
     /// Captured memory copy events.
     pub memcopies: Vec<MemcopyActivity>,
+    /// Captured HIP runtime API call events.
+    pub hip_api_activities: Vec<ApiActivity>,
     /// Captured counter results from dispatch counting callbacks.
     pub counter_results: Vec<CounterResult>,
     /// kernel_id → kernel_name, populated by code object callbacks.
@@ -125,6 +138,8 @@ pub struct GlobalState {
     pub renderstages_consumers: HashMap<u32, ConsumerStartOffsets>,
     /// Per-instance start offsets for counters consumers.
     pub counters_consumers: HashMap<u32, CounterConsumerStartOffsets>,
+    /// thread_id → thread name, captured from /proc when first seen.
+    pub thread_names: HashMap<u64, String>,
     pub config: Config,
     pub initialized: bool,
 }
@@ -135,6 +150,7 @@ impl Default for GlobalState {
         Self {
             kernel_dispatches: Vec::new(),
             memcopies: Vec::new(),
+            hip_api_activities: Vec::new(),
             counter_results: Vec::new(),
             kernel_names: HashMap::new(),
             agents: HashMap::new(),
@@ -146,6 +162,7 @@ impl Default for GlobalState {
             utility_context: None,
             renderstages_consumers: HashMap::new(),
             counters_consumers: HashMap::new(),
+            thread_names: HashMap::new(),
             config: Config::default(),
             initialized: false,
         }

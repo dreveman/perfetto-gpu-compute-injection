@@ -249,4 +249,17 @@ rocprofiler_status_t rocprofiler_configure_callback_dispatch_counting_service(
   return ROCPROFILER_STATUS_SUCCESS;
 }
 
+static const char* kUnknownOpName = "unknown";
+
+rocprofiler_status_t rocprofiler_query_buffer_tracing_kind_operation_name(
+    rocprofiler_buffer_tracing_kind_t kind,
+    rocprofiler_tracing_operation_t operation, const char** name,
+    size_t* name_len) {
+  (void)kind;
+  (void)operation;
+  if (name) *name = kUnknownOpName;
+  if (name_len) *name_len = 7;
+  return ROCPROFILER_STATUS_SUCCESS;
+}
+
 }  // extern "C"

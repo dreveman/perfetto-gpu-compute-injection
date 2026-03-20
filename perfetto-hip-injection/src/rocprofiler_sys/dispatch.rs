@@ -188,3 +188,10 @@ dispatch_fn!(rocprofiler_query_record_counter_id(
     id: u64,
     counter_id: *mut rocprofiler_counter_id_t,
 ) -> rocprofiler_status_t);
+
+dispatch_fn!(rocprofiler_query_buffer_tracing_kind_operation_name(
+    kind: rocprofiler_buffer_tracing_kind_t,
+    operation: rocprofiler_tracing_operation_t,
+    name: *mut *const c_char,
+    name_len: *mut usize,
+) -> rocprofiler_status_t);

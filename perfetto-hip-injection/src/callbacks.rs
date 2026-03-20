@@ -15,7 +15,9 @@
 //! rocprofiler-sdk callback handlers for AMD GPU tracing.
 
 use crate::rocprofiler_sys::*;
-use crate::state::{AgentInfo, CounterResult, KernelDispatch, MemcopyActivity, GLOBAL_STATE};
+use crate::state::{
+    AgentInfo, ApiActivity, CounterResult, KernelDispatch, MemcopyActivity, GLOBAL_STATE,
+};
 use std::ffi::CStr;
 use std::panic;
 
@@ -133,6 +135,40 @@ pub unsafe extern "C" fn buffer_callback(
                     gpu_id,
                     #[allow(clippy::unnecessary_cast)]
                     direction: rec.operation as i32,
+                });
+            } else if kind == ROCPROFILER_BUFFER_TRACING_HIP_RUNTIME_API {
+                if hdr.payload.is_null() {
+                    continue;
+                }
+                let rec = &*(hdr.payload as *const rocprofiler_buffer_tracing_hip_api_record_t);
+
+                // Skip records whose size doesn't match our struct (e.g.
+                // the extended `hip_api_ext_record_t` variant).
+                let expected_size =
+                    std::mem::size_of::<rocprofiler_buffer_tracing_hip_api_record_t>() as u64;
+                if rec.size != expected_size {
+                    continue;
+                }
+
+                let tid = rec.thread_id;
+                if let std::collections::hash_map::Entry::Vacant(e) = state.thread_names.entry(tid)
+                {
+                    let name = std::fs::read_to_string(format!("/proc/self/task/{}/comm", tid))
+                        .unwrap_or_default()
+                        .trim_end_matches('\n')
+                        .to_owned();
+                    if !name.is_empty() {
+                        e.insert(name);
+                    }
+                }
+
+                state.hip_api_activities.push(ApiActivity {
+                    kind: rec.kind,
+                    operation: rec.operation,
+                    start: rec.start_timestamp,
+                    end: rec.end_timestamp,
+                    thread_id: tid,
+                    correlation_id: rec.correlation_id.internal,
                 });
             }
         }

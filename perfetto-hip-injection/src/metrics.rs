@@ -30,8 +30,6 @@ pub const DEFAULT_METRICS: &[&str] = &[
     "TCP_TCC_WRITE_REQ_sum",
     "TCC_HIT_sum",
     "TCC_MISS_sum",
-    "TCC_EA_RDREQ_sum",
-    "TCC_EA_WRREQ_sum",
 ];
 
 /// Parses a comma or semicolon separated string of metrics.

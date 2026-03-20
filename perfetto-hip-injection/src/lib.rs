@@ -264,7 +264,8 @@ impl GpuBackend for RocprofilerBackend {
                                     .set_gpu_id(kd.gpu_id as i32)
                                     .set_hw_queue_iid(hw_queue_iid)
                                     .set_stage_iid(AMD_KERNEL_STAGE_IID)
-                                    .set_context(1);
+                                    .set_context(1)
+                                    .set_name(perfetto_gpu_compute_injection::kernel::simplify_name(&demangled));
                                 let extra_fields: &[(&str, String)] = &[
                                     ("kernel_name", kd.kernel_name.clone()),
                                     ("kernel_demangled_name", demangled.clone()),
@@ -303,6 +304,14 @@ impl GpuBackend for RocprofilerBackend {
                 // Emit memory copy events.
                 for mc in state.memcopies[mc_start..].iter() {
                     let duration_ns = mc.end_ns.saturating_sub(mc.start_ns);
+                    let direction_str = match mc.direction {
+                        1 => "HostToHost",
+                        2 => "HostToDevice",
+                        3 => "DeviceToHost",
+                        4 => "DeviceToDevice",
+                        _ => "Unknown",
+                    };
+                    let memcpy_name = format!("Memcpy {}", direction_str);
                     ctx.add_packet(|packet: &mut TracePacket| {
                         packet
                             .set_timestamp(mc.start_ns)
@@ -314,7 +323,8 @@ impl GpuBackend for RocprofilerBackend {
                                     .set_gpu_id(mc.gpu_id as i32)
                                     .set_hw_queue_iid(AMD_HW_QUEUE_IID_OFFSET)
                                     .set_stage_iid(AMD_MEMCPY_STAGE_IID)
-                                    .set_context(1);
+                                    .set_context(1)
+                                    .set_name(&memcpy_name);
                                 let extra_fields: &[(&str, String)] = &[
                                     ("process_id", process_id.to_string()),
                                     ("process_name", process_name.clone()),

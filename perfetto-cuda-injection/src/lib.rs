@@ -364,6 +364,7 @@ impl GpuBackend for CuptiBackend {
                 struct PendingEvent {
                     start: u64,
                     end: u64,
+                    name: String,
                     extra_data: Vec<(String, String)>,
                     channel_id: u32,
                     channel_type: u32,
@@ -620,6 +621,7 @@ impl GpuBackend for CuptiBackend {
                             .push(PendingEvent {
                                 start: raw_start,
                                 end: raw_end,
+                                name: perfetto_gpu_compute_injection::kernel::simplify_name(&demangled).to_string(),
                                 extra_data: extra_data_vec,
                                 channel_id: activity.channel_id,
                                 channel_type: activity.channel_type,
@@ -643,6 +645,7 @@ impl GpuBackend for CuptiBackend {
                             .push(PendingEvent {
                                 start: activity.start,
                                 end: activity.end,
+                                name: format!("Memcpy {}", activity.direction_string()),
                                 extra_data: extra_data_vec,
                                 channel_id: activity.channel_id,
                                 channel_type: activity.channel_type,
@@ -666,6 +669,7 @@ impl GpuBackend for CuptiBackend {
                             .push(PendingEvent {
                                 start: activity.start,
                                 end: activity.end,
+                                name: "Memset".to_string(),
                                 extra_data: extra_data_vec,
                                 channel_id: activity.channel_id,
                                 channel_type: activity.channel_type,
@@ -718,6 +722,7 @@ impl GpuBackend for CuptiBackend {
                                 duration_ns,
                                 emit_interned,
                                 &rs_ctx,
+                                &event.name,
                                 &event.extra_data,
                             );
                         });
@@ -818,6 +823,7 @@ struct RenderStageContext<'a> {
     process_id: i32,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_render_stage_event<T: GpuActivity>(
     ctx: &mut TraceContext,
     activity: &T,
@@ -825,6 +831,7 @@ fn emit_render_stage_event<T: GpuActivity>(
     duration_ns: u64,
     emit_interned: bool,
     rs_ctx: &RenderStageContext,
+    name: &str,
     extra_data: &[(String, String)],
 ) {
     let hw_queue_iid = activity.channel_id() as u64 + HW_QUEUE_IID_OFFSET;
@@ -843,7 +850,8 @@ fn emit_render_stage_event<T: GpuActivity>(
                     .set_gpu_id(gpu_id)
                     .set_hw_queue_iid(hw_queue_iid)
                     .set_stage_iid(stage_iid)
-                    .set_context(context_iid);
+                    .set_context(context_iid)
+                    .set_name(name);
                 for (name, value) in extra_data {
                     event.set_extra_data(|extra_data: &mut GpuRenderStageEventExtraData| {
                         extra_data.set_name(name);

@@ -181,7 +181,7 @@ dependencies = [
 
 [[package]]
 name = "perfetto-gpu-compute-injection"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "libc",
  "once_cell",
@@ -216,9 +216,9 @@ dependencies = [
 
 [[package]]
 name = "perfetto-sdk-protos-gpu"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "90b27a02f6f5122686635ca98100b0cbd767c8752f15b9c86f2eca3c4dcd58df"
+checksum = "660447abd2ce6c3a76791f76ce079651bacbbbca2487beb655d2a00a4b96bb07"
 dependencies = [
  "paste",
  "perfetto-sdk",

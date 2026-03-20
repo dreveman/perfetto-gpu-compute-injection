@@ -317,157 +317,12 @@ impl GpuBackend for RocprofilerBackend {
         });
     }
 
-    fn register_counters_consumer(&self, inst_id: u32) {
-        if let Ok(mut state) = GLOBAL_STATE.lock() {
-            let offsets = CounterConsumerStartOffsets {
-                counter_results: state.counter_results.len(),
-            };
-            state.counters_consumers.insert(inst_id, offsets);
-        }
-    }
+    fn on_first_counters_start(&self) {
+        // Set up per-agent counter configs and configure the dispatch counting
+        // service. This is deferred to first consumer start so we don't
+        // enumerate counters when only gpu.renderstages is enabled.
+        use callbacks::{dispatch_counting_callback, record_counting_callback};
 
-    fn emit_counter_events_for_instance(&self, inst_id: u32, stop_guard: Option<StopGuard>) {
-        let _ = panic::catch_unwind(|| {
-            let mut state = match GLOBAL_STATE.lock() {
-                Ok(s) => s,
-                Err(_) => return,
-            };
-            let start_offsets = match state.counters_consumers.remove(&inst_id) {
-                Some(o) => o,
-                None => return,
-            };
-            let counter_names = state.counter_names.clone();
-            if counter_names.is_empty() {
-                return;
-            }
-            let cr_start = start_offsets.counter_results;
-            let mut stop_guard_opt = stop_guard;
-            get_counters_data_source().trace(|ctx: &mut TraceContext| {
-                if ctx.instance_index() != inst_id {
-                    return;
-                }
-                for result in state.counter_results[cr_start..].iter() {
-                    let gpu_id = result.gpu_id as i32;
-                    let got_first_counters =
-                        GOT_FIRST_COUNTERS.fetch_or(1 << inst_id, Ordering::SeqCst);
-                    if got_first_counters & (1 << inst_id) == 0 {
-                        // Descriptor packet (once per instance).
-                        ctx.add_packet(|packet: &mut TracePacket| {
-                            packet
-                                .set_timestamp(result.start_ns)
-                                .set_timestamp_clock_id(
-                                    BuiltinClock::BuiltinClockBoottime.into(),
-                                )
-                                .set_gpu_counter_event(|event: &mut GpuCounterEvent| {
-                                    event.set_gpu_id(gpu_id).set_counter_descriptor(
-                                        |desc: &mut GpuCounterDescriptor| {
-                                            for (i, name) in counter_names.iter().enumerate() {
-                                                desc.set_specs(|spec: &mut GpuCounterDescriptorGpuCounterSpec| {
-                                                    spec.set_counter_id(i as u32);
-                                                    spec.set_name(name);
-                                                    spec.set_groups(GpuCounterDescriptorGpuCounterGroup::Compute);
-                                                });
-                                            }
-                                        },
-                                    );
-                                });
-                        });
-                    }
-                    // Zero packet at start_ns.
-                    ctx.add_packet(|packet: &mut TracePacket| {
-                        packet
-                            .set_timestamp(result.start_ns)
-                            .set_timestamp_clock_id(BuiltinClock::BuiltinClockBoottime.into())
-                            .set_gpu_counter_event(|event: &mut GpuCounterEvent| {
-                                event.set_gpu_id(gpu_id);
-                                for i in 0..counter_names.len() {
-                                    event.set_counters(
-                                        |counter: &mut GpuCounterEventGpuCounter| {
-                                            counter.set_counter_id(i as u32).set_int_value(0);
-                                        },
-                                    );
-                                }
-                            });
-                    });
-                    // Values packet at end_ns.
-                    ctx.add_packet(|packet: &mut TracePacket| {
-                        packet
-                            .set_timestamp(result.end_ns)
-                            .set_timestamp_clock_id(BuiltinClock::BuiltinClockBoottime.into())
-                            .set_gpu_counter_event(|event: &mut GpuCounterEvent| {
-                                event.set_gpu_id(gpu_id);
-                                for (i, &value) in result.values.iter().enumerate() {
-                                    event.set_counters(
-                                        |counter: &mut GpuCounterEventGpuCounter| {
-                                            counter
-                                                .set_counter_id(i as u32)
-                                                .set_double_value(value);
-                                        },
-                                    );
-                                }
-                            });
-                    });
-                }
-                let mut sg = Some(stop_guard_opt.take());
-                ctx.flush(move || drop(sg.take()));
-            });
-            drop(stop_guard_opt);
-            let emitted = state.counter_results.len().saturating_sub(cr_start);
-            injection_log!("emitted {} counter events (instance {})", emitted, inst_id);
-        });
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Atexit fallback
-// ---------------------------------------------------------------------------
-
-extern "C" fn end_execution() {
-    let _ = panic::catch_unwind(|| {
-        let amd = RocprofilerBackend;
-        amd.run_teardown();
-        let (renderstage_ids, counter_ids): (Vec<u32>, Vec<u32>) = GLOBAL_STATE
-            .lock()
-            .map(|s| {
-                (
-                    s.renderstages_consumers.keys().copied().collect(),
-                    s.counters_consumers.keys().copied().collect(),
-                )
-            })
-            .unwrap_or_default();
-        for inst_id in renderstage_ids {
-            amd.emit_renderstage_events_for_instance(inst_id, None);
-        }
-        for inst_id in counter_ids {
-            amd.emit_counter_events_for_instance(inst_id, None);
-        }
-    });
-}
-
-// ---------------------------------------------------------------------------
-// AMD rocprofiler initialization helpers
-// ---------------------------------------------------------------------------
-
-/// Initialize AMD: populate agent map, create contexts and buffers.
-/// Called from `tool_initialize` during `rocprofiler_configure`.
-fn initialize_rocprofiler() -> rocprofiler_status_t {
-    use callbacks::{
-        agents_callback, buffer_callback, code_object_callback, dispatch_counting_callback,
-        record_counting_callback,
-    };
-
-    // Enumerate GPU agents.
-    unsafe {
-        rocprofiler_query_available_agents(
-            ROCPROFILER_AGENT_INFO_VERSION_0,
-            Some(agents_callback),
-            std::mem::size_of::<rocprofiler_agent_v0_t>(),
-            std::ptr::null_mut(),
-        )
-    };
-
-    // Set up per-agent counter configs.
-    {
         let requested_metrics: Vec<String> = GLOBAL_STATE
             .lock()
             .ok()
@@ -607,7 +462,181 @@ fn initialize_rocprofiler() -> rocprofiler_status_t {
                 }
             }
         }
+
+        // Configure callback dispatch counting service on the tracing context.
+        let has_counter_configs = GLOBAL_STATE
+            .lock()
+            .ok()
+            .map(|s| !s.counter_configs.is_empty())
+            .unwrap_or(false);
+        if has_counter_configs {
+            let context_handle = GLOBAL_STATE.lock().ok().and_then(|s| s.tracing_context);
+            if let Some(handle) = context_handle {
+                let tracing_ctx = rocprofiler_context_id_t { handle };
+                let status = unsafe {
+                    rocprofiler_configure_callback_dispatch_counting_service(
+                        tracing_ctx,
+                        Some(dispatch_counting_callback),
+                        std::ptr::null_mut(),
+                        Some(record_counting_callback),
+                        std::ptr::null_mut(),
+                    )
+                };
+                if status != ROCPROFILER_STATUS_SUCCESS {
+                    injection_log!(
+                        "rocprofiler_configure_callback_dispatch_counting_service failed: {}",
+                        status
+                    );
+                }
+            }
+        }
     }
+
+    fn register_counters_consumer(&self, inst_id: u32) {
+        if let Ok(mut state) = GLOBAL_STATE.lock() {
+            let offsets = CounterConsumerStartOffsets {
+                counter_results: state.counter_results.len(),
+            };
+            state.counters_consumers.insert(inst_id, offsets);
+        }
+    }
+
+    fn emit_counter_events_for_instance(&self, inst_id: u32, stop_guard: Option<StopGuard>) {
+        let _ = panic::catch_unwind(|| {
+            let mut state = match GLOBAL_STATE.lock() {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+            let start_offsets = match state.counters_consumers.remove(&inst_id) {
+                Some(o) => o,
+                None => return,
+            };
+            let counter_names = state.counter_names.clone();
+            if counter_names.is_empty() {
+                return;
+            }
+            let cr_start = start_offsets.counter_results;
+            let mut stop_guard_opt = stop_guard;
+            get_counters_data_source().trace(|ctx: &mut TraceContext| {
+                if ctx.instance_index() != inst_id {
+                    return;
+                }
+                for result in state.counter_results[cr_start..].iter() {
+                    let gpu_id = result.gpu_id as i32;
+                    let got_first_counters =
+                        GOT_FIRST_COUNTERS.fetch_or(1 << inst_id, Ordering::SeqCst);
+                    if got_first_counters & (1 << inst_id) == 0 {
+                        // Descriptor packet (once per instance).
+                        ctx.add_packet(|packet: &mut TracePacket| {
+                            packet
+                                .set_timestamp(result.start_ns)
+                                .set_timestamp_clock_id(
+                                    BuiltinClock::BuiltinClockBoottime.into(),
+                                )
+                                .set_gpu_counter_event(|event: &mut GpuCounterEvent| {
+                                    event.set_gpu_id(gpu_id).set_counter_descriptor(
+                                        |desc: &mut GpuCounterDescriptor| {
+                                            for (i, name) in counter_names.iter().enumerate() {
+                                                desc.set_specs(|spec: &mut GpuCounterDescriptorGpuCounterSpec| {
+                                                    spec.set_counter_id(i as u32);
+                                                    spec.set_name(name);
+                                                    spec.set_groups(GpuCounterDescriptorGpuCounterGroup::Compute);
+                                                });
+                                            }
+                                        },
+                                    );
+                                });
+                        });
+                    }
+                    // Zero packet at start_ns.
+                    ctx.add_packet(|packet: &mut TracePacket| {
+                        packet
+                            .set_timestamp(result.start_ns)
+                            .set_timestamp_clock_id(BuiltinClock::BuiltinClockBoottime.into())
+                            .set_gpu_counter_event(|event: &mut GpuCounterEvent| {
+                                event.set_gpu_id(gpu_id);
+                                for i in 0..counter_names.len() {
+                                    event.set_counters(
+                                        |counter: &mut GpuCounterEventGpuCounter| {
+                                            counter.set_counter_id(i as u32).set_int_value(0);
+                                        },
+                                    );
+                                }
+                            });
+                    });
+                    // Values packet at end_ns.
+                    ctx.add_packet(|packet: &mut TracePacket| {
+                        packet
+                            .set_timestamp(result.end_ns)
+                            .set_timestamp_clock_id(BuiltinClock::BuiltinClockBoottime.into())
+                            .set_gpu_counter_event(|event: &mut GpuCounterEvent| {
+                                event.set_gpu_id(gpu_id);
+                                for (i, &value) in result.values.iter().enumerate() {
+                                    event.set_counters(
+                                        |counter: &mut GpuCounterEventGpuCounter| {
+                                            counter
+                                                .set_counter_id(i as u32)
+                                                .set_double_value(value);
+                                        },
+                                    );
+                                }
+                            });
+                    });
+                }
+                let mut sg = Some(stop_guard_opt.take());
+                ctx.flush(move || drop(sg.take()));
+            });
+            drop(stop_guard_opt);
+            let emitted = state.counter_results.len().saturating_sub(cr_start);
+            injection_log!("emitted {} counter events (instance {})", emitted, inst_id);
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Atexit fallback
+// ---------------------------------------------------------------------------
+
+extern "C" fn end_execution() {
+    let _ = panic::catch_unwind(|| {
+        let amd = RocprofilerBackend;
+        amd.run_teardown();
+        let (renderstage_ids, counter_ids): (Vec<u32>, Vec<u32>) = GLOBAL_STATE
+            .lock()
+            .map(|s| {
+                (
+                    s.renderstages_consumers.keys().copied().collect(),
+                    s.counters_consumers.keys().copied().collect(),
+                )
+            })
+            .unwrap_or_default();
+        for inst_id in renderstage_ids {
+            amd.emit_renderstage_events_for_instance(inst_id, None);
+        }
+        for inst_id in counter_ids {
+            amd.emit_counter_events_for_instance(inst_id, None);
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// AMD rocprofiler initialization helpers
+// ---------------------------------------------------------------------------
+
+/// Initialize AMD: populate agent map, create contexts and buffers.
+/// Called from `tool_initialize` during `rocprofiler_configure`.
+fn initialize_rocprofiler() -> rocprofiler_status_t {
+    use callbacks::{agents_callback, buffer_callback, code_object_callback};
+
+    // Enumerate GPU agents.
+    unsafe {
+        rocprofiler_query_available_agents(
+            ROCPROFILER_AGENT_INFO_VERSION_0,
+            Some(agents_callback),
+            std::mem::size_of::<rocprofiler_agent_v0_t>(),
+            std::ptr::null_mut(),
+        )
+    };
 
     // Create utility context (always-on) for code object callbacks.
     let mut utility_ctx = rocprofiler_context_id_t { handle: 0 };
@@ -687,31 +716,6 @@ fn initialize_rocprofiler() -> rocprofiler_status_t {
     };
     if status != ROCPROFILER_STATUS_SUCCESS {
         return status;
-    }
-
-    // Configure callback dispatch counting service for hardware counters.
-    let has_counter_configs = GLOBAL_STATE
-        .lock()
-        .ok()
-        .map(|s| !s.counter_configs.is_empty())
-        .unwrap_or(false);
-    if has_counter_configs {
-        let status = unsafe {
-            rocprofiler_configure_callback_dispatch_counting_service(
-                tracing_ctx,
-                Some(dispatch_counting_callback),
-                std::ptr::null_mut(),
-                Some(record_counting_callback),
-                std::ptr::null_mut(),
-            )
-        };
-        if status != ROCPROFILER_STATUS_SUCCESS {
-            injection_log!(
-                "rocprofiler_configure_callback_dispatch_counting_service failed: {}",
-                status
-            );
-            // Non-fatal: counters won't work but renderstages will.
-        }
     }
 
     // Store context and buffer handles in global state.

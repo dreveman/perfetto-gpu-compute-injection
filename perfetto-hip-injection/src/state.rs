@@ -34,6 +34,19 @@ pub struct CounterConsumerStartOffsets {
     pub counter_results: usize,
 }
 
+/// Per-agent GPU properties captured during agent enumeration.
+#[derive(Debug, Clone)]
+pub struct AgentInfo {
+    /// 0-based GPU index (`logical_node_type_id`).
+    pub device_index: i32,
+    /// GPU architecture name (e.g. `gfx90a`).
+    pub arch: String,
+    /// Wavefront size (64 for GCN/CDNA, 32 for RDNA).
+    pub wave_front_size: u32,
+    /// Number of compute units.
+    pub cu_count: u32,
+}
+
 /// A captured kernel dispatch event from rocprofiler buffer tracing.
 #[derive(Debug, Clone)]
 pub struct KernelDispatch {
@@ -50,6 +63,10 @@ pub struct KernelDispatch {
     pub gpu_id: u32,
     /// GPU architecture name (e.g. `gfx90a`).
     pub arch: String,
+    /// Wavefront size (64 for GCN/CDNA, 32 for RDNA).
+    pub wave_front_size: u32,
+    /// Number of compute units.
+    pub cu_count: u32,
 }
 
 /// A captured memory copy event.
@@ -90,8 +107,8 @@ pub struct GlobalState {
     pub counter_results: Vec<CounterResult>,
     /// kernel_id → kernel_name, populated by code object callbacks.
     pub kernel_names: HashMap<u64, String>,
-    /// agent_id.handle → (logical_node_type_id, arch name) for GPU agents.
-    pub agents: HashMap<u64, (i32, String)>,
+    /// agent_id.handle → agent properties for GPU agents.
+    pub agents: HashMap<u64, AgentInfo>,
     /// agent_id.handle → counter_config_id.handle (per-agent counter configs).
     pub counter_configs: HashMap<u64, u64>,
     /// Ordered list of configured counter names (same order as CounterResult.values).

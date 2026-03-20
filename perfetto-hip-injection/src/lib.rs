@@ -224,6 +224,16 @@ impl GpuBackend for RocprofilerBackend {
                     let grid_size = kd.grid.0 * kd.grid.1 * kd.grid.2;
                     let workgroup_size = kd.workgroup.0 * kd.workgroup.1 * kd.workgroup.2;
                     let thread_count = grid_size * workgroup_size;
+                    let total_waves = if kd.wave_front_size > 0 {
+                        (grid_size * workgroup_size).div_ceil(kd.wave_front_size)
+                    } else {
+                        0
+                    };
+                    let waves_per_cu = if kd.cu_count > 0 {
+                        total_waves as f64 / kd.cu_count as f64
+                    } else {
+                        0.0
+                    };
                     let hw_queue_iid = (kd.queue_handle & 0xFFFF) + AMD_HW_QUEUE_IID_OFFSET;
                     let duration_ns = kd.end_ns.saturating_sub(kd.start_ns);
 
@@ -257,6 +267,10 @@ impl GpuBackend for RocprofilerBackend {
                                     ("launch__block_size_y", kd.workgroup.1.to_string()),
                                     ("launch__block_size_z", kd.workgroup.2.to_string()),
                                     ("launch__thread_count", thread_count.to_string()),
+                                    (
+                                        "launch__waves_per_multiprocessor",
+                                        format!("{:.2}", waves_per_cu),
+                                    ),
                                 ];
                                 for (name, value) in extra_fields {
                                     event.set_extra_data(

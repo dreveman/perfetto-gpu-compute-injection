@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::cupti_profiler::bindings::*;
-use std::ptr;
+use std::{ffi::CStr, ptr};
 
 /// Subscribes to CUPTI callbacks.
 /// # Safety
@@ -52,4 +52,19 @@ pub unsafe fn enable_domain(
 ) -> Result<(), CUptiResult> {
     check_cupti!(unsafe { cuptiEnableDomain(enable, subscriber, domain) });
     Ok(())
+}
+
+/// Returns the human-readable name for a CUPTI callback ID in the given domain.
+///
+/// Falls back to `api_call_{cbid}` if the lookup fails.
+pub fn get_callback_name(domain: CUpti_CallbackDomain, cbid: u32) -> String {
+    let mut name_ptr: *const std::os::raw::c_char = ptr::null();
+    let result = unsafe { cuptiGetCallbackName(domain, cbid, &mut name_ptr) };
+    if result == CUptiResult_CUPTI_SUCCESS && !name_ptr.is_null() {
+        unsafe { CStr::from_ptr(name_ptr) }
+            .to_string_lossy()
+            .into_owned()
+    } else {
+        format!("api_call_{}", cbid)
+    }
 }

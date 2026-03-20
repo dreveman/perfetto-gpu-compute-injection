@@ -13,7 +13,9 @@
 // limitations under the License.
 
 use crate::cupti_profiler::{self as profiler, *};
-use crate::state::{KernelActivity, KernelLaunch, MemcpyActivity, MemsetActivity, GLOBAL_STATE};
+use crate::state::{
+    ApiActivity, KernelActivity, KernelLaunch, MemcpyActivity, MemsetActivity, GLOBAL_STATE,
+};
 use libc::c_void;
 use perfetto_gpu_compute_injection::tracing::{is_counters_enabled, trace_time_ns};
 use perfetto_gpu_compute_injection::{injection_fatal, injection_log};
@@ -131,6 +133,43 @@ pub unsafe extern "C" fn buffer_completed(
                             channel_id: m.channelID,
                             channel_type: m.channelType,
                         });
+                    }
+                } else if r.kind == CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_RUNTIME
+                    || r.kind == CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_DRIVER
+                {
+                    let a = &*(record as *const CUpti_ActivityAPI);
+
+                    // Capture thread name on first occurrence of each thread_id.
+                    let tid = a.threadId;
+                    if tid != 0 {
+                        if let std::collections::hash_map::Entry::Vacant(e) =
+                            state.thread_names.entry(tid)
+                        {
+                            let name =
+                                std::fs::read_to_string(format!("/proc/self/task/{}/comm", tid))
+                                    .unwrap_or_default()
+                                    .trim_end_matches('\n')
+                                    .to_owned();
+                            if !name.is_empty() {
+                                e.insert(name);
+                            }
+                        }
+                    }
+
+                    let activity = ApiActivity {
+                        kind: a.kind,
+                        cbid: a.cbid,
+                        start: a.start,
+                        end: a.end,
+                        process_id: a.processId,
+                        thread_id: a.threadId,
+                        correlation_id: a.correlationId,
+                        return_value: a.returnValue,
+                    };
+                    if r.kind == CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_RUNTIME {
+                        state.runtime_api_activities.push(activity);
+                    } else {
+                        state.driver_api_activities.push(activity);
                     }
                 }
             }

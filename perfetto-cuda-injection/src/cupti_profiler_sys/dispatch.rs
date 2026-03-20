@@ -380,3 +380,23 @@ dispatch_fn!(get_cupti_handle, CUPTI_ERROR_UNKNOWN,
     cuptiRangeProfilerCounterDataGetRangeInfo(
         pParams: *mut CUpti_RangeProfiler_CounterData_GetRangeInfo_Params,
     ) -> CUptiResult);
+
+// ---------------------------------------------------------------------------
+// CUPTI: callback name lookup
+// ---------------------------------------------------------------------------
+
+dispatch_fn!(get_cupti_handle, CUPTI_ERROR_UNKNOWN,
+    cuptiGetCallbackName(
+        domain: CUpti_CallbackDomain,
+        cbid: u32,
+        name: *mut *const c_char,
+    ) -> CUptiResult);
+
+// ---------------------------------------------------------------------------
+// CUPTI: thread ID type
+// ---------------------------------------------------------------------------
+
+dispatch_fn!(get_cupti_handle, CUPTI_ERROR_UNKNOWN,
+    cuptiSetThreadIdType(
+        type_: CUpti_ActivityThreadIdType,
+    ) -> CUptiResult);

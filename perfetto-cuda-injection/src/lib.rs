@@ -358,6 +358,65 @@ impl GpuBackend for CuptiBackend {
                         contexts.insert(activity.context_id);
                     }
                 }
+                // Collect all pending events per channel across all contexts,
+                // then sort and clamp timestamps to prevent overlaps within
+                // each channel before emitting.
+                struct PendingEvent {
+                    start: u64,
+                    end: u64,
+                    extra_data: Vec<(String, String)>,
+                    channel_id: u32,
+                    channel_type: u32,
+                    activity_device_id: u32,
+                    activity_device_uuid: [u8; 16],
+                    activity_context_id: u32,
+                    activity_stream_id: u32,
+                    stage_iid: u64,
+                }
+
+                impl state::GpuActivity for PendingEvent {
+                    fn start(&self) -> u64 {
+                        self.start
+                    }
+                    fn end(&self) -> u64 {
+                        self.end
+                    }
+                    fn device_id(&self) -> u32 {
+                        self.activity_device_id
+                    }
+                    fn device_uuid(&self) -> &[u8; 16] {
+                        &self.activity_device_uuid
+                    }
+                    fn context_id(&self) -> u32 {
+                        self.activity_context_id
+                    }
+                    fn stream_id(&self) -> u32 {
+                        self.activity_stream_id
+                    }
+                    fn channel_id(&self) -> u32 {
+                        self.channel_id
+                    }
+                    fn channel_type(&self) -> u32 {
+                        self.channel_type
+                    }
+                    fn stage_iid(&self) -> u64 {
+                        self.stage_iid
+                    }
+                    fn emit_extra_data(
+                        &self,
+                        _process_id: i32,
+                        _process_name: &str,
+                        _emit: &mut dyn FnMut(&str, &str),
+                    ) {
+                    }
+                }
+
+                // Build per-channel event lists.
+                let mut channel_events: std::collections::HashMap<
+                    (u32, u32),
+                    Vec<PendingEvent>,
+                > = std::collections::HashMap::new();
+
                 for (ctx_id, data) in state.context_data.iter() {
                     let launch_start =
                         start_offsets.kernel_launches.get(ctx_id).copied().unwrap_or(0);
@@ -367,10 +426,10 @@ impl GpuBackend for CuptiBackend {
                         .iter()
                         .zip(data.kernel_activities[ka_start..].iter())
                     {
-                        let (timestamp, duration_ns) = if launch.profiled {
-                            (launch.start, launch.end.saturating_sub(launch.start))
+                        let (raw_start, raw_end) = if launch.profiled {
+                            (launch.start, launch.end)
                         } else {
-                            (activity.start, activity.end.saturating_sub(activity.start))
+                            (activity.start, activity.end)
                         };
                         let demangled = if let Ok(sym) = Symbol::new(&activity.kernel_name) {
                             sym.demangle()
@@ -471,156 +530,175 @@ impl GpuBackend for CuptiBackend {
                         let occupancy_limit_registers =
                             if regs_per_block != 0 { regs_per_sm / regs_per_block } else { 16 };
 
-                        let extra_data = |emit: &mut dyn FnMut(&str, &str)| {
-                            emit("kernel_name", &activity.kernel_name);
-                            emit("kernel_demangled_name", &demangled);
-                            emit("kernel_type", "Compute");
-                            emit("process_id", &process_id.to_string());
-                            emit("process_name", &process_name);
-                            emit("device_id", &activity.device_id.to_string());
-                            emit("device_uuid", &activity.device_uuid_string());
-                            emit("context_id", &activity.context_id.to_string());
-                            emit("stream_id", &activity.stream_id.to_string());
-                            emit("channel_id", &activity.channel_id.to_string());
-                            emit("channel_type", &activity.channel_type.to_string());
-                            emit("arch", &format!("CC_{}{}", major, minor));
-                            #[allow(nonstandard_style)]
-                            match cache_mode as u32 {
-                                CUfunc_cache_enum_CU_FUNC_CACHE_PREFER_NONE => {
-                                    emit("launch__func_cache_config", "CachePreferNone")
-                                }
-                                CUfunc_cache_enum_CU_FUNC_CACHE_PREFER_SHARED => {
-                                    emit("launch__func_cache_config", "CachePreferShared")
-                                }
-                                CUfunc_cache_enum_CU_FUNC_CACHE_PREFER_L1 => {
-                                    emit("launch__func_cache_config", "CachePreferL1")
-                                }
-                                CUfunc_cache_enum_CU_FUNC_CACHE_PREFER_EQUAL => {
-                                    emit("launch__func_cache_config", "CachePreferEqual")
-                                }
-                                _ => emit("launch__func_cache_config", "n/a"),
-                            }
-                            emit(
-                                "launch__waves_per_multiprocessor",
-                                &waves_per_multiprocessor.to_string(),
-                            );
-                            emit("launch__grid_size", &grid_size.to_string());
-                            emit("launch__grid_size_x", &activity.grid_size.0.to_string());
-                            emit("launch__grid_size_y", &activity.grid_size.1.to_string());
-                            emit("launch__grid_size_z", &activity.grid_size.2.to_string());
-                            emit("launch__block_size", &block_size.to_string());
-                            emit("launch__block_size_x", &activity.block_size.0.to_string());
-                            emit("launch__block_size_y", &activity.block_size.1.to_string());
-                            emit("launch__block_size_z", &activity.block_size.2.to_string());
-                            emit("launch__thread_count", &thread_count.to_string());
-                            emit(
-                                "launch__registers_per_thread",
-                                &activity.registers_per_thread.to_string(),
-                            );
-                            emit("launch__shared_mem_config_size", "49152");
-                            emit(
-                                "launch__shared_mem_per_block_driver",
-                                &smem_per_block.to_string(),
-                            );
-                            emit(
-                                "launch__shared_mem_per_block_dynamic",
-                                &activity.dynamic_shared_memory.to_string(),
-                            );
-                            emit(
-                                "launch__shared_mem_per_block_static",
-                                &activity.static_shared_memory.to_string(),
-                            );
-                            emit(
-                                "launch__occupancy_limit_shared_mem",
-                                &occupancy_limit_shared_mem.to_string(),
-                            );
-                            emit(
-                                "launch__occupancy_limit_warps",
-                                &occupancy_limit_warps.to_string(),
-                            );
-                            emit("launch__occupancy_limit_blocks", &max_blocks_sm.to_string());
-                            emit(
-                                "launch__occupancy_limit_registers",
-                                &occupancy_limit_registers.to_string(),
-                            );
-                            emit(
-                                "sm__maximum_warps_avg_per_active_cycle",
-                                &max_active_warps.to_string(),
-                            );
-                            emit(
-                                "sm__maximum_warps_per_active_cycle_pct",
-                                &max_active_warps_pct.to_string(),
-                            );
-                        };
                         let mut extra_data_vec: Vec<(String, String)> = Vec::new();
-                        extra_data(&mut |name: &str, value: &str| {
+                        let emit = &mut |name: &str, value: &str| {
                             extra_data_vec.push((name.to_string(), value.to_string()));
-                        });
+                        };
+                        emit("kernel_name", &activity.kernel_name);
+                        emit("kernel_demangled_name", &demangled);
+                        emit("kernel_type", "Compute");
+                        emit("process_id", &process_id.to_string());
+                        emit("process_name", &process_name);
+                        emit("device_id", &activity.device_id.to_string());
+                        emit("device_uuid", &activity.device_uuid_string());
+                        emit("context_id", &activity.context_id.to_string());
+                        emit("stream_id", &activity.stream_id.to_string());
+                        emit("channel_id", &activity.channel_id.to_string());
+                        emit("channel_type", &activity.channel_type.to_string());
+                        emit("arch", &format!("CC_{}{}", major, minor));
+                        #[allow(nonstandard_style)]
+                        match cache_mode as u32 {
+                            CUfunc_cache_enum_CU_FUNC_CACHE_PREFER_NONE => {
+                                emit("launch__func_cache_config", "CachePreferNone")
+                            }
+                            CUfunc_cache_enum_CU_FUNC_CACHE_PREFER_SHARED => {
+                                emit("launch__func_cache_config", "CachePreferShared")
+                            }
+                            CUfunc_cache_enum_CU_FUNC_CACHE_PREFER_L1 => {
+                                emit("launch__func_cache_config", "CachePreferL1")
+                            }
+                            CUfunc_cache_enum_CU_FUNC_CACHE_PREFER_EQUAL => {
+                                emit("launch__func_cache_config", "CachePreferEqual")
+                            }
+                            _ => emit("launch__func_cache_config", "n/a"),
+                        }
+                        emit(
+                            "launch__waves_per_multiprocessor",
+                            &waves_per_multiprocessor.to_string(),
+                        );
+                        emit("launch__grid_size", &grid_size.to_string());
+                        emit("launch__grid_size_x", &activity.grid_size.0.to_string());
+                        emit("launch__grid_size_y", &activity.grid_size.1.to_string());
+                        emit("launch__grid_size_z", &activity.grid_size.2.to_string());
+                        emit("launch__block_size", &block_size.to_string());
+                        emit("launch__block_size_x", &activity.block_size.0.to_string());
+                        emit("launch__block_size_y", &activity.block_size.1.to_string());
+                        emit("launch__block_size_z", &activity.block_size.2.to_string());
+                        emit("launch__thread_count", &thread_count.to_string());
+                        emit(
+                            "launch__registers_per_thread",
+                            &activity.registers_per_thread.to_string(),
+                        );
+                        emit("launch__shared_mem_config_size", "49152");
+                        emit(
+                            "launch__shared_mem_per_block_driver",
+                            &smem_per_block.to_string(),
+                        );
+                        emit(
+                            "launch__shared_mem_per_block_dynamic",
+                            &activity.dynamic_shared_memory.to_string(),
+                        );
+                        emit(
+                            "launch__shared_mem_per_block_static",
+                            &activity.static_shared_memory.to_string(),
+                        );
+                        emit(
+                            "launch__occupancy_limit_shared_mem",
+                            &occupancy_limit_shared_mem.to_string(),
+                        );
+                        emit(
+                            "launch__occupancy_limit_warps",
+                            &occupancy_limit_warps.to_string(),
+                        );
+                        emit("launch__occupancy_limit_blocks", &max_blocks_sm.to_string());
+                        emit(
+                            "launch__occupancy_limit_registers",
+                            &occupancy_limit_registers.to_string(),
+                        );
+                        emit(
+                            "sm__maximum_warps_avg_per_active_cycle",
+                            &max_active_warps.to_string(),
+                        );
+                        emit(
+                            "sm__maximum_warps_per_active_cycle_pct",
+                            &max_active_warps_pct.to_string(),
+                        );
 
-                        let got_first_renderstages =
-                            GOT_FIRST_RENDERSTAGES.fetch_or(1 << inst_id, Ordering::SeqCst);
-                        ctx.with_incremental_state(|ctx: &mut TraceContext, inc_state| {
-                            let was_cleared =
-                                std::mem::replace(&mut inc_state.was_cleared, false);
-                            let emit_interned =
-                                was_cleared || got_first_renderstages & (1 << inst_id) == 0;
-                            let rs_ctx = RenderStageContext {
-                                channels: &channels,
-                                contexts: &contexts,
-                                process_id,
-                            };
-                            emit_render_stage_event(
-                                ctx,
-                                activity,
-                                timestamp,
-                                duration_ns,
-                                emit_interned,
-                                &rs_ctx,
-                                &extra_data_vec,
-                            );
-                        });
+                        channel_events
+                            .entry((activity.channel_id, activity.channel_type))
+                            .or_default()
+                            .push(PendingEvent {
+                                start: raw_start,
+                                end: raw_end,
+                                extra_data: extra_data_vec,
+                                channel_id: activity.channel_id,
+                                channel_type: activity.channel_type,
+                                activity_device_id: activity.device_id,
+                                activity_device_uuid: activity.device_uuid,
+                                activity_context_id: activity.context_id,
+                                activity_stream_id: activity.stream_id,
+                                stage_iid: state::KERNEL_STAGE_IID,
+                            });
                     }
                     let mc_start =
                         start_offsets.memcpy_activities.get(ctx_id).copied().unwrap_or(0);
                     for activity in data.memcpy_activities[mc_start..].iter() {
-                        let timestamp = activity.start;
-                        let duration_ns = activity.end.saturating_sub(activity.start);
                         let mut extra_data_vec: Vec<(String, String)> = Vec::new();
                         activity.emit_extra_data(process_id, &process_name, &mut |name, value| {
                             extra_data_vec.push((name.to_string(), value.to_string()));
                         });
-                        let got_first_renderstages =
-                            GOT_FIRST_RENDERSTAGES.fetch_or(1 << inst_id, Ordering::SeqCst);
-                        ctx.with_incremental_state(|ctx: &mut TraceContext, inc_state| {
-                            let was_cleared =
-                                std::mem::replace(&mut inc_state.was_cleared, false);
-                            let emit_interned =
-                                was_cleared || got_first_renderstages & (1 << inst_id) == 0;
-                            let rs_ctx = RenderStageContext {
-                                channels: &channels,
-                                contexts: &contexts,
-                                process_id,
-                            };
-                            emit_render_stage_event(
-                                ctx,
-                                activity,
-                                timestamp,
-                                duration_ns,
-                                emit_interned,
-                                &rs_ctx,
-                                &extra_data_vec,
-                            );
-                        });
+                        channel_events
+                            .entry((activity.channel_id, activity.channel_type))
+                            .or_default()
+                            .push(PendingEvent {
+                                start: activity.start,
+                                end: activity.end,
+                                extra_data: extra_data_vec,
+                                channel_id: activity.channel_id,
+                                channel_type: activity.channel_type,
+                                activity_device_id: activity.device_id,
+                                activity_device_uuid: activity.device_uuid,
+                                activity_context_id: activity.context_id,
+                                activity_stream_id: activity.stream_id,
+                                stage_iid: state::MEMCPY_STAGE_IID,
+                            });
                     }
                     let ms_start =
                         start_offsets.memset_activities.get(ctx_id).copied().unwrap_or(0);
                     for activity in data.memset_activities[ms_start..].iter() {
-                        let timestamp = activity.start;
-                        let duration_ns = activity.end.saturating_sub(activity.start);
                         let mut extra_data_vec: Vec<(String, String)> = Vec::new();
                         activity.emit_extra_data(process_id, &process_name, &mut |name, value| {
                             extra_data_vec.push((name.to_string(), value.to_string()));
                         });
+                        channel_events
+                            .entry((activity.channel_id, activity.channel_type))
+                            .or_default()
+                            .push(PendingEvent {
+                                start: activity.start,
+                                end: activity.end,
+                                extra_data: extra_data_vec,
+                                channel_id: activity.channel_id,
+                                channel_type: activity.channel_type,
+                                activity_device_id: activity.device_id,
+                                activity_device_uuid: activity.device_uuid,
+                                activity_context_id: activity.context_id,
+                                activity_stream_id: activity.stream_id,
+                                stage_iid: state::MEMSET_STAGE_IID,
+                            });
+                    }
+                }
+
+                // Sort each channel's events by start time, then clamp to
+                // prevent overlaps caused by mixed timestamp sources.
+                for events in channel_events.values_mut() {
+                    events.sort_by_key(|e| e.start);
+                    let mut prev_end: u64 = 0;
+                    for event in events.iter_mut() {
+                        if event.start < prev_end {
+                            event.start = prev_end;
+                        }
+                        if event.end < event.start {
+                            event.end = event.start;
+                        }
+                        prev_end = event.end;
+                    }
+                }
+
+                // Emit all events with adjusted timestamps.
+                for events in channel_events.values() {
+                    for event in events {
+                        let timestamp = event.start;
+                        let duration_ns = event.end.saturating_sub(event.start);
                         let got_first_renderstages =
                             GOT_FIRST_RENDERSTAGES.fetch_or(1 << inst_id, Ordering::SeqCst);
                         ctx.with_incremental_state(|ctx: &mut TraceContext, inc_state| {
@@ -635,12 +713,12 @@ impl GpuBackend for CuptiBackend {
                             };
                             emit_render_stage_event(
                                 ctx,
-                                activity,
+                                event,
                                 timestamp,
                                 duration_ns,
                                 emit_interned,
                                 &rs_ctx,
-                                &extra_data_vec,
+                                &event.extra_data,
                             );
                         });
                     }

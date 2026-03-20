@@ -310,4 +310,19 @@ CUptiResult cuptiActivityGetNextRecord(uint8_t* buffer,
   (void)record;
   return CUPTI_SUCCESS;
 }
+
+CUptiResult cuptiGetCallbackName(CUpti_CallbackDomain domain, uint32_t cbid,
+                                 const char** name) {
+  (void)domain;
+  (void)cbid;
+  static const char* stub_name = "stub_api_call";
+  *name = stub_name;
+  return CUPTI_SUCCESS;
+}
+
+typedef int CUpti_ActivityThreadIdType;
+CUptiResult cuptiSetThreadIdType(CUpti_ActivityThreadIdType type) {
+  (void)type;
+  return CUPTI_SUCCESS;
+}
 }

@@ -37,6 +37,11 @@ use perfetto_sdk::{
             trace_packet::{TracePacket, TracePacketSequenceFlags},
         },
     },
+    track_event::{
+        EventContext, TrackEvent, TrackEventProtoField, TrackEventProtoTrack, TrackEventTimestamp,
+        TrackEventTrack, TrackEventType,
+    },
+    track_event_categories, track_event_set_category_callback,
 };
 use perfetto_sdk_protos_gpu::protos::{
     common::gpu_counter_descriptor::{
@@ -62,12 +67,26 @@ use state::{
     MEMCPY_STAGE_IID, MEMSET_STAGE_IID,
 };
 use std::{
+    ffi::CString,
     panic, ptr,
     sync::atomic::{AtomicU8, Ordering},
+    time::Duration,
 };
 
 use cupti_profiler as profiler;
 use cupti_profiler::bindings::*;
+
+// ---------------------------------------------------------------------------
+// Track event categories for CUDA API call tracing
+// ---------------------------------------------------------------------------
+
+track_event_categories! {
+    pub mod cuda_te_ns {
+        ( "cudart", "CUDA Runtime API calls", [ "api" ] ),
+        ( "cuda", "CUDA Driver API calls", [ "api" ] ),
+    }
+}
+use cuda_te_ns as perfetto_te_ns;
 
 // ---------------------------------------------------------------------------
 // CuptiBackend implementation
@@ -169,6 +188,8 @@ impl GpuBackend for CuptiBackend {
                 );
                 let _ = profiler::activity_disable(CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_MEMCPY);
                 let _ = profiler::activity_disable(CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_MEMSET);
+                let _ = profiler::activity_disable(CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_RUNTIME);
+                let _ = profiler::activity_disable(CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_DRIVER);
                 let _ = profiler::activity_flush_all(
                     CUpti_ActivityFlag_CUPTI_ACTIVITY_FLAG_FLUSH_FORCED,
                 );
@@ -764,6 +785,139 @@ fn emit_render_stage_event<T: GpuActivity>(
 }
 
 // ---------------------------------------------------------------------------
+// API call track event emission
+// ---------------------------------------------------------------------------
+
+fn emit_api_activities() {
+    let (runtime_activities, driver_activities, thread_names) = {
+        let mut state = match GLOBAL_STATE.lock() {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let runtime = std::mem::take(&mut state.runtime_api_activities);
+        let driver = std::mem::take(&mut state.driver_api_activities);
+        let names = std::mem::take(&mut state.thread_names);
+        (runtime, driver, names)
+    };
+
+    // Emit runtime API activities under "cudart" category
+    emit_api_category_activities(
+        &runtime_activities,
+        CUpti_CallbackDomain_CUPTI_CB_DOMAIN_RUNTIME_API,
+        perfetto_te_ns::category_index("cudart"),
+        &thread_names,
+    );
+
+    // Emit driver API activities under "cuda" category
+    emit_api_category_activities(
+        &driver_activities,
+        CUpti_CallbackDomain_CUPTI_CB_DOMAIN_DRIVER_API,
+        perfetto_te_ns::category_index("cuda"),
+        &thread_names,
+    );
+
+    let total = runtime_activities.len() + driver_activities.len();
+    if total > 0 {
+        injection_log!(
+            "emitted {} API call track events ({} runtime, {} driver)",
+            total,
+            runtime_activities.len(),
+            driver_activities.len()
+        );
+    }
+}
+
+fn emit_api_category_activities(
+    activities: &[state::ApiActivity],
+    domain: CUpti_CallbackDomain,
+    category_index: usize,
+    thread_names: &std::collections::HashMap<u32, String>,
+) {
+    if activities.is_empty() || !perfetto_te_ns::is_category_enabled(category_index) {
+        return;
+    }
+
+    let process_uuid = TrackEventTrack::process_track_uuid();
+
+    // Sort by (thread_id, start) for proper nesting per thread
+    let mut sorted: Vec<&state::ApiActivity> = activities.iter().collect();
+    sorted.sort_by_key(|a| (a.thread_id, a.start));
+
+    for activity in &sorted {
+        let full_name = profiler::get_callback_name(domain, activity.cbid);
+        // Strip version suffix (e.g. "_v7000") from the name, add as debug annotation
+        let (base_name, version) = match full_name.rfind("_v") {
+            Some(pos) if full_name[pos + 2..].chars().all(|c| c.is_ascii_digit()) => {
+                (&full_name[..pos], Some(&full_name[pos + 2..]))
+            }
+            _ => (full_name.as_str(), None),
+        };
+        let c_name = CString::new(base_name).unwrap_or_else(|_| CString::new("unknown").unwrap());
+        let name_ptr = c_name.as_ptr();
+
+        // Target the correct thread track using Perfetto's UUID formula:
+        // process_track_uuid ^ gettid(). Include parent_uuid and thread
+        // descriptor so the descriptor is consistent with any SDK-emitted
+        // descriptor for the same thread.
+        let tname = thread_names.get(&activity.thread_id);
+        let thread_fields_with_name;
+        let thread_fields_without_name;
+        let thread_fields: &[TrackEventProtoField] = if let Some(name) = tname {
+            thread_fields_with_name = [
+                TrackEventProtoField::VarInt(1, activity.process_id as u64), // pid
+                TrackEventProtoField::VarInt(2, activity.thread_id as u64),  // tid
+                TrackEventProtoField::Cstr(5, name),                         // thread_name
+            ];
+            &thread_fields_with_name
+        } else {
+            thread_fields_without_name = [
+                TrackEventProtoField::VarInt(1, activity.process_id as u64), // pid
+                TrackEventProtoField::VarInt(2, activity.thread_id as u64),  // tid
+            ];
+            &thread_fields_without_name
+        };
+        let track_fields = [
+            TrackEventProtoField::VarInt(5, process_uuid), // parent_uuid
+            TrackEventProtoField::Nested(4, thread_fields), // thread
+        ];
+        let thread_track = TrackEventProtoTrack {
+            uuid: process_uuid ^ activity.thread_id as u64,
+            fields: &track_fields,
+        };
+
+        // SliceBegin
+        let mut ctx = EventContext::default();
+        ctx.set_timestamp(TrackEventTimestamp::Boot(Duration::from_nanos(
+            activity.start,
+        )));
+        ctx.set_proto_track(&thread_track);
+        ctx.add_debug_arg(
+            "correlation_id",
+            perfetto_sdk::track_event::TrackEventDebugArg::Uint64(activity.correlation_id as u64),
+        );
+        if let Some(ver) = version {
+            ctx.add_debug_arg(
+                "version",
+                perfetto_sdk::track_event::TrackEventDebugArg::String(ver),
+            );
+        }
+        perfetto_te_ns::emit(
+            category_index,
+            TrackEventType::SliceBegin(name_ptr),
+            &mut ctx,
+        );
+
+        // SliceEnd
+        let mut ctx = EventContext::default();
+        ctx.set_timestamp(TrackEventTimestamp::Boot(Duration::from_nanos(
+            activity.end,
+        )));
+        ctx.set_proto_track(&thread_track);
+        perfetto_te_ns::emit(category_index, TrackEventType::SliceEnd, &mut ctx);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Atexit fallback
 // ---------------------------------------------------------------------------
 
@@ -785,6 +939,7 @@ extern "C" fn end_execution() {
         for inst_id in renderstage_ids {
             nvidia.emit_renderstage_events_for_instance(inst_id, None);
         }
+        emit_api_activities();
     });
 }
 
@@ -859,6 +1014,12 @@ pub extern "C" fn InitializeInjection() -> i32 {
         unsafe { profiler::bindings::cuptiGetVersion(&mut cupti_version) };
         injection_log!("CUPTI version: {}", cupti_version);
 
+        // Use system thread IDs (gettid on Linux) so that activity record
+        // threadId values match Perfetto's thread track UUIDs.
+        let _ = unsafe {
+            cuptiSetThreadIdType(CUpti_ActivityThreadIdType_CUPTI_ACTIVITY_THREAD_ID_TYPE_SYSTEM)
+        };
+
         let metrics_str = std::env::var("INJECTION_METRICS").unwrap_or_default();
         config.metrics = parse_metrics(&metrics_str);
 
@@ -868,6 +1029,27 @@ pub extern "C" fn InitializeInjection() -> i32 {
         Producer::init(producer_args.build());
         let _ = get_counters_data_source();
         let _ = get_renderstages_data_source();
+
+        // Initialize track event categories for API call tracing
+        TrackEvent::init();
+        let _ = perfetto_te_ns::register();
+
+        // Enable/disable CUPTI activity kinds when categories are toggled
+        track_event_set_category_callback!("cudart", |_inst_id, enabled, _changed| {
+            if enabled {
+                let _ = profiler::activity_enable(CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_RUNTIME);
+            } else {
+                let _ = profiler::activity_disable(CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_RUNTIME);
+            }
+        });
+        track_event_set_category_callback!("cuda", |_inst_id, enabled, _changed| {
+            if enabled {
+                let _ = profiler::activity_enable(CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_DRIVER);
+            } else {
+                let _ = profiler::activity_disable(CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_DRIVER);
+            }
+        });
+
         if let Ok(mut state) = GLOBAL_STATE.lock() {
             if !state.injection_initialized {
                 state.injection_initialized = true;

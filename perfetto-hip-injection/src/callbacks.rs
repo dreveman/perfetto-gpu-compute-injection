@@ -15,7 +15,7 @@
 //! rocprofiler-sdk callback handlers for AMD GPU tracing.
 
 use crate::rocprofiler_sys::*;
-use crate::state::{CounterResult, KernelDispatch, MemcopyActivity, GLOBAL_STATE};
+use crate::state::{AgentInfo, CounterResult, KernelDispatch, MemcopyActivity, GLOBAL_STATE};
 use std::ffi::CStr;
 use std::panic;
 
@@ -78,12 +78,12 @@ pub unsafe extern "C" fn buffer_callback(
                     .cloned()
                     .unwrap_or_else(|| format!("kernel_{}", info.kernel_id));
 
-                // Look up device index and arch from agent map.
-                let (device_index, arch) = state
-                    .agents
-                    .get(&info.agent_id.handle)
-                    .map(|(idx, arch)| (*idx, arch.clone()))
-                    .unwrap_or((0, String::new()));
+                // Look up agent info.
+                let agent_info = state.agents.get(&info.agent_id.handle);
+                let device_index = agent_info.map(|a| a.device_index).unwrap_or(0);
+                let arch = agent_info.map(|a| a.arch.clone()).unwrap_or_default();
+                let wave_front_size = agent_info.map(|a| a.wave_front_size).unwrap_or(0);
+                let cu_count = agent_info.map(|a| a.cu_count).unwrap_or(0);
 
                 let gpu_id = agent_handle_to_gpu_id(info.agent_id.handle);
 
@@ -101,6 +101,8 @@ pub unsafe extern "C" fn buffer_callback(
                     device_index,
                     gpu_id,
                     arch,
+                    wave_front_size,
+                    cu_count,
                 });
             } else if kind == ROCPROFILER_BUFFER_TRACING_MEMORY_COPY {
                 if hdr.payload.is_null() {
@@ -112,12 +114,12 @@ pub unsafe extern "C" fn buffer_callback(
                 let device_index = state
                     .agents
                     .get(&rec.dst_agent_id.handle)
-                    .map(|(idx, _)| *idx)
+                    .map(|a| a.device_index)
                     .unwrap_or_else(|| {
                         state
                             .agents
                             .get(&rec.src_agent_id.handle)
-                            .map(|(idx, _)| *idx)
+                            .map(|a| a.device_index)
                             .unwrap_or(0)
                     });
 
@@ -210,9 +212,15 @@ pub unsafe extern "C" fn agents_callback(
                     } else {
                         CStr::from_ptr(agent.name).to_string_lossy().into_owned()
                     };
-                    state
-                        .agents
-                        .insert(agent.id.handle, (agent.logical_node_type_id, arch));
+                    state.agents.insert(
+                        agent.id.handle,
+                        AgentInfo {
+                            device_index: agent.logical_node_type_id,
+                            arch,
+                            wave_front_size: agent.wave_front_size,
+                            cu_count: agent.cu_count,
+                        },
+                    );
                 }
             }
         }
@@ -284,7 +292,7 @@ pub unsafe extern "C" fn record_counting_callback(
         let device_index = state
             .agents
             .get(&info.agent_id.handle)
-            .map(|(idx, _)| *idx)
+            .map(|a| a.device_index)
             .unwrap_or(0);
         let gpu_id = agent_handle_to_gpu_id(info.agent_id.handle);
 

@@ -17,7 +17,6 @@ mod metrics;
 pub mod rocprofiler_sys;
 mod state;
 
-use cpp_demangle::Symbol;
 use perfetto_gpu_compute_injection::injection_log;
 use perfetto_gpu_compute_injection::tracing::{
     get_counters_data_source, get_next_event_id, get_renderstages_data_source, register_backend,
@@ -32,10 +31,7 @@ use perfetto_sdk::{
             trace_packet::{TracePacket, TracePacketSequenceFlags},
         },
     },
-    track_event::{
-        EventContext, TrackEvent, TrackEventProtoField, TrackEventProtoTrack, TrackEventTimestamp,
-        TrackEventTrack, TrackEventType,
-    },
+    track_event::{EventContext, TrackEvent, TrackEventTimestamp, TrackEventTrack, TrackEventType},
     track_event_categories,
 };
 use perfetto_sdk_protos_gpu::protos::{
@@ -143,11 +139,8 @@ impl GpuBackend for RocprofilerBackend {
 
     fn emit_renderstage_events_for_instance(&self, inst_id: u32, stop_guard: Option<StopGuard>) {
         let _ = panic::catch_unwind(|| {
-            let process_id = unsafe { libc::getpid() };
-            let process_name = std::fs::read_to_string("/proc/self/comm")
-                .unwrap_or_else(|_| "unknown".to_string())
-                .trim_end_matches('\n')
-                .to_owned();
+            let (process_id, process_name) =
+                perfetto_gpu_compute_injection::config::get_process_info();
 
             let mut state = match GLOBAL_STATE.lock() {
                 Ok(s) => s,
@@ -230,13 +223,8 @@ impl GpuBackend for RocprofilerBackend {
 
                 // Emit kernel dispatch events.
                 for kd in state.kernel_dispatches[kd_start..].iter() {
-                    let demangled = if let Ok(sym) = Symbol::new(&kd.kernel_name) {
-                        sym.demangle()
-                            .map(|d| d.to_string())
-                            .unwrap_or(kd.kernel_name.clone())
-                    } else {
-                        kd.kernel_name.clone()
-                    };
+                    let demangled =
+                        perfetto_gpu_compute_injection::kernel::demangle_name(&kd.kernel_name);
                     let grid_size = kd.grid.0 * kd.grid.1 * kd.grid.2;
                     let workgroup_size = kd.workgroup.0 * kd.workgroup.1 * kd.workgroup.2;
                     let thread_count = grid_size * workgroup_size;
@@ -703,30 +691,13 @@ fn emit_hip_api_activities() {
 
         // Build thread descriptor with optional thread_name (field 5).
         let thread_name = thread_names.get(&activity.thread_id);
-        let thread_fields_named;
-        let thread_fields_unnamed;
-        let thread_fields: &[TrackEventProtoField] = if let Some(tname) = thread_name {
-            thread_fields_named = [
-                TrackEventProtoField::VarInt(1, process_id), // pid
-                TrackEventProtoField::VarInt(2, activity.thread_id), // tid
-                TrackEventProtoField::Cstr(5, tname),        // thread_name
-            ];
-            &thread_fields_named
-        } else {
-            thread_fields_unnamed = [
-                TrackEventProtoField::VarInt(1, process_id), // pid
-                TrackEventProtoField::VarInt(2, activity.thread_id), // tid
-            ];
-            &thread_fields_unnamed
-        };
-        let track_fields = [
-            TrackEventProtoField::VarInt(5, process_uuid), // parent_uuid
-            TrackEventProtoField::Nested(4, thread_fields), // thread
-        ];
-        let thread_track = TrackEventProtoTrack {
-            uuid: process_uuid ^ activity.thread_id,
-            fields: &track_fields,
-        };
+        perfetto_gpu_compute_injection::build_thread_track!(
+            process_uuid: process_uuid,
+            process_id: process_id,
+            thread_id: activity.thread_id,
+            thread_name: thread_name.map(|s| s.as_str()),
+            => _thread_fields_named, _thread_fields_unnamed, _track_fields, thread_track
+        );
 
         // SliceBegin
         let mut ctx = EventContext::default();

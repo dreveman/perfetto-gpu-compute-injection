@@ -329,6 +329,67 @@ pub fn trace_time_ns() -> u64 {
     (ts.tv_sec as u64) * 1_000_000_000u64 + (ts.tv_nsec as u64)
 }
 
+/// Builds a thread-track descriptor for API call track events.
+///
+/// Creates local bindings for `TrackEventProtoField` arrays and a
+/// `TrackEventProtoTrack` that borrows them.  The track `uuid` is
+/// `process_uuid ^ thread_id`.
+///
+/// # Parameters
+///
+/// * `$process_uuid` — the process track UUID (`TrackEventTrack::process_track_uuid()`)
+/// * `$process_id`   — numeric pid (as `u64`)
+/// * `$thread_id`    — numeric tid (as `u64`)
+/// * `$thread_name`  — `Option<&str>` thread name
+/// * `$thread_fields_named`, `$thread_fields_unnamed`, `$track_fields`, `$thread_track`
+///   — identifiers for the local bindings that will be created
+///
+/// After the macro expands, `$thread_track` is a `TrackEventProtoTrack` you
+/// can pass to `ctx.set_proto_track()`.
+#[macro_export]
+macro_rules! build_thread_track {
+    (
+        process_uuid: $process_uuid:expr,
+        process_id: $process_id:expr,
+        thread_id: $thread_id:expr,
+        thread_name: $thread_name:expr,
+        => $thread_fields_named:ident,
+           $thread_fields_unnamed:ident,
+           $track_fields:ident,
+           $thread_track:ident
+    ) => {
+        let __pu = $process_uuid;
+        let __pid: u64 = $process_id;
+        let __tid: u64 = $thread_id;
+        let __tname: Option<&str> = $thread_name;
+        let $thread_fields_named;
+        let $thread_fields_unnamed;
+        let thread_fields_ref: &[perfetto_sdk::track_event::TrackEventProtoField] =
+            if let Some(name) = __tname {
+                $thread_fields_named = [
+                    perfetto_sdk::track_event::TrackEventProtoField::VarInt(1, __pid),
+                    perfetto_sdk::track_event::TrackEventProtoField::VarInt(2, __tid),
+                    perfetto_sdk::track_event::TrackEventProtoField::Cstr(5, name),
+                ];
+                &$thread_fields_named
+            } else {
+                $thread_fields_unnamed = [
+                    perfetto_sdk::track_event::TrackEventProtoField::VarInt(1, __pid),
+                    perfetto_sdk::track_event::TrackEventProtoField::VarInt(2, __tid),
+                ];
+                &$thread_fields_unnamed
+            };
+        let $track_fields = [
+            perfetto_sdk::track_event::TrackEventProtoField::VarInt(5, __pu),
+            perfetto_sdk::track_event::TrackEventProtoField::Nested(4, thread_fields_ref),
+        ];
+        let $thread_track = perfetto_sdk::track_event::TrackEventProtoTrack {
+            uuid: __pu ^ __tid,
+            fields: &$track_fields,
+        };
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -36,20 +36,7 @@ pub const DEFAULT_METRICS: &[&str] = &[
 ///
 /// If input is empty or whitespace-only, returns `DEFAULT_METRICS`.
 pub fn parse_metrics(input: &str) -> Vec<String> {
-    if input.trim().is_empty() {
-        return DEFAULT_METRICS.iter().map(|s| s.to_string()).collect();
-    }
-    input
-        .split(&[';', ','][..])
-        .filter_map(|m| {
-            let trimmed = m.trim();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed.to_string())
-            }
-        })
-        .collect()
+    perfetto_gpu_compute_injection::config::parse_metrics(input, DEFAULT_METRICS)
 }
 
 #[cfg(test)]
@@ -61,19 +48,5 @@ mod tests {
         let metrics = parse_metrics("");
         assert_eq!(metrics.len(), DEFAULT_METRICS.len());
         assert_eq!(metrics[0], "SQ_WAVES");
-    }
-
-    #[test]
-    fn test_parse_metrics_custom() {
-        let input = "metric1; metric2, metric3";
-        let metrics = parse_metrics(input);
-        assert_eq!(metrics, vec!["metric1", "metric2", "metric3"]);
-    }
-
-    #[test]
-    fn test_parse_metrics_with_empty_segments() {
-        let input = "metric1;;,metric2";
-        let metrics = parse_metrics(input);
-        assert_eq!(metrics, vec!["metric1", "metric2"]);
     }
 }

@@ -142,18 +142,10 @@ pub unsafe extern "C" fn buffer_completed(
                     // Capture thread name on first occurrence of each thread_id.
                     let tid = a.threadId;
                     if tid != 0 {
-                        if let std::collections::hash_map::Entry::Vacant(e) =
-                            state.thread_names.entry(tid)
-                        {
-                            let name =
-                                std::fs::read_to_string(format!("/proc/self/task/{}/comm", tid))
-                                    .unwrap_or_default()
-                                    .trim_end_matches('\n')
-                                    .to_owned();
-                            if !name.is_empty() {
-                                e.insert(name);
-                            }
-                        }
+                        perfetto_gpu_compute_injection::config::capture_thread_name(
+                            &mut state.thread_names,
+                            tid,
+                        );
                     }
 
                     let activity = ApiActivity {

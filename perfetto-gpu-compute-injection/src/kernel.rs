@@ -12,7 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Utilities for simplifying demangled GPU kernel names.
+//! Utilities for GPU kernel name demangling and simplification.
+
+/// Demangle a C++ mangled symbol name.
+///
+/// Returns the demangled name if successful, otherwise returns the input unchanged.
+pub fn demangle_name(mangled: &str) -> String {
+    if let Ok(sym) = cpp_demangle::Symbol::new(mangled) {
+        sym.demangle()
+            .map(|d| d.to_string())
+            .unwrap_or_else(|_| mangled.to_string())
+    } else {
+        mangled.to_string()
+    }
+}
 
 /// Simplify a demangled kernel name by stripping the return type,
 /// arguments, and template parameters, leaving just the qualified
@@ -104,5 +117,16 @@ mod tests {
     #[test]
     fn namespaced_no_args() {
         assert_eq!(simplify_name("foo::bar::baz"), "foo::bar::baz");
+    }
+
+    #[test]
+    fn demangle_mangled_name() {
+        let demangled = demangle_name("_Z3foov");
+        assert_eq!(demangled, "foo()");
+    }
+
+    #[test]
+    fn demangle_plain_name() {
+        assert_eq!(demangle_name("simple_kernel"), "simple_kernel");
     }
 }

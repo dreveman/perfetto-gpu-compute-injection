@@ -19,7 +19,6 @@ pub mod metrics;
 pub mod state;
 
 use callbacks::{buffer_completed, buffer_requested, profiler_callback_handler};
-use cpp_demangle::Symbol;
 use metrics::parse_metrics;
 use perfetto_gpu_compute_injection::config::Config;
 use perfetto_gpu_compute_injection::injection_log;
@@ -37,10 +36,7 @@ use perfetto_sdk::{
             trace_packet::{TracePacket, TracePacketSequenceFlags},
         },
     },
-    track_event::{
-        EventContext, TrackEvent, TrackEventProtoField, TrackEventProtoTrack, TrackEventTimestamp,
-        TrackEventTrack, TrackEventType,
-    },
+    track_event::{EventContext, TrackEvent, TrackEventTimestamp, TrackEventTrack, TrackEventType},
     track_event_categories, track_event_set_category_callback,
 };
 use perfetto_sdk_protos_gpu::protos::{
@@ -315,11 +311,8 @@ impl GpuBackend for CuptiBackend {
 
     fn emit_renderstage_events_for_instance(&self, inst_id: u32, stop_guard: Option<StopGuard>) {
         let _ = panic::catch_unwind(|| {
-            let process_id = unsafe { libc::getpid() };
-            let process_name = std::fs::read_to_string("/proc/self/comm")
-                .unwrap_or_else(|_| "unknown".to_string())
-                .trim_end_matches('\n')
-                .to_owned();
+            let (process_id, process_name) =
+                perfetto_gpu_compute_injection::config::get_process_info();
 
             let mut state = match GLOBAL_STATE.lock() {
                 Ok(s) => s,
@@ -432,13 +425,10 @@ impl GpuBackend for CuptiBackend {
                         } else {
                             (activity.start, activity.end)
                         };
-                        let demangled = if let Ok(sym) = Symbol::new(&activity.kernel_name) {
-                            sym.demangle()
-                                .map(|d| d.to_string())
-                                .unwrap_or(activity.kernel_name.clone())
-                        } else {
-                            activity.kernel_name.clone()
-                        };
+                        let demangled =
+                            perfetto_gpu_compute_injection::kernel::demangle_name(
+                                &activity.kernel_name,
+                            );
                         let grid_size =
                             activity.grid_size.0 * activity.grid_size.1 * activity.grid_size.2;
                         let block_size =
@@ -946,30 +936,13 @@ fn emit_api_category_activities(
         // descriptor so the descriptor is consistent with any SDK-emitted
         // descriptor for the same thread.
         let tname = thread_names.get(&activity.thread_id);
-        let thread_fields_with_name;
-        let thread_fields_without_name;
-        let thread_fields: &[TrackEventProtoField] = if let Some(name) = tname {
-            thread_fields_with_name = [
-                TrackEventProtoField::VarInt(1, activity.process_id as u64), // pid
-                TrackEventProtoField::VarInt(2, activity.thread_id as u64),  // tid
-                TrackEventProtoField::Cstr(5, name),                         // thread_name
-            ];
-            &thread_fields_with_name
-        } else {
-            thread_fields_without_name = [
-                TrackEventProtoField::VarInt(1, activity.process_id as u64), // pid
-                TrackEventProtoField::VarInt(2, activity.thread_id as u64),  // tid
-            ];
-            &thread_fields_without_name
-        };
-        let track_fields = [
-            TrackEventProtoField::VarInt(5, process_uuid), // parent_uuid
-            TrackEventProtoField::Nested(4, thread_fields), // thread
-        ];
-        let thread_track = TrackEventProtoTrack {
-            uuid: process_uuid ^ activity.thread_id as u64,
-            fields: &track_fields,
-        };
+        perfetto_gpu_compute_injection::build_thread_track!(
+            process_uuid: process_uuid,
+            process_id: activity.process_id as u64,
+            thread_id: activity.thread_id as u64,
+            thread_name: tname.map(|s| s.as_str()),
+            => _thread_fields_named, _thread_fields_unnamed, _track_fields, thread_track
+        );
 
         // SliceBegin
         let mut ctx = EventContext::default();

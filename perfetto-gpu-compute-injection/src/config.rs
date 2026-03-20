@@ -77,6 +77,26 @@ impl Default for Config {
     }
 }
 
+/// Parses a comma or semicolon separated string of metrics.
+///
+/// If `input` is empty or whitespace-only, returns `defaults` converted to `String`s.
+pub fn parse_metrics(input: &str, defaults: &[&str]) -> Vec<String> {
+    if input.trim().is_empty() {
+        return defaults.iter().map(|s| s.to_string()).collect();
+    }
+    input
+        .split(&[';', ','][..])
+        .filter_map(|m| {
+            let trimmed = m.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        })
+        .collect()
+}
+
 impl Config {
     /// Loads configuration from environment variables.
     ///
@@ -99,5 +119,58 @@ impl Config {
             verbose,
             metrics: Vec::new(),
         }
+    }
+}
+
+/// Returns the process ID and process name (read from `/proc/self/comm`).
+pub fn get_process_info() -> (i32, String) {
+    let pid = unsafe { libc::getpid() };
+    let name = std::fs::read_to_string("/proc/self/comm")
+        .unwrap_or_else(|_| "unknown".to_string())
+        .trim_end_matches('\n')
+        .to_owned();
+    (pid, name)
+}
+
+/// Captures the thread name for `tid` from `/proc/self/task/<tid>/comm` into
+/// `thread_names` if the entry is vacant and the name is non-empty.
+pub fn capture_thread_name<K: Eq + std::hash::Hash + std::fmt::Display>(
+    thread_names: &mut std::collections::HashMap<K, String>,
+    tid: K,
+) {
+    if let std::collections::hash_map::Entry::Vacant(e) = thread_names.entry(tid) {
+        let name = std::fs::read_to_string(format!("/proc/self/task/{}/comm", e.key()))
+            .unwrap_or_default()
+            .trim_end_matches('\n')
+            .to_owned();
+        if !name.is_empty() {
+            e.insert(name);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_metrics_custom() {
+        let input = "metric1; metric2, metric3";
+        let metrics = parse_metrics(input, &["default1"]);
+        assert_eq!(metrics, vec!["metric1", "metric2", "metric3"]);
+    }
+
+    #[test]
+    fn test_parse_metrics_with_empty_segments() {
+        let input = "metric1;;,metric2";
+        let metrics = parse_metrics(input, &["default1"]);
+        assert_eq!(metrics, vec!["metric1", "metric2"]);
+    }
+
+    #[test]
+    fn test_parse_metrics_empty_returns_defaults() {
+        let defaults = &["d1", "d2"];
+        let metrics = parse_metrics("", defaults);
+        assert_eq!(metrics, vec!["d1", "d2"]);
     }
 }

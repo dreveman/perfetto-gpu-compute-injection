@@ -187,7 +187,7 @@ impl GpuBackend for RocprofilerBackend {
                                 .set_graphics_contexts(|gctx: &mut InternedGraphicsContext| {
                                     gctx.set_iid(1);
                                     gctx.set_pid(process_id);
-                                    gctx.set_api(InternedGraphicsContextApi::Undefined);
+                                    gctx.set_api(InternedGraphicsContextApi::Hip);
                                 });
                             // HW queue specs per distinct queue.
                             for &queue_handle in &queues {

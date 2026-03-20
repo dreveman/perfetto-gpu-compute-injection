@@ -781,7 +781,7 @@ fn emit_interned_specifications(
             interned.set_graphics_contexts(|ctx: &mut InternedGraphicsContext| {
                 ctx.set_iid(*context_id as u64);
                 ctx.set_pid(process_id);
-                ctx.set_api(InternedGraphicsContextApi::Undefined);
+                ctx.set_api(InternedGraphicsContextApi::Cuda);
             });
         }
         for (channel_id, channel_type) in channels {

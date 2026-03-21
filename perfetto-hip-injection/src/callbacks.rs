@@ -16,7 +16,8 @@
 
 use crate::rocprofiler_sys::*;
 use crate::state::{
-    AgentInfo, ApiActivity, CounterResult, KernelDispatch, MemcopyActivity, GLOBAL_STATE,
+    AgentInfo, ApiActivity, CounterResult, KernelDispatch, MemcopyActivity, MemsetActivity,
+    GLOBAL_STATE,
 };
 use std::ffi::CStr;
 use std::panic;
@@ -79,6 +80,40 @@ pub unsafe extern "C" fn buffer_callback(
                     .get(&info.kernel_id)
                     .cloned()
                     .unwrap_or_else(|| format!("kernel_{}", info.kernel_id));
+
+                // Translate internal ROCm runtime kernels to memcpy/memset events.
+                if kernel_name.starts_with("__amd_rocclr_copyBuffer") {
+                    let device_index = state
+                        .agents
+                        .get(&info.agent_id.handle)
+                        .map(|a| a.device_index)
+                        .unwrap_or(0);
+                    let gpu_id = agent_handle_to_gpu_id(info.agent_id.handle);
+                    state.memcopies.push(MemcopyActivity {
+                        bytes: 0,
+                        start_ns: rec.start_timestamp,
+                        end_ns: rec.end_timestamp,
+                        device_index,
+                        gpu_id,
+                        direction: -1,
+                    });
+                    continue;
+                }
+                if kernel_name.starts_with("__amd_rocclr_fillBuffer") {
+                    let device_index = state
+                        .agents
+                        .get(&info.agent_id.handle)
+                        .map(|a| a.device_index)
+                        .unwrap_or(0);
+                    let gpu_id = agent_handle_to_gpu_id(info.agent_id.handle);
+                    state.memsets.push(MemsetActivity {
+                        start_ns: rec.start_timestamp,
+                        end_ns: rec.end_timestamp,
+                        device_index,
+                        gpu_id,
+                    });
+                    continue;
+                }
 
                 // Look up agent info.
                 let agent_info = state.agents.get(&info.agent_id.handle);
@@ -318,6 +353,11 @@ pub unsafe extern "C" fn record_counting_callback(
             .get(&info.kernel_id)
             .cloned()
             .unwrap_or_else(|| format!("kernel_{}", info.kernel_id));
+
+        // Skip internal ROCm runtime kernels.
+        if kernel_name.starts_with("__amd_rocclr_") {
+            return;
+        }
 
         let device_index = state
             .agents

@@ -71,6 +71,7 @@ use hip_te_ns as perfetto_te_ns;
 // IID for the HIP Compute stage specification.
 const AMD_KERNEL_STAGE_IID: u64 = 1;
 const AMD_MEMCPY_STAGE_IID: u64 = 2;
+const AMD_MEMSET_STAGE_IID: u64 = 3;
 // Queue IID base offset to avoid collision with stage IIDs.
 const AMD_HW_QUEUE_IID_OFFSET: u64 = 1000;
 
@@ -152,6 +153,7 @@ impl GpuBackend for RocprofilerBackend {
             };
             let kd_start = start_offsets.kernel_dispatches;
             let mc_start = start_offsets.memcopies;
+            let ms_start = start_offsets.memsets;
 
             let mut stop_guard_opt = stop_guard;
             get_renderstages_data_source().trace(|ctx: &mut TraceContext| {
@@ -212,6 +214,17 @@ impl GpuBackend for RocprofilerBackend {
                                     spec.set_iid(AMD_MEMCPY_STAGE_IID);
                                     spec.set_name("MemoryTransfer");
                                     spec.set_description("HIP Memory Transfer");
+                                    spec.set_category(
+                                        InternedGpuRenderStageSpecificationRenderStageCategory::Other,
+                                    );
+                                },
+                            );
+                            // Memory set stage spec.
+                            interned.set_gpu_specifications(
+                                |spec: &mut InternedGpuRenderStageSpecification| {
+                                    spec.set_iid(AMD_MEMSET_STAGE_IID);
+                                    spec.set_name("MemorySet");
+                                    spec.set_description("HIP Memory Set");
                                     spec.set_category(
                                         InternedGpuRenderStageSpecificationRenderStageCategory::Other,
                                     );
@@ -292,14 +305,13 @@ impl GpuBackend for RocprofilerBackend {
                 // Emit memory copy events.
                 for mc in state.memcopies[mc_start..].iter() {
                     let duration_ns = mc.end_ns.saturating_sub(mc.start_ns);
-                    let direction_str = match mc.direction {
-                        1 => "HtoH",
-                        2 => "HtoD",
-                        3 => "DtoH",
-                        4 => "DtoD",
-                        _ => "Unknown",
+                    let memcpy_name = match mc.direction {
+                        1 => "Memcpy HtoH",
+                        2 => "Memcpy HtoD",
+                        3 => "Memcpy DtoH",
+                        4 => "Memcpy DtoD",
+                        _ => "Memcpy",
                     };
-                    let memcpy_name = format!("Memcpy {}", direction_str);
                     ctx.add_packet(|packet: &mut TracePacket| {
                         packet
                             .set_timestamp(mc.start_ns)
@@ -312,7 +324,7 @@ impl GpuBackend for RocprofilerBackend {
                                     .set_hw_queue_iid(AMD_HW_QUEUE_IID_OFFSET)
                                     .set_stage_iid(AMD_MEMCPY_STAGE_IID)
                                     .set_context(1)
-                                    .set_name(&memcpy_name);
+                                    .set_name(memcpy_name);
                                 let extra_fields: &[(&str, String)] = &[
                                     ("process_id", process_id.to_string()),
                                     ("process_name", process_name.clone()),
@@ -332,13 +344,47 @@ impl GpuBackend for RocprofilerBackend {
                     });
                 }
 
+                // Emit memory set events.
+                for ms in state.memsets[ms_start..].iter() {
+                    let duration_ns = ms.end_ns.saturating_sub(ms.start_ns);
+                    ctx.add_packet(|packet: &mut TracePacket| {
+                        packet
+                            .set_timestamp(ms.start_ns)
+                            .set_timestamp_clock_id(BuiltinClock::BuiltinClockBoottime.into())
+                            .set_gpu_render_stage_event(|event: &mut GpuRenderStageEvent| {
+                                event
+                                    .set_event_id(get_next_event_id())
+                                    .set_duration(duration_ns)
+                                    .set_gpu_id(ms.gpu_id as i32)
+                                    .set_hw_queue_iid(AMD_HW_QUEUE_IID_OFFSET)
+                                    .set_stage_iid(AMD_MEMSET_STAGE_IID)
+                                    .set_context(1)
+                                    .set_name("Memset");
+                                let extra_fields: &[(&str, String)] = &[
+                                    ("process_id", process_id.to_string()),
+                                    ("process_name", process_name.clone()),
+                                    ("device_id", ms.device_index.to_string()),
+                                ];
+                                for (name, value) in extra_fields {
+                                    event.set_extra_data(
+                                        |ed: &mut GpuRenderStageEventExtraData| {
+                                            ed.set_name(*name);
+                                            ed.set_value(value.as_str());
+                                        },
+                                    );
+                                }
+                            });
+                    });
+                }
+
                 let mut sg = Some(stop_guard_opt.take());
                 ctx.flush(move || drop(sg.take()));
             });
             drop(stop_guard_opt);
 
             let emitted = state.kernel_dispatches.len().saturating_sub(kd_start)
-                + state.memcopies.len().saturating_sub(mc_start);
+                + state.memcopies.len().saturating_sub(mc_start)
+                + state.memsets.len().saturating_sub(ms_start);
             injection_log!(
                 "emitted {} AMD render stage events (instance {})",
                 emitted,

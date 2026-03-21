@@ -81,6 +81,15 @@ pub struct MemcopyActivity {
     pub direction: i32,
 }
 
+/// A captured memory set event.
+#[derive(Debug, Clone)]
+pub struct MemsetActivity {
+    pub start_ns: u64,
+    pub end_ns: u64,
+    pub device_index: i32,
+    pub gpu_id: u32,
+}
+
 /// A captured HIP runtime API call event from buffer tracing.
 #[derive(Debug, Clone)]
 pub struct ApiActivity {
@@ -98,6 +107,7 @@ pub struct ApiActivity {
 pub struct ConsumerStartOffsets {
     pub kernel_dispatches: usize,
     pub memcopies: usize,
+    pub memsets: usize,
 }
 
 impl ConsumerStartOffsets {
@@ -105,6 +115,7 @@ impl ConsumerStartOffsets {
         Self {
             kernel_dispatches: state.kernel_dispatches.len(),
             memcopies: state.memcopies.len(),
+            memsets: state.memsets.len(),
         }
     }
 }
@@ -114,6 +125,8 @@ pub struct GlobalState {
     pub kernel_dispatches: Vec<KernelDispatch>,
     /// Captured memory copy events.
     pub memcopies: Vec<MemcopyActivity>,
+    /// Captured memory set events.
+    pub memsets: Vec<MemsetActivity>,
     /// Captured HIP runtime API call events.
     pub hip_api_activities: Vec<ApiActivity>,
     /// Captured counter results from dispatch counting callbacks.
@@ -150,6 +163,7 @@ impl Default for GlobalState {
         Self {
             kernel_dispatches: Vec::new(),
             memcopies: Vec::new(),
+            memsets: Vec::new(),
             hip_api_activities: Vec::new(),
             counter_results: Vec::new(),
             kernel_names: HashMap::new(),

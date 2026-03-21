@@ -293,10 +293,10 @@ impl GpuBackend for RocprofilerBackend {
                 for mc in state.memcopies[mc_start..].iter() {
                     let duration_ns = mc.end_ns.saturating_sub(mc.start_ns);
                     let direction_str = match mc.direction {
-                        1 => "HostToHost",
-                        2 => "HostToDevice",
-                        3 => "DeviceToHost",
-                        4 => "DeviceToDevice",
+                        1 => "HtoH",
+                        2 => "HtoD",
+                        3 => "DtoH",
+                        4 => "DtoD",
                         _ => "Unknown",
                     };
                     let memcpy_name = format!("Memcpy {}", direction_str);

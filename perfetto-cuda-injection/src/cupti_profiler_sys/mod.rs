@@ -38,5 +38,27 @@ pub mod bindings {
 #[cfg(feature = "stubs")]
 pub mod bindings {
     pub use super::raw_bindings::*;
+
+    use std::os::raw::{c_char, c_int, c_void};
+
+    // NVML types not present in raw_bindings (no NVML headers for bindgen).
+    #[allow(non_camel_case_types)]
+    pub type nvmlReturn_t = u32;
+    #[allow(non_camel_case_types)]
+    pub type nvmlDevice_t = *mut c_void;
+
+    // Stubs for CUDA/NVML functions not in the original bindgen-generated bindings.
+    unsafe extern "C" {
+        pub fn cuDeviceGetPCIBusId(
+            pciBusId: *mut c_char,
+            len: c_int,
+            dev: super::raw_bindings::CUdevice,
+        ) -> super::raw_bindings::CUresult;
+        pub fn nvmlDeviceGetHandleByPciBusId_v2(
+            pciBusId: *const c_char,
+            device: *mut nvmlDevice_t,
+        ) -> nvmlReturn_t;
+        pub fn nvmlDeviceGetIndex(device: nvmlDevice_t, index: *mut u32) -> nvmlReturn_t;
+    }
 }
 pub use bindings::*;

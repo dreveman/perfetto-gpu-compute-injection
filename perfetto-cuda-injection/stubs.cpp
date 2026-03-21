@@ -34,6 +34,11 @@ typedef struct {
 #define CUDA_SUCCESS 0
 #define CUPTI_SUCCESS 0
 
+// NVML types
+typedef unsigned int nvmlReturn_t;
+typedef void* nvmlDevice_t;
+#define NVML_SUCCESS 0
+
 typedef struct {
   void* pCounterAvailabilityImage;
   size_t counterAvailabilityImageSize;
@@ -318,6 +323,27 @@ CUptiResult cuptiGetCallbackName(CUpti_CallbackDomain domain, uint32_t cbid,
   static const char* stub_name = "stub_api_call";
   *name = stub_name;
   return CUPTI_SUCCESS;
+}
+
+CUresult cuDeviceGetPCIBusId(char* pciBusId, int len, CUdevice dev) {
+  (void)dev;
+  snprintf(pciBusId, len, "0000:00:00.0");
+  return CUDA_SUCCESS;
+}
+
+nvmlReturn_t nvmlInit_v2() { return NVML_SUCCESS; }
+
+nvmlReturn_t nvmlDeviceGetHandleByPciBusId_v2(const char* pciBusId,
+                                              nvmlDevice_t* device) {
+  (void)pciBusId;
+  *device = nullptr;
+  return NVML_SUCCESS;
+}
+
+nvmlReturn_t nvmlDeviceGetIndex(nvmlDevice_t device, unsigned int* index) {
+  (void)device;
+  *index = 0;
+  return NVML_SUCCESS;
 }
 
 typedef int CUpti_ActivityThreadIdType;

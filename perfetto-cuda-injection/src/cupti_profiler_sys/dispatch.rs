@@ -382,6 +382,86 @@ dispatch_fn!(get_cupti_handle, CUPTI_ERROR_UNKNOWN,
     ) -> CUptiResult);
 
 // ---------------------------------------------------------------------------
+// NVML library handle
+// ---------------------------------------------------------------------------
+
+/// NVML return type (0 = success).
+#[allow(non_camel_case_types)]
+pub type nvmlReturn_t = u32;
+
+/// Opaque NVML device handle.
+#[allow(non_camel_case_types)]
+pub type nvmlDevice_t = *mut c_void;
+
+static NVML_HANDLE: OnceLock<usize> = OnceLock::new();
+
+/// Returns a handle to `libnvidia-ml.so.1`, loading it on demand.
+/// Also calls `nvmlInit_v2()` to initialize the library.
+/// Returns null if NVML is not available (gpu_id will fall back to CUDA ordinal).
+fn get_nvml_handle() -> *mut c_void {
+    *NVML_HANDLE.get_or_init(|| {
+        let handle = unsafe { dlopen(c"libnvidia-ml.so.1".as_ptr(), RTLD_LAZY) };
+        if handle.is_null() {
+            eprintln!(
+                "==INJECTION== could not load libnvidia-ml.so.1; \
+                 gpu_id will fall back to CUDA ordinal"
+            );
+            return 0;
+        }
+        // NVML requires initialization before any other calls.
+        let init_sym = unsafe { dlsym(handle, c"nvmlInit_v2".as_ptr()) };
+        if init_sym.is_null() {
+            eprintln!(
+                "==INJECTION== could not resolve nvmlInit_v2; \
+                 gpu_id will fall back to CUDA ordinal"
+            );
+            return 0;
+        }
+        let init_fn: unsafe extern "C" fn() -> nvmlReturn_t =
+            unsafe { std::mem::transmute(init_sym) };
+        let ret = unsafe { init_fn() };
+        if ret != 0 {
+            eprintln!(
+                "==INJECTION== nvmlInit_v2 failed (error {}); \
+                 gpu_id will fall back to CUDA ordinal",
+                ret
+            );
+            return 0;
+        }
+        handle as usize
+    }) as *mut c_void
+}
+
+// ---------------------------------------------------------------------------
+// CUDA Driver API: PCI bus ID
+// ---------------------------------------------------------------------------
+
+dispatch_fn!(get_cuda_handle, CUDA_ERROR_UNKNOWN,
+    cuDeviceGetPCIBusId(
+        pciBusId: *mut c_char,
+        len: c_int,
+        dev: CUdevice,
+    ) -> CUresult);
+
+// ---------------------------------------------------------------------------
+// NVML API (from libnvidia-ml.so)
+// ---------------------------------------------------------------------------
+
+const NVML_ERROR_UNINITIALIZED: nvmlReturn_t = 1;
+
+dispatch_fn!(get_nvml_handle, NVML_ERROR_UNINITIALIZED,
+    nvmlDeviceGetHandleByPciBusId_v2(
+        pciBusId: *const c_char,
+        device: *mut nvmlDevice_t,
+    ) -> nvmlReturn_t);
+
+dispatch_fn!(get_nvml_handle, NVML_ERROR_UNINITIALIZED,
+    nvmlDeviceGetIndex(
+        device: nvmlDevice_t,
+        index: *mut u32,
+    ) -> nvmlReturn_t);
+
+// ---------------------------------------------------------------------------
 // CUPTI: callback name lookup
 // ---------------------------------------------------------------------------
 

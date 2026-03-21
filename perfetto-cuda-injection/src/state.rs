@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::cupti_profiler::bindings::*;
+use crate::cupti_profiler::cuda;
 use crate::cupti_profiler::*;
 use once_cell::sync::Lazy;
 use perfetto_gpu_compute_injection::config::Config;
@@ -46,14 +47,10 @@ pub trait GpuActivity {
         emit: &mut dyn FnMut(&str, &str),
     );
 
-    /// Returns a u32 gpu_id derived from the device UUID by XOR-folding.
+    /// Returns the nvidia-smi device index as gpu_id.
+    /// Falls back to the CUDA ordinal if NVML is unavailable.
     fn gpu_id(&self) -> u32 {
-        let uuid = self.device_uuid();
-        let u0 = u32::from_le_bytes([uuid[0], uuid[1], uuid[2], uuid[3]]);
-        let u1 = u32::from_le_bytes([uuid[4], uuid[5], uuid[6], uuid[7]]);
-        let u2 = u32::from_le_bytes([uuid[8], uuid[9], uuid[10], uuid[11]]);
-        let u3 = u32::from_le_bytes([uuid[12], uuid[13], uuid[14], uuid[15]]);
-        u0 ^ u1 ^ u2 ^ u3
+        cuda::get_nvidia_smi_index(self.device_id() as CUdevice)
     }
 
     /// Returns the device UUID as a hex string in standard UUID format.

@@ -191,16 +191,16 @@ impl MemcpyActivity {
     /// Returns the copy direction as a human-readable string.
     pub fn direction_string(&self) -> &'static str {
         match self.copy_kind {
-            1 => "HostToDevice",
-            2 => "DeviceToHost",
-            3 => "HostToArray",
-            4 => "ArrayToHost",
-            5 => "ArrayToArray",
-            6 => "ArrayToDevice",
-            7 => "DeviceToArray",
-            8 => "DeviceToDevice",
-            9 => "HostToHost",
-            10 => "PeerToPeer",
+            1 => "HtoD",
+            2 => "DtoH",
+            3 => "HtoA",
+            4 => "AtoH",
+            5 => "AtoA",
+            6 => "AtoD",
+            7 => "DtoA",
+            8 => "DtoD",
+            9 => "HtoH",
+            10 => "PtoP",
             _ => "Unknown",
         }
     }

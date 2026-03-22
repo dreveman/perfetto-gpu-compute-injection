@@ -22,11 +22,6 @@ use crate::state::{
 use std::ffi::CStr;
 use std::panic;
 
-/// Derive a 32-bit pseudo GPU ID from a 64-bit agent handle by XOR-folding.
-fn agent_handle_to_gpu_id(handle: u64) -> u32 {
-    ((handle >> 32) as u32) ^ (handle as u32)
-}
-
 /// Buffer callback: called by rocprofiler's internal thread when the buffer is
 /// flushed (at watermark or explicitly). Processes kernel dispatch and memory
 /// copy records.
@@ -88,13 +83,11 @@ pub unsafe extern "C" fn buffer_callback(
                         .get(&info.agent_id.handle)
                         .map(|a| a.device_index)
                         .unwrap_or(0);
-                    let gpu_id = agent_handle_to_gpu_id(info.agent_id.handle);
                     state.memcopies.push(MemcopyActivity {
                         bytes: 0,
                         start_ns: rec.start_timestamp,
                         end_ns: rec.end_timestamp,
                         device_index,
-                        gpu_id,
                         direction: -1,
                     });
                     continue;
@@ -105,12 +98,10 @@ pub unsafe extern "C" fn buffer_callback(
                         .get(&info.agent_id.handle)
                         .map(|a| a.device_index)
                         .unwrap_or(0);
-                    let gpu_id = agent_handle_to_gpu_id(info.agent_id.handle);
                     state.memsets.push(MemsetActivity {
                         start_ns: rec.start_timestamp,
                         end_ns: rec.end_timestamp,
                         device_index,
-                        gpu_id,
                     });
                     continue;
                 }
@@ -121,8 +112,6 @@ pub unsafe extern "C" fn buffer_callback(
                 let arch = agent_info.map(|a| a.arch.clone()).unwrap_or_default();
                 let wave_front_size = agent_info.map(|a| a.wave_front_size).unwrap_or(0);
                 let cu_count = agent_info.map(|a| a.cu_count).unwrap_or(0);
-
-                let gpu_id = agent_handle_to_gpu_id(info.agent_id.handle);
 
                 state.kernel_dispatches.push(KernelDispatch {
                     kernel_name,
@@ -136,7 +125,6 @@ pub unsafe extern "C" fn buffer_callback(
                     end_ns: rec.end_timestamp,
                     queue_handle: info.queue_id.handle,
                     device_index,
-                    gpu_id,
                     arch,
                     wave_front_size,
                     cu_count,
@@ -160,14 +148,11 @@ pub unsafe extern "C" fn buffer_callback(
                             .unwrap_or(0)
                     });
 
-                let gpu_id = agent_handle_to_gpu_id(rec.dst_agent_id.handle);
-
                 state.memcopies.push(MemcopyActivity {
                     bytes: rec.bytes,
                     start_ns: rec.start_timestamp,
                     end_ns: rec.end_timestamp,
                     device_index,
-                    gpu_id,
                     #[allow(clippy::unnecessary_cast)]
                     direction: rec.operation as i32,
                 });
@@ -364,7 +349,6 @@ pub unsafe extern "C" fn record_counting_callback(
             .get(&info.agent_id.handle)
             .map(|a| a.device_index)
             .unwrap_or(0);
-        let gpu_id = agent_handle_to_gpu_id(info.agent_id.handle);
 
         let mut values = vec![0.0_f64; num_counters];
         for record in records {
@@ -383,7 +367,6 @@ pub unsafe extern "C" fn record_counting_callback(
             start_ns: dispatch_data.start_timestamp,
             end_ns: dispatch_data.end_timestamp,
             device_index,
-            gpu_id,
             values,
         });
     });

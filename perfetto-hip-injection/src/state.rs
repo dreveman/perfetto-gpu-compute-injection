@@ -24,7 +24,6 @@ pub struct CounterResult {
     pub start_ns: u64,
     pub end_ns: u64,
     pub device_index: i32,
-    pub gpu_id: u32,
     pub values: Vec<f64>, // values in same order as counter_names
 }
 
@@ -59,8 +58,6 @@ pub struct KernelDispatch {
     pub queue_handle: u64,
     /// `logical_node_type_id` (0-based GPU index) for this agent.
     pub device_index: i32,
-    /// Pseudo GPU-ID derived from the agent handle (for Perfetto gpu_id field).
-    pub gpu_id: u32,
     /// GPU architecture name (e.g. `gfx90a`).
     pub arch: String,
     /// Wavefront size (64 for GCN/CDNA, 32 for RDNA).
@@ -76,7 +73,6 @@ pub struct MemcopyActivity {
     pub start_ns: u64,
     pub end_ns: u64,
     pub device_index: i32,
-    pub gpu_id: u32,
     /// Memory copy direction (raw `rocprofiler_memory_copy_operation_t` value).
     pub direction: i32,
 }
@@ -87,7 +83,6 @@ pub struct MemsetActivity {
     pub start_ns: u64,
     pub end_ns: u64,
     pub device_index: i32,
-    pub gpu_id: u32,
 }
 
 /// A captured HIP runtime API call event from buffer tracing.

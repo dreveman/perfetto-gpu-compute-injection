@@ -262,7 +262,7 @@ impl GpuBackend for RocprofilerBackend {
                                 event
                                     .set_event_id(get_next_event_id())
                                     .set_duration(duration_ns)
-                                    .set_gpu_id(kd.gpu_id as i32)
+                                    .set_gpu_id(kd.device_index)
                                     .set_hw_queue_iid(hw_queue_iid)
                                     .set_stage_iid(AMD_KERNEL_STAGE_IID)
                                     .set_context(1)
@@ -320,7 +320,7 @@ impl GpuBackend for RocprofilerBackend {
                                 event
                                     .set_event_id(get_next_event_id())
                                     .set_duration(duration_ns)
-                                    .set_gpu_id(mc.gpu_id as i32)
+                                    .set_gpu_id(mc.device_index)
                                     .set_hw_queue_iid(AMD_HW_QUEUE_IID_OFFSET)
                                     .set_stage_iid(AMD_MEMCPY_STAGE_IID)
                                     .set_context(1)
@@ -355,7 +355,7 @@ impl GpuBackend for RocprofilerBackend {
                                 event
                                     .set_event_id(get_next_event_id())
                                     .set_duration(duration_ns)
-                                    .set_gpu_id(ms.gpu_id as i32)
+                                    .set_gpu_id(ms.device_index)
                                     .set_hw_queue_iid(AMD_HW_QUEUE_IID_OFFSET)
                                     .set_stage_iid(AMD_MEMSET_STAGE_IID)
                                     .set_context(1)
@@ -611,7 +611,7 @@ impl GpuBackend for RocprofilerBackend {
                     return;
                 }
                 for result in state.counter_results[cr_start..].iter() {
-                    let gpu_id = result.gpu_id as i32;
+                    let gpu_id = result.device_index;
                     let got_first_counters =
                         GOT_FIRST_COUNTERS.fetch_or(1 << inst_id, Ordering::SeqCst);
                     if got_first_counters & (1 << inst_id) == 0 {

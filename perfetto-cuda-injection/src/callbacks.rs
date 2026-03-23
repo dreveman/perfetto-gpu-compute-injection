@@ -306,11 +306,29 @@ pub unsafe extern "C" fn profiler_callback_handler(
                             }
                             // Record kernel launch with start timestamp.
                             let start = trace_time_ns();
+                            let block_size = params.blockDimX * params.blockDimY * params.blockDimZ;
+                            let cache_mode = unsafe {
+                                profiler::get_func_attribute(
+                                    params.f,
+                                    CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_CACHE_MODE_CA,
+                                )
+                            }
+                            .unwrap_or(0);
+                            let max_active_blocks_per_sm = unsafe {
+                                profiler::occupancy_max_active_blocks_per_multiprocessor(
+                                    params.f,
+                                    block_size as i32,
+                                    params.sharedMemBytes as usize,
+                                )
+                            }
+                            .unwrap_or(0);
                             data.kernel_launches.push(KernelLaunch {
                                 function: params.f,
                                 start,
                                 end: 0, // Will be set in API_EXIT when profiler completes
                                 profiled: counters_enabled,
+                                cache_mode,
+                                max_active_blocks_per_sm,
                             });
                         }
                     }
@@ -373,9 +391,50 @@ pub unsafe extern "C" fn profiler_callback_handler(
                         CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
                     )
                     .unwrap_or(0);
+                    let warp_size = profiler::get_device_attribute(
+                        device_id,
+                        CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_WARP_SIZE,
+                    )
+                    .unwrap_or(32);
+                    let max_threads_per_sm = profiler::get_device_attribute(
+                        device_id,
+                        CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR,
+                    )
+                    .unwrap_or(0);
+                    let max_blocks_per_sm = profiler::get_device_attribute(
+                        device_id,
+                        CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_MAX_BLOCKS_PER_MULTIPROCESSOR,
+                    )
+                    .unwrap_or(0);
+                    let max_regs_per_sm = profiler::get_device_attribute(
+                        device_id,
+                        CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_MAX_REGISTERS_PER_MULTIPROCESSOR,
+                    )
+                    .unwrap_or(0);
+                    let max_smem_per_sm = profiler::get_device_attribute(
+                        device_id,
+                        CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_MULTIPROCESSOR,
+                    )
+                    .unwrap_or(0);
+                    let cc_major = profiler::get_device_attribute(
+                        device_id,
+                        CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR,
+                    )
+                    .unwrap_or(0);
+                    let cc_minor = profiler::get_device_attribute(
+                        device_id,
+                        CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR,
+                    )
+                    .unwrap_or(0);
                     let mut data = Box::new(crate::state::CtxProfilerData {
                         device_id,
                         num_sms,
+                        warp_size,
+                        max_threads_per_sm,
+                        max_blocks_per_sm,
+                        max_regs_per_sm,
+                        max_smem_per_sm,
+                        compute_capability: (cc_major, cc_minor),
                         max_num_ranges: 10,
                         is_active: false,
                         counter_data_image: Vec::new(),

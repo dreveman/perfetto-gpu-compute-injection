@@ -147,9 +147,16 @@ impl GpuBackend for RocprofilerBackend {
                 Ok(s) => s,
                 Err(_) => return,
             };
-            let start_offsets = match state.renderstages_consumers.remove(&inst_id) {
-                Some(o) => o,
-                None => return,
+            let start_offsets = if stop_guard.is_some() {
+                match state.renderstages_consumers.remove(&inst_id) {
+                    Some(o) => o,
+                    None => return,
+                }
+            } else {
+                match state.renderstages_consumers.get(&inst_id).cloned() {
+                    Some(o) => o,
+                    None => return,
+                }
             };
             let kd_start = start_offsets.kernel_dispatches;
             let mc_start = start_offsets.memcopies;
@@ -596,9 +603,16 @@ impl GpuBackend for RocprofilerBackend {
                 Ok(s) => s,
                 Err(_) => return,
             };
-            let start_offsets = match state.counters_consumers.remove(&inst_id) {
-                Some(o) => o,
-                None => return,
+            let start_offsets = if stop_guard.is_some() {
+                match state.counters_consumers.remove(&inst_id) {
+                    Some(o) => o,
+                    None => return,
+                }
+            } else {
+                match state.counters_consumers.get(&inst_id).cloned() {
+                    Some(o) => o,
+                    None => return,
+                }
             };
             let counter_names = state.counter_names.clone();
             if counter_names.is_empty() {
@@ -682,439 +696,29 @@ impl GpuBackend for RocprofilerBackend {
     }
 
     fn flush_renderstage_events(&self) {
-        let _ = panic::catch_unwind(|| {
-            let (process_id, process_name) =
-                perfetto_gpu_compute_injection::config::get_process_info();
-
-            let mut state = match GLOBAL_STATE.lock() {
-                Ok(s) => s,
-                Err(_) => return,
-            };
-
-            if state.renderstages_consumers.is_empty() {
-                return;
-            }
-
-            let inst_ids: Vec<u32> = state.renderstages_consumers.keys().copied().collect();
-
-            for inst_id in &inst_ids {
-                let start_offsets = match state.renderstages_consumers.get(inst_id) {
-                    Some(o) => o,
-                    None => continue,
-                };
-
-                let kd_start = start_offsets.kernel_dispatches;
-                let mc_start = start_offsets.memcopies;
-                let ms_start = start_offsets.memsets;
-
-                get_renderstages_data_source().trace(|ctx: &mut TraceContext| {
-                    if ctx.instance_index() != *inst_id {
-                        return;
-                    }
-
-                    // Collect unique queue handles for interned specs.
-                    let mut queues: std::collections::HashSet<u64> =
-                        std::collections::HashSet::new();
-                    for kd in state.kernel_dispatches[kd_start..].iter() {
-                        queues.insert(kd.queue_handle);
-                    }
-
-                    // Always emit interned specifications on flush so that
-                    // queues that first appear after a previous flush are
-                    // properly defined.
-                    let has_events = !state.kernel_dispatches[kd_start..].is_empty()
-                        || !state.memcopies[mc_start..].is_empty()
-                        || !state.memsets[ms_start..].is_empty();
-
-                    if has_events {
-                        ctx.add_packet(|packet: &mut TracePacket| {
-                            packet.set_sequence_flags(
-                                TracePacketSequenceFlags::SeqIncrementalStateCleared as u32,
-                            );
-                            packet.set_interned_data(|interned: &mut InternedData| {
-                                interned.set_graphics_contexts(
-                                    |gctx: &mut InternedGraphicsContext| {
-                                        gctx.set_iid(1);
-                                        gctx.set_pid(process_id);
-                                        gctx.set_api(InternedGraphicsContextApi::Hip);
-                                    },
-                                );
-                                for &queue_handle in &queues {
-                                    let iid =
-                                        (queue_handle & 0xFFFF) + AMD_HW_QUEUE_IID_OFFSET;
-                                    interned.set_gpu_specifications(
-                                        |spec: &mut InternedGpuRenderStageSpecification| {
-                                            spec.set_iid(iid);
-                                            spec.set_name(format!(
-                                                "Queue ({})",
-                                                queue_handle
-                                            ));
-                                            spec.set_category(
-                                                InternedGpuRenderStageSpecificationRenderStageCategory::Compute,
-                                            );
-                                        },
-                                    );
-                                }
-                                interned.set_gpu_specifications(
-                                    |spec: &mut InternedGpuRenderStageSpecification| {
-                                        spec.set_iid(AMD_KERNEL_STAGE_IID);
-                                        spec.set_name("Kernel");
-                                        spec.set_description("HIP Kernel");
-                                        spec.set_category(
-                                            InternedGpuRenderStageSpecificationRenderStageCategory::Compute,
-                                        );
-                                    },
-                                );
-                                interned.set_gpu_specifications(
-                                    |spec: &mut InternedGpuRenderStageSpecification| {
-                                        spec.set_iid(AMD_MEMCPY_STAGE_IID);
-                                        spec.set_name("MemoryTransfer");
-                                        spec.set_description("HIP Memory Transfer");
-                                        spec.set_category(
-                                            InternedGpuRenderStageSpecificationRenderStageCategory::Other,
-                                        );
-                                    },
-                                );
-                                interned.set_gpu_specifications(
-                                    |spec: &mut InternedGpuRenderStageSpecification| {
-                                        spec.set_iid(AMD_MEMSET_STAGE_IID);
-                                        spec.set_name("MemorySet");
-                                        spec.set_description("HIP Memory Set");
-                                        spec.set_category(
-                                            InternedGpuRenderStageSpecificationRenderStageCategory::Other,
-                                        );
-                                    },
-                                );
-                            });
-                        });
-                        GOT_FIRST_RENDERSTAGES.fetch_or(1 << inst_id, Ordering::SeqCst);
-                    }
-
-                    // Emit kernel dispatch events.
-                    for kd in state.kernel_dispatches[kd_start..].iter() {
-                        let demangled = perfetto_gpu_compute_injection::kernel::demangle_name(
-                            &kd.kernel_name,
-                        );
-                        let grid_size = kd.grid.0 * kd.grid.1 * kd.grid.2;
-                        let workgroup_size = kd.workgroup.0 * kd.workgroup.1 * kd.workgroup.2;
-                        let thread_count = grid_size * workgroup_size;
-                        let total_waves = if kd.wave_front_size > 0 {
-                            (grid_size * workgroup_size).div_ceil(kd.wave_front_size)
-                        } else {
-                            0
-                        };
-                        let waves_per_cu = if kd.cu_count > 0 {
-                            total_waves as f64 / kd.cu_count as f64
-                        } else {
-                            0.0
-                        };
-                        let hw_queue_iid =
-                            (kd.queue_handle & 0xFFFF) + AMD_HW_QUEUE_IID_OFFSET;
-                        let duration_ns = kd.end_ns.saturating_sub(kd.start_ns);
-
-                        ctx.add_packet(|packet: &mut TracePacket| {
-                            packet
-                                .set_timestamp(kd.start_ns)
-                                .set_timestamp_clock_id(
-                                    BuiltinClock::BuiltinClockBoottime.into(),
-                                )
-                                .set_gpu_render_stage_event(
-                                    |event: &mut GpuRenderStageEvent| {
-                                        event
-                                            .set_event_id(get_next_event_id())
-                                            .set_duration(duration_ns)
-                                            .set_gpu_id(kd.device_index)
-                                            .set_hw_queue_iid(hw_queue_iid)
-                                            .set_stage_iid(AMD_KERNEL_STAGE_IID)
-                                            .set_context(1)
-                                            .set_name(
-                                                perfetto_gpu_compute_injection::kernel::simplify_name(&demangled),
-                                            );
-                                        let extra_fields: &[(&str, String)] = &[
-                                            ("kernel_name", kd.kernel_name.clone()),
-                                            ("kernel_demangled_name", demangled.clone()),
-                                            ("kernel_type", "Compute".to_string()),
-                                            ("process_id", process_id.to_string()),
-                                            ("process_name", process_name.clone()),
-                                            ("device_id", kd.device_index.to_string()),
-                                            ("arch", kd.arch.clone()),
-                                            ("queue_id", kd.queue_handle.to_string()),
-                                            ("launch__grid_size", grid_size.to_string()),
-                                            ("launch__grid_size_x", kd.grid.0.to_string()),
-                                            ("launch__grid_size_y", kd.grid.1.to_string()),
-                                            ("launch__grid_size_z", kd.grid.2.to_string()),
-                                            (
-                                                "launch__block_size",
-                                                workgroup_size.to_string(),
-                                            ),
-                                            (
-                                                "launch__block_size_x",
-                                                kd.workgroup.0.to_string(),
-                                            ),
-                                            (
-                                                "launch__block_size_y",
-                                                kd.workgroup.1.to_string(),
-                                            ),
-                                            (
-                                                "launch__block_size_z",
-                                                kd.workgroup.2.to_string(),
-                                            ),
-                                            (
-                                                "launch__thread_count",
-                                                thread_count.to_string(),
-                                            ),
-                                            (
-                                                "launch__waves_per_multiprocessor",
-                                                format!("{:.2}", waves_per_cu),
-                                            ),
-                                        ];
-                                        for (name, value) in extra_fields {
-                                            event.set_extra_data(
-                                                |ed: &mut GpuRenderStageEventExtraData| {
-                                                    ed.set_name(*name);
-                                                    ed.set_value(value.as_str());
-                                                },
-                                            );
-                                        }
-                                    },
-                                );
-                        });
-                    }
-
-                    // Emit memory copy events.
-                    for mc in state.memcopies[mc_start..].iter() {
-                        let duration_ns = mc.end_ns.saturating_sub(mc.start_ns);
-                        let memcpy_name = match mc.direction {
-                            1 => "Memcpy HtoH",
-                            2 => "Memcpy HtoD",
-                            3 => "Memcpy DtoH",
-                            4 => "Memcpy DtoD",
-                            _ => "Memcpy",
-                        };
-                        ctx.add_packet(|packet: &mut TracePacket| {
-                            packet
-                                .set_timestamp(mc.start_ns)
-                                .set_timestamp_clock_id(
-                                    BuiltinClock::BuiltinClockBoottime.into(),
-                                )
-                                .set_gpu_render_stage_event(
-                                    |event: &mut GpuRenderStageEvent| {
-                                        event
-                                            .set_event_id(get_next_event_id())
-                                            .set_duration(duration_ns)
-                                            .set_gpu_id(mc.device_index)
-                                            .set_hw_queue_iid(AMD_HW_QUEUE_IID_OFFSET)
-                                            .set_stage_iid(AMD_MEMCPY_STAGE_IID)
-                                            .set_context(1)
-                                            .set_name(memcpy_name);
-                                        let extra_fields: &[(&str, String)] = &[
-                                            ("process_id", process_id.to_string()),
-                                            ("process_name", process_name.clone()),
-                                            ("device_id", mc.device_index.to_string()),
-                                            ("size_bytes", mc.bytes.to_string()),
-                                            ("direction", mc.direction.to_string()),
-                                        ];
-                                        for (name, value) in extra_fields {
-                                            event.set_extra_data(
-                                                |ed: &mut GpuRenderStageEventExtraData| {
-                                                    ed.set_name(*name);
-                                                    ed.set_value(value.as_str());
-                                                },
-                                            );
-                                        }
-                                    },
-                                );
-                        });
-                    }
-
-                    // Emit memory set events.
-                    for ms in state.memsets[ms_start..].iter() {
-                        let duration_ns = ms.end_ns.saturating_sub(ms.start_ns);
-                        ctx.add_packet(|packet: &mut TracePacket| {
-                            packet
-                                .set_timestamp(ms.start_ns)
-                                .set_timestamp_clock_id(
-                                    BuiltinClock::BuiltinClockBoottime.into(),
-                                )
-                                .set_gpu_render_stage_event(
-                                    |event: &mut GpuRenderStageEvent| {
-                                        event
-                                            .set_event_id(get_next_event_id())
-                                            .set_duration(duration_ns)
-                                            .set_gpu_id(ms.device_index)
-                                            .set_hw_queue_iid(AMD_HW_QUEUE_IID_OFFSET)
-                                            .set_stage_iid(AMD_MEMSET_STAGE_IID)
-                                            .set_context(1)
-                                            .set_name("Memset");
-                                        let extra_fields: &[(&str, String)] = &[
-                                            ("process_id", process_id.to_string()),
-                                            ("process_name", process_name.clone()),
-                                            ("device_id", ms.device_index.to_string()),
-                                        ];
-                                        for (name, value) in extra_fields {
-                                            event.set_extra_data(
-                                                |ed: &mut GpuRenderStageEventExtraData| {
-                                                    ed.set_name(*name);
-                                                    ed.set_value(value.as_str());
-                                                },
-                                            );
-                                        }
-                                    },
-                                );
-                        });
-                    }
-
-                    ctx.flush(|| {});
-                });
-            }
-
-            let emitted = state.kernel_dispatches.len().saturating_sub(
-                inst_ids
-                    .iter()
-                    .filter_map(|id| state.renderstages_consumers.get(id))
-                    .map(|o| o.kernel_dispatches)
-                    .min()
-                    .unwrap_or(0),
-            ) + state.memcopies.len().saturating_sub(
-                inst_ids
-                    .iter()
-                    .filter_map(|id| state.renderstages_consumers.get(id))
-                    .map(|o| o.memcopies)
-                    .min()
-                    .unwrap_or(0),
-            ) + state.memsets.len().saturating_sub(
-                inst_ids
-                    .iter()
-                    .filter_map(|id| state.renderstages_consumers.get(id))
-                    .map(|o| o.memsets)
-                    .min()
-                    .unwrap_or(0),
-            );
-
+        let inst_ids: Vec<u32> = GLOBAL_STATE
+            .lock()
+            .map(|s| s.renderstages_consumers.keys().copied().collect())
+            .unwrap_or_default();
+        for inst_id in inst_ids {
+            self.emit_renderstage_events_for_instance(inst_id, None);
+        }
+        if let Ok(mut state) = GLOBAL_STATE.lock() {
             state.advance_and_drain_renderstage_events();
-
-            if emitted > 0 {
-                injection_log!("flushed {} AMD render stage events", emitted);
-            }
-        });
+        }
     }
 
     fn flush_counter_events(&self) {
-        let _ = panic::catch_unwind(|| {
-            let mut state = match GLOBAL_STATE.lock() {
-                Ok(s) => s,
-                Err(_) => return,
-            };
-
-            if state.counters_consumers.is_empty() {
-                return;
-            }
-
-            let inst_ids: Vec<u32> = state.counters_consumers.keys().copied().collect();
-            let counter_names = state.counter_names.clone();
-            if counter_names.is_empty() {
-                return;
-            }
-
-            for inst_id in &inst_ids {
-                let start_offsets = match state.counters_consumers.get(inst_id) {
-                    Some(o) => o,
-                    None => continue,
-                };
-                let cr_start = start_offsets.counter_results;
-
-                get_counters_data_source().trace(|ctx: &mut TraceContext| {
-                    if ctx.instance_index() != *inst_id {
-                        return;
-                    }
-                    for result in state.counter_results[cr_start..].iter() {
-                        let gpu_id = result.device_index;
-                        let got_first_counters =
-                            GOT_FIRST_COUNTERS.fetch_or(1 << inst_id, Ordering::SeqCst);
-                        if got_first_counters & (1 << inst_id) == 0 {
-                            ctx.add_packet(|packet: &mut TracePacket| {
-                                packet
-                                    .set_timestamp(result.start_ns)
-                                    .set_timestamp_clock_id(
-                                        BuiltinClock::BuiltinClockBoottime.into(),
-                                    )
-                                    .set_gpu_counter_event(|event: &mut GpuCounterEvent| {
-                                        event.set_gpu_id(gpu_id).set_counter_descriptor(
-                                            |desc: &mut GpuCounterDescriptor| {
-                                                for (i, name) in
-                                                    counter_names.iter().enumerate()
-                                                {
-                                                    desc.set_specs(|spec: &mut GpuCounterDescriptorGpuCounterSpec| {
-                                                        spec.set_counter_id(i as u32);
-                                                        spec.set_name(name);
-                                                        spec.set_groups(GpuCounterDescriptorGpuCounterGroup::Compute);
-                                                    });
-                                                }
-                                            },
-                                        );
-                                    });
-                            });
-                        }
-                        // Zero packet at start_ns.
-                        ctx.add_packet(|packet: &mut TracePacket| {
-                            packet
-                                .set_timestamp(result.start_ns)
-                                .set_timestamp_clock_id(
-                                    BuiltinClock::BuiltinClockBoottime.into(),
-                                )
-                                .set_gpu_counter_event(|event: &mut GpuCounterEvent| {
-                                    event.set_gpu_id(gpu_id);
-                                    for i in 0..counter_names.len() {
-                                        event.set_counters(
-                                            |counter: &mut GpuCounterEventGpuCounter| {
-                                                counter
-                                                    .set_counter_id(i as u32)
-                                                    .set_int_value(0);
-                                            },
-                                        );
-                                    }
-                                });
-                        });
-                        // Values packet at end_ns.
-                        ctx.add_packet(|packet: &mut TracePacket| {
-                            packet
-                                .set_timestamp(result.end_ns)
-                                .set_timestamp_clock_id(
-                                    BuiltinClock::BuiltinClockBoottime.into(),
-                                )
-                                .set_gpu_counter_event(|event: &mut GpuCounterEvent| {
-                                    event.set_gpu_id(gpu_id);
-                                    for (i, &value) in result.values.iter().enumerate() {
-                                        event.set_counters(
-                                            |counter: &mut GpuCounterEventGpuCounter| {
-                                                counter
-                                                    .set_counter_id(i as u32)
-                                                    .set_double_value(value);
-                                            },
-                                        );
-                                    }
-                                });
-                        });
-                    }
-                    ctx.flush(|| {});
-                });
-            }
-
-            let emitted = state.counter_results.len().saturating_sub(
-                inst_ids
-                    .iter()
-                    .filter_map(|id| state.counters_consumers.get(id))
-                    .map(|o| o.counter_results)
-                    .min()
-                    .unwrap_or(0),
-            );
-
+        let inst_ids: Vec<u32> = GLOBAL_STATE
+            .lock()
+            .map(|s| s.counters_consumers.keys().copied().collect())
+            .unwrap_or_default();
+        for inst_id in inst_ids {
+            self.emit_counter_events_for_instance(inst_id, None);
+        }
+        if let Ok(mut state) = GLOBAL_STATE.lock() {
             state.advance_and_drain_counter_events();
-
-            if emitted > 0 {
-                injection_log!("flushed {} counter events", emitted);
-            }
-        });
+        }
     }
 }
 

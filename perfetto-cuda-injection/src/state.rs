@@ -63,6 +63,10 @@ pub struct KernelLaunch {
     /// When true, `start`/`end` are valid CPU-side timestamps to use for renderstage events.
     /// When false, activity timestamps from CUPTI activity records should be used instead.
     pub profiled: bool,
+    /// Pre-computed cache mode from `CU_FUNC_ATTRIBUTE_CACHE_MODE_CA`.
+    pub cache_mode: i32,
+    /// Pre-computed max active blocks per SM from `cuOccupancyMaxActiveBlocksPerMultiprocessor`.
+    pub max_active_blocks_per_sm: i32,
 }
 
 /// Detailed activity information for a kernel execution.
@@ -315,7 +319,7 @@ impl GpuActivity for MemsetActivity {
 /// Contexts that did not exist when the consumer started are absent from the
 /// maps; an offset of 0 is used for them (emit everything, since all of their
 /// data post-dates the consumer start).
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct ConsumerStartOffsets {
     pub range_info: HashMap<u32, usize>,
     pub kernel_launches: HashMap<u32, usize>,
@@ -349,6 +353,12 @@ impl ConsumerStartOffsets {
 pub struct CtxProfilerData {
     pub device_id: i32,
     pub num_sms: i32,
+    pub warp_size: i32,
+    pub max_threads_per_sm: i32,
+    pub max_blocks_per_sm: i32,
+    pub max_regs_per_sm: i32,
+    pub max_smem_per_sm: i32,
+    pub compute_capability: (i32, i32),
     pub max_num_ranges: usize,
     pub is_active: bool,
     pub counter_data_image: Vec<u8>,

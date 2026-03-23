@@ -31,29 +31,53 @@ pub unsafe fn get_device(_ctx: CUcontext) -> Result<CUdevice, u32> {
 }
 
 /// Safe wrapper for `cuDeviceGetAttribute`.
+/// Results are cached per (device, attribute) pair since these are static hardware properties.
 pub fn get_device_attribute(dev: CUdevice, attr: CUdevice_attribute) -> Result<i32, u32> {
+    static CACHE: Mutex<Option<HashMap<(i32, u32), i32>>> = Mutex::new(None);
+
+    let key = (dev, attr);
+    let mut cache = CACHE.lock().unwrap();
+    let map = cache.get_or_insert_with(HashMap::new);
+    if let Some(&val) = map.get(&key) {
+        return Ok(val);
+    }
+
     let mut val = 0;
     let res = unsafe { cuDeviceGetAttribute(&mut val, attr, dev) };
     if res != 0 {
         return Err(res);
     }
+    map.insert(key, val);
     Ok(val)
 }
 
 /// Safe wrapper for `cuFuncGetAttribute`.
+/// Results are cached per (function, attribute) pair. CUfunction handles are stable for
+/// the lifetime of their module.
 /// # Safety
 ///
 /// The `func` pointer must be a valid CUDA function handle.
 pub unsafe fn get_func_attribute(func: CUfunction, attr: CUfunction_attribute) -> Result<i32, u32> {
+    static CACHE: Mutex<Option<HashMap<(usize, u32), i32>>> = Mutex::new(None);
+
+    let key = (func as usize, attr);
+    let mut cache = CACHE.lock().unwrap();
+    let map = cache.get_or_insert_with(HashMap::new);
+    if let Some(&val) = map.get(&key) {
+        return Ok(val);
+    }
+
     let mut val = 0;
     let res = unsafe { cuFuncGetAttribute(&mut val, attr, func) };
     if res != 0 {
         return Err(res);
     }
+    map.insert(key, val);
     Ok(val)
 }
 
 /// Safe wrapper for `cuOccupancyMaxActiveBlocksPerMultiprocessor`.
+/// Results are cached per (function, block_size, dynamic_smem_size) tuple.
 /// # Safety
 ///
 /// The `func` pointer must be a valid CUDA function handle.
@@ -62,6 +86,16 @@ pub unsafe fn occupancy_max_active_blocks_per_multiprocessor(
     block_size: i32,
     dynamic_smem_size: usize,
 ) -> Result<i32, u32> {
+    #[allow(clippy::type_complexity)]
+    static CACHE: Mutex<Option<HashMap<(usize, i32, usize), i32>>> = Mutex::new(None);
+
+    let key = (func as usize, block_size, dynamic_smem_size);
+    let mut cache = CACHE.lock().unwrap();
+    let map = cache.get_or_insert_with(HashMap::new);
+    if let Some(&val) = map.get(&key) {
+        return Ok(val);
+    }
+
     let mut num_blocks = 0;
     let res = unsafe {
         cuOccupancyMaxActiveBlocksPerMultiprocessor(
@@ -74,6 +108,7 @@ pub unsafe fn occupancy_max_active_blocks_per_multiprocessor(
     if res != 0 {
         return Err(res);
     }
+    map.insert(key, num_blocks);
     Ok(num_blocks)
 }
 
@@ -85,17 +120,6 @@ pub unsafe fn get_context_id(ctx: CUcontext) -> u32 {
     let mut ctx_id = 0;
     let _ = unsafe { cuptiGetContextId(ctx, &mut ctx_id) };
     ctx_id
-}
-
-/// Gets the UUID for a CUDA device as raw bytes.
-pub fn get_device_uuid(dev: CUdevice) -> Result<[u8; 16], u32> {
-    let mut uuid: CUuuid = CUuuid { bytes: [0; 16] };
-    let res = unsafe { cuDeviceGetUuid_v2(&mut uuid, dev) };
-    if res != 0 {
-        return Err(res);
-    }
-    // Convert c_char bytes to u8 bytes
-    Ok(uuid.bytes.map(|b| b as u8))
 }
 
 /// Returns the nvidia-smi index for a CUDA device ordinal.

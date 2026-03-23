@@ -364,7 +364,6 @@ impl GpuBackend for CuptiBackend {
                     channel_id: u32,
                     channel_type: u32,
                     activity_device_id: u32,
-                    activity_device_uuid: [u8; 16],
                     activity_context_id: u32,
                     activity_stream_id: u32,
                     stage_iid: u64,
@@ -379,9 +378,6 @@ impl GpuBackend for CuptiBackend {
                     }
                     fn device_id(&self) -> u32 {
                         self.activity_device_id
-                    }
-                    fn device_uuid(&self) -> &[u8; 16] {
-                        &self.activity_device_uuid
                     }
                     fn context_id(&self) -> u32 {
                         self.activity_context_id
@@ -533,7 +529,6 @@ impl GpuBackend for CuptiBackend {
                         emit("process_id", &process_id.to_string());
                         emit("process_name", &process_name);
                         emit("device_id", &activity.device_id.to_string());
-                        emit("device_uuid", &activity.device_uuid_string());
                         emit("context_id", &activity.context_id.to_string());
                         emit("stream_id", &activity.stream_id.to_string());
                         emit("channel_id", &activity.channel_id.to_string());
@@ -618,7 +613,6 @@ impl GpuBackend for CuptiBackend {
                                 channel_id: activity.channel_id,
                                 channel_type: activity.channel_type,
                                 activity_device_id: activity.device_id,
-                                activity_device_uuid: activity.device_uuid,
                                 activity_context_id: activity.context_id,
                                 activity_stream_id: activity.stream_id,
                                 stage_iid: state::KERNEL_STAGE_IID,
@@ -642,7 +636,6 @@ impl GpuBackend for CuptiBackend {
                                 channel_id: activity.channel_id,
                                 channel_type: activity.channel_type,
                                 activity_device_id: activity.device_id,
-                                activity_device_uuid: activity.device_uuid,
                                 activity_context_id: activity.context_id,
                                 activity_stream_id: activity.stream_id,
                                 stage_iid: state::MEMCPY_STAGE_IID,
@@ -666,7 +659,6 @@ impl GpuBackend for CuptiBackend {
                                 channel_id: activity.channel_id,
                                 channel_type: activity.channel_type,
                                 activity_device_id: activity.device_id,
-                                activity_device_uuid: activity.device_uuid,
                                 activity_context_id: activity.context_id,
                                 activity_stream_id: activity.stream_id,
                                 stage_iid: state::MEMSET_STAGE_IID,
@@ -830,7 +822,6 @@ impl GpuBackend for CuptiBackend {
                         channel_id: u32,
                         channel_type: u32,
                         activity_device_id: u32,
-                        activity_device_uuid: [u8; 16],
                         activity_context_id: u32,
                         activity_stream_id: u32,
                         stage_iid: u64,
@@ -845,9 +836,6 @@ impl GpuBackend for CuptiBackend {
                         }
                         fn device_id(&self) -> u32 {
                             self.activity_device_id
-                        }
-                        fn device_uuid(&self) -> &[u8; 16] {
-                            &self.activity_device_uuid
                         }
                         fn context_id(&self) -> u32 {
                             self.activity_context_id
@@ -923,7 +911,6 @@ impl GpuBackend for CuptiBackend {
                                     channel_id: activity.channel_id,
                                     channel_type: activity.channel_type,
                                     activity_device_id: activity.device_id,
-                                    activity_device_uuid: activity.device_uuid,
                                     activity_context_id: activity.context_id,
                                     activity_stream_id: activity.stream_id,
                                     stage_iid: state::KERNEL_STAGE_IID,
@@ -954,7 +941,6 @@ impl GpuBackend for CuptiBackend {
                                     channel_id: activity.channel_id,
                                     channel_type: activity.channel_type,
                                     activity_device_id: activity.device_id,
-                                    activity_device_uuid: activity.device_uuid,
                                     activity_context_id: activity.context_id,
                                     activity_stream_id: activity.stream_id,
                                     stage_iid: state::MEMCPY_STAGE_IID,
@@ -985,7 +971,6 @@ impl GpuBackend for CuptiBackend {
                                     channel_id: activity.channel_id,
                                     channel_type: activity.channel_type,
                                     activity_device_id: activity.device_id,
-                                    activity_device_uuid: activity.device_uuid,
                                     activity_context_id: activity.context_id,
                                     activity_stream_id: activity.stream_id,
                                     stage_iid: state::MEMSET_STAGE_IID,

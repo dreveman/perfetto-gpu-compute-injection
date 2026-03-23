@@ -27,8 +27,6 @@ pub trait GpuActivity {
     fn end(&self) -> u64;
     /// CUDA device ID.
     fn device_id(&self) -> u32;
-    /// CUDA device UUID (16 bytes).
-    fn device_uuid(&self) -> &[u8; 16];
     /// CUDA context ID.
     fn context_id(&self) -> u32;
     /// CUDA stream ID.
@@ -51,19 +49,6 @@ pub trait GpuActivity {
     /// Falls back to the CUDA ordinal if NVML is unavailable.
     fn gpu_id(&self) -> u32 {
         cuda::get_nvidia_smi_index(self.device_id() as CUdevice)
-    }
-
-    /// Returns the device UUID as a hex string in standard UUID format.
-    fn device_uuid_string(&self) -> String {
-        let uuid = self.device_uuid();
-        format!(
-            "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-            uuid[0], uuid[1], uuid[2], uuid[3],
-            uuid[4], uuid[5],
-            uuid[6], uuid[7],
-            uuid[8], uuid[9],
-            uuid[10], uuid[11], uuid[12], uuid[13], uuid[14], uuid[15]
-        )
     }
 }
 
@@ -96,8 +81,6 @@ pub struct KernelActivity {
     pub end: u64,
     /// CUDA device ID.
     pub device_id: u32,
-    /// CUDA device UUID (16 bytes).
-    pub device_uuid: [u8; 16],
     /// CUDA context ID.
     pub context_id: u32,
     /// CUDA stream ID.
@@ -124,9 +107,6 @@ impl GpuActivity for KernelActivity {
     fn device_id(&self) -> u32 {
         self.device_id
     }
-    fn device_uuid(&self) -> &[u8; 16] {
-        &self.device_uuid
-    }
     fn context_id(&self) -> u32 {
         self.context_id
     }
@@ -152,7 +132,6 @@ impl GpuActivity for KernelActivity {
         emit("process_id", &process_id.to_string());
         emit("process_name", process_name);
         emit("device_id", &self.device_id.to_string());
-        emit("device_uuid", &self.device_uuid_string());
         emit("context_id", &self.context_id.to_string());
         emit("stream_id", &self.stream_id.to_string());
         emit("channel_id", &self.channel_id.to_string());
@@ -172,8 +151,6 @@ pub struct MemcpyActivity {
     pub end: u64,
     /// CUDA device ID.
     pub device_id: u32,
-    /// CUDA device UUID (16 bytes).
-    pub device_uuid: [u8; 16],
     /// CUDA context ID.
     pub context_id: u32,
     /// CUDA stream ID.
@@ -213,9 +190,6 @@ impl GpuActivity for MemcpyActivity {
     fn device_id(&self) -> u32 {
         self.device_id
     }
-    fn device_uuid(&self) -> &[u8; 16] {
-        &self.device_uuid
-    }
     fn context_id(&self) -> u32 {
         self.context_id
     }
@@ -242,7 +216,6 @@ impl GpuActivity for MemcpyActivity {
         emit("process_id", &process_id.to_string());
         emit("process_name", process_name);
         emit("device_id", &self.device_id.to_string());
-        emit("device_uuid", &self.device_uuid_string());
         emit("context_id", &self.context_id.to_string());
         emit("stream_id", &self.stream_id.to_string());
         emit("channel_id", &self.channel_id.to_string());
@@ -264,8 +237,6 @@ pub struct MemsetActivity {
     pub end: u64,
     /// CUDA device ID.
     pub device_id: u32,
-    /// CUDA device UUID (16 bytes).
-    pub device_uuid: [u8; 16],
     /// CUDA context ID.
     pub context_id: u32,
     /// CUDA stream ID.
@@ -303,9 +274,6 @@ impl GpuActivity for MemsetActivity {
     fn device_id(&self) -> u32 {
         self.device_id
     }
-    fn device_uuid(&self) -> &[u8; 16] {
-        &self.device_uuid
-    }
     fn context_id(&self) -> u32 {
         self.context_id
     }
@@ -333,7 +301,6 @@ impl GpuActivity for MemsetActivity {
         emit("process_id", &process_id.to_string());
         emit("process_name", process_name);
         emit("device_id", &self.device_id.to_string());
-        emit("device_uuid", &self.device_uuid_string());
         emit("context_id", &self.context_id.to_string());
         emit("stream_id", &self.stream_id.to_string());
         emit("channel_id", &self.channel_id.to_string());

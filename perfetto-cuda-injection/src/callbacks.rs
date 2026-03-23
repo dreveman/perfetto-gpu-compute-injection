@@ -70,6 +70,7 @@ pub unsafe extern "C" fn buffer_completed(
     let _ = panic::catch_unwind(|| {
         if let Ok(mut state) = GLOBAL_STATE.lock() {
             let mut record: *mut CUpti_Activity = ptr::null_mut();
+            let mut api_events_emitted: u64 = 0;
             while unsafe { profiler::activity_get_next_record(buffer, valid_size, &mut record) }
                 .is_ok()
             {
@@ -79,8 +80,6 @@ pub unsafe extern "C" fn buffer_completed(
                     if let Some(data) = state.context_data.get_mut(&k.contextId) {
                         let kernel_name = CStr::from_ptr(k.name).to_string_lossy().to_string();
                         injection_log!("kernel activity: {}", kernel_name);
-                        let device_uuid =
-                            profiler::get_device_uuid(k.deviceId as i32).unwrap_or([0u8; 16]);
                         data.kernel_activities.push(KernelActivity {
                             kernel_name,
                             grid_size: (k.gridX, k.gridY, k.gridZ),
@@ -91,7 +90,6 @@ pub unsafe extern "C" fn buffer_completed(
                             start: k.start,
                             end: k.end,
                             device_id: k.deviceId,
-                            device_uuid,
                             context_id: k.contextId,
                             stream_id: k.streamId,
                             channel_id: k.channelID,
@@ -102,15 +100,12 @@ pub unsafe extern "C" fn buffer_completed(
                     let m = &*(record as *const CUpti_ActivityMemcpy6);
                     if let Some(data) = state.context_data.get_mut(&m.contextId) {
                         injection_log!("memcpy activity: {} bytes", m.bytes);
-                        let device_uuid =
-                            profiler::get_device_uuid(m.deviceId as i32).unwrap_or([0u8; 16]);
                         data.memcpy_activities.push(MemcpyActivity {
                             copy_kind: m.copyKind,
                             bytes: m.bytes,
                             start: m.start,
                             end: m.end,
                             device_id: m.deviceId,
-                            device_uuid,
                             context_id: m.contextId,
                             stream_id: m.streamId,
                             channel_id: m.channelID,
@@ -121,8 +116,6 @@ pub unsafe extern "C" fn buffer_completed(
                     let m = &*(record as *const CUpti_ActivityMemset4);
                     if let Some(data) = state.context_data.get_mut(&m.contextId) {
                         injection_log!("memset activity: {} bytes", m.bytes);
-                        let device_uuid =
-                            profiler::get_device_uuid(m.deviceId as i32).unwrap_or([0u8; 16]);
                         data.memset_activities.push(MemsetActivity {
                             value: m.value,
                             bytes: m.bytes,
@@ -130,7 +123,6 @@ pub unsafe extern "C" fn buffer_completed(
                             start: m.start,
                             end: m.end,
                             device_id: m.deviceId,
-                            device_uuid,
                             context_id: m.contextId,
                             stream_id: m.streamId,
                             channel_id: m.channelID,
@@ -216,8 +208,12 @@ pub unsafe extern "C" fn buffer_completed(
                         ctx.set_timestamp(TrackEventTimestamp::Boot(Duration::from_nanos(a.end)));
                         ctx.set_proto_track(&thread_track);
                         perfetto_te_ns::emit(category_index, TrackEventType::SliceEnd, &mut ctx);
+                        api_events_emitted += 1;
                     }
                 }
+            }
+            if api_events_emitted > 0 {
+                injection_log!("flushed {} API track events", api_events_emitted);
             }
         }
         libc::free(buffer as *mut c_void);
@@ -368,6 +364,10 @@ pub unsafe extern "C" fn profiler_callback_handler(
                         }
                     }
                     let device_id = unsafe { profiler::get_device(ctx) }.unwrap_or(0);
+                    // Eagerly cache the nvidia-smi index for this device so
+                    // later lookups (during flush) don't make cu* FFI calls
+                    // that would generate spurious DRIVER activity records.
+                    let _ = profiler::get_nvidia_smi_index(device_id);
                     let num_sms = profiler::get_device_attribute(
                         device_id,
                         CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,

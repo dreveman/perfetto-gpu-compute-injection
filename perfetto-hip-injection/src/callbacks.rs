@@ -14,13 +14,18 @@
 
 //! rocprofiler-sdk callback handlers for AMD GPU tracing.
 
+use crate::perfetto_te_ns;
 use crate::rocprofiler_sys::*;
 use crate::state::{
-    AgentInfo, ApiActivity, CounterResult, KernelDispatch, MemcopyActivity, MemsetActivity,
-    GLOBAL_STATE,
+    AgentInfo, CounterResult, KernelDispatch, MemcopyActivity, MemsetActivity, GLOBAL_STATE,
+};
+use perfetto_sdk::track_event::{
+    EventContext, TrackEventTimestamp, TrackEventTrack, TrackEventType,
 };
 use std::ffi::CStr;
+use std::ffi::CString;
 use std::panic;
+use std::time::Duration;
 
 /// Buffer callback: called by rocprofiler's internal thread when the buffer is
 /// flushed (at watermark or explicitly). Processes kernel dispatch and memory
@@ -176,14 +181,66 @@ pub unsafe extern "C" fn buffer_callback(
                     tid,
                 );
 
-                state.hip_api_activities.push(ApiActivity {
-                    kind: rec.kind,
-                    operation: rec.operation,
-                    start: rec.start_timestamp,
-                    end: rec.end_timestamp,
-                    thread_id: tid,
-                    correlation_id: rec.correlation_id.internal,
-                });
+                let category_index = perfetto_te_ns::category_index("hip");
+                if perfetto_te_ns::is_category_enabled(category_index) {
+                    // Resolve operation name via rocprofiler.
+                    let op_name = {
+                        let mut name_ptr: *const std::os::raw::c_char = std::ptr::null();
+                        let mut name_len: usize = 0;
+                        let status = rocprofiler_query_buffer_tracing_kind_operation_name(
+                            rec.kind,
+                            rec.operation,
+                            &mut name_ptr,
+                            &mut name_len,
+                        );
+                        if status == ROCPROFILER_STATUS_SUCCESS && !name_ptr.is_null() {
+                            CStr::from_ptr(name_ptr).to_string_lossy().into_owned()
+                        } else {
+                            format!("hip_op_{}", rec.operation)
+                        }
+                    };
+
+                    let c_name = CString::new(op_name.as_str())
+                        .unwrap_or_else(|_| CString::new("unknown").unwrap());
+                    let name_ptr = c_name.as_ptr();
+
+                    let process_uuid = TrackEventTrack::process_track_uuid();
+                    let process_id = libc::getpid() as u64;
+                    let thread_name = state.thread_names.get(&tid);
+                    perfetto_gpu_compute_injection::build_thread_track!(
+                        process_uuid: process_uuid,
+                        process_id: process_id,
+                        thread_id: tid,
+                        thread_name: thread_name.map(|s| s.as_str()),
+                        => _thread_fields_named, _thread_fields_unnamed, _track_fields, thread_track
+                    );
+
+                    // SliceBegin
+                    let mut ctx = EventContext::default();
+                    ctx.set_timestamp(TrackEventTimestamp::Boot(Duration::from_nanos(
+                        rec.start_timestamp,
+                    )));
+                    ctx.set_proto_track(&thread_track);
+                    ctx.add_debug_arg(
+                        "correlation_id",
+                        perfetto_sdk::track_event::TrackEventDebugArg::Uint64(
+                            rec.correlation_id.internal,
+                        ),
+                    );
+                    perfetto_te_ns::emit(
+                        category_index,
+                        TrackEventType::SliceBegin(name_ptr),
+                        &mut ctx,
+                    );
+
+                    // SliceEnd
+                    let mut ctx = EventContext::default();
+                    ctx.set_timestamp(TrackEventTimestamp::Boot(Duration::from_nanos(
+                        rec.end_timestamp,
+                    )));
+                    ctx.set_proto_track(&thread_track);
+                    perfetto_te_ns::emit(category_index, TrackEventType::SliceEnd, &mut ctx);
+                }
             }
         }
     });

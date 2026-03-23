@@ -31,7 +31,7 @@ use perfetto_sdk::{
             trace_packet::{TracePacket, TracePacketSequenceFlags},
         },
     },
-    track_event::{EventContext, TrackEvent, TrackEventTimestamp, TrackEventTrack, TrackEventType},
+    track_event::TrackEvent,
     track_event_categories,
 };
 use perfetto_sdk_protos_gpu::protos::{
@@ -55,7 +55,7 @@ use perfetto_sdk_protos_gpu::protos::{
 };
 use rocprofiler_sys::*;
 use state::{ConsumerStartOffsets, CounterConsumerStartOffsets, GLOBAL_STATE};
-use std::{ffi::CString, panic, sync::atomic::Ordering, time::Duration};
+use std::{panic, sync::atomic::Ordering};
 
 // ---------------------------------------------------------------------------
 // Track event categories for HIP API call tracing
@@ -1122,93 +1122,6 @@ impl GpuBackend for RocprofilerBackend {
 // HIP API call track event emission
 // ---------------------------------------------------------------------------
 
-fn emit_hip_api_activities() {
-    let (activities, thread_names) = {
-        let mut state = match GLOBAL_STATE.lock() {
-            Ok(s) => s,
-            Err(_) => return,
-        };
-        let acts = std::mem::take(&mut state.hip_api_activities);
-        let names = state.thread_names.clone();
-        (acts, names)
-    };
-
-    let category_index = perfetto_te_ns::category_index("hip");
-    if activities.is_empty() || !perfetto_te_ns::is_category_enabled(category_index) {
-        return;
-    }
-
-    let process_uuid = TrackEventTrack::process_track_uuid();
-    let process_id = unsafe { libc::getpid() } as u64;
-
-    // Sort by (thread_id, start) for proper nesting per thread.
-    let mut sorted: Vec<&state::ApiActivity> = activities.iter().collect();
-    sorted.sort_by_key(|a| (a.thread_id, a.start));
-
-    for activity in &sorted {
-        // Resolve operation name via rocprofiler.
-        let op_name = {
-            let mut name_ptr: *const std::os::raw::c_char = std::ptr::null();
-            let mut name_len: usize = 0;
-            let status = unsafe {
-                rocprofiler_query_buffer_tracing_kind_operation_name(
-                    activity.kind,
-                    activity.operation,
-                    &mut name_ptr,
-                    &mut name_len,
-                )
-            };
-            if status == ROCPROFILER_STATUS_SUCCESS && !name_ptr.is_null() {
-                unsafe { std::ffi::CStr::from_ptr(name_ptr) }
-                    .to_string_lossy()
-                    .into_owned()
-            } else {
-                format!("hip_op_{}", activity.operation)
-            }
-        };
-
-        let c_name =
-            CString::new(op_name.as_str()).unwrap_or_else(|_| CString::new("unknown").unwrap());
-        let name_ptr = c_name.as_ptr();
-
-        // Build thread descriptor with optional thread_name (field 5).
-        let thread_name = thread_names.get(&activity.thread_id);
-        perfetto_gpu_compute_injection::build_thread_track!(
-            process_uuid: process_uuid,
-            process_id: process_id,
-            thread_id: activity.thread_id,
-            thread_name: thread_name.map(|s| s.as_str()),
-            => _thread_fields_named, _thread_fields_unnamed, _track_fields, thread_track
-        );
-
-        // SliceBegin
-        let mut ctx = EventContext::default();
-        ctx.set_timestamp(TrackEventTimestamp::Boot(Duration::from_nanos(
-            activity.start,
-        )));
-        ctx.set_proto_track(&thread_track);
-        ctx.add_debug_arg(
-            "correlation_id",
-            perfetto_sdk::track_event::TrackEventDebugArg::Uint64(activity.correlation_id),
-        );
-        perfetto_te_ns::emit(
-            category_index,
-            TrackEventType::SliceBegin(name_ptr),
-            &mut ctx,
-        );
-
-        // SliceEnd
-        let mut ctx = EventContext::default();
-        ctx.set_timestamp(TrackEventTimestamp::Boot(Duration::from_nanos(
-            activity.end,
-        )));
-        ctx.set_proto_track(&thread_track);
-        perfetto_te_ns::emit(category_index, TrackEventType::SliceEnd, &mut ctx);
-    }
-
-    injection_log!("emitted {} HIP API call track events", activities.len());
-}
-
 // ---------------------------------------------------------------------------
 // Atexit fallback
 // ---------------------------------------------------------------------------
@@ -1232,7 +1145,6 @@ extern "C" fn end_execution() {
         for inst_id in counter_ids {
             amd.emit_counter_events_for_instance(inst_id, None);
         }
-        emit_hip_api_activities();
     });
 }
 

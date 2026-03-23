@@ -180,3 +180,80 @@ impl Default for GlobalState {
 
 pub static GLOBAL_STATE: Lazy<Mutex<GlobalState>> =
     Lazy::new(|| Mutex::new(GlobalState::default()));
+
+impl GlobalState {
+    /// Advance all renderstages consumer offsets to current vector lengths,
+    /// then drain the prefix that all consumers have consumed.
+    pub fn advance_and_drain_renderstage_events(&mut self) {
+        // Advance all consumer offsets to current lengths.
+        for offsets in self.renderstages_consumers.values_mut() {
+            offsets.kernel_dispatches = self.kernel_dispatches.len();
+            offsets.memcopies = self.memcopies.len();
+            offsets.memsets = self.memsets.len();
+        }
+
+        // Find minimum offset across all consumers.
+        let min_kd = self
+            .renderstages_consumers
+            .values()
+            .map(|o| o.kernel_dispatches)
+            .min()
+            .unwrap_or(0);
+        let min_mc = self
+            .renderstages_consumers
+            .values()
+            .map(|o| o.memcopies)
+            .min()
+            .unwrap_or(0);
+        let min_ms = self
+            .renderstages_consumers
+            .values()
+            .map(|o| o.memsets)
+            .min()
+            .unwrap_or(0);
+
+        // Drain and adjust offsets.
+        if min_kd > 0 {
+            self.kernel_dispatches.drain(..min_kd);
+            for offsets in self.renderstages_consumers.values_mut() {
+                offsets.kernel_dispatches -= min_kd;
+            }
+        }
+        if min_mc > 0 {
+            self.memcopies.drain(..min_mc);
+            for offsets in self.renderstages_consumers.values_mut() {
+                offsets.memcopies -= min_mc;
+            }
+        }
+        if min_ms > 0 {
+            self.memsets.drain(..min_ms);
+            for offsets in self.renderstages_consumers.values_mut() {
+                offsets.memsets -= min_ms;
+            }
+        }
+    }
+
+    /// Advance all counters consumer offsets to current vector lengths,
+    /// then drain the prefix that all consumers have consumed.
+    pub fn advance_and_drain_counter_events(&mut self) {
+        // Advance all consumer offsets to current lengths.
+        for offsets in self.counters_consumers.values_mut() {
+            offsets.counter_results = self.counter_results.len();
+        }
+
+        // Find minimum offset across all consumers.
+        let min_cr = self
+            .counters_consumers
+            .values()
+            .map(|o| o.counter_results)
+            .min()
+            .unwrap_or(0);
+
+        if min_cr > 0 {
+            self.counter_results.drain(..min_cr);
+            for offsets in self.counters_consumers.values_mut() {
+                offsets.counter_results -= min_cr;
+            }
+        }
+    }
+}

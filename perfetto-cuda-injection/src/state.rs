@@ -463,6 +463,195 @@ pub struct GlobalState {
 
 unsafe impl Send for GlobalState {}
 
+impl GlobalState {
+    /// Advance all renderstages consumer offsets to the current vector lengths,
+    /// then drain the prefix of each vector that all consumers have consumed.
+    pub fn advance_and_drain_renderstage_events(&mut self) {
+        // Advance all consumer offsets to current lengths.
+        for offsets in self.renderstages_consumers.values_mut() {
+            for (&ctx_id, data) in self.context_data.iter() {
+                offsets
+                    .kernel_launches
+                    .entry(ctx_id)
+                    .and_modify(|o| *o = data.kernel_launches.len())
+                    .or_insert(data.kernel_launches.len());
+                offsets
+                    .kernel_activities
+                    .entry(ctx_id)
+                    .and_modify(|o| *o = data.kernel_activities.len())
+                    .or_insert(data.kernel_activities.len());
+                offsets
+                    .memcpy_activities
+                    .entry(ctx_id)
+                    .and_modify(|o| *o = data.memcpy_activities.len())
+                    .or_insert(data.memcpy_activities.len());
+                offsets
+                    .memset_activities
+                    .entry(ctx_id)
+                    .and_modify(|o| *o = data.memset_activities.len())
+                    .or_insert(data.memset_activities.len());
+            }
+        }
+
+        // Drain consumed prefix for each context vector.
+        for (&ctx_id, data) in self.context_data.iter_mut() {
+            // kernel_launches and kernel_activities are shared with counter consumers,
+            // so take the minimum across BOTH consumer types to avoid draining entries
+            // that counter consumers haven't yet processed.
+            let min_kl = self
+                .renderstages_consumers
+                .values()
+                .chain(self.counters_consumers.values())
+                .map(|o| o.kernel_launches.get(&ctx_id).copied().unwrap_or(0))
+                .min()
+                .unwrap_or(0);
+            let min_ka = self
+                .renderstages_consumers
+                .values()
+                .chain(self.counters_consumers.values())
+                .map(|o| o.kernel_activities.get(&ctx_id).copied().unwrap_or(0))
+                .min()
+                .unwrap_or(0);
+            let min_mc = self
+                .renderstages_consumers
+                .values()
+                .map(|o| o.memcpy_activities.get(&ctx_id).copied().unwrap_or(0))
+                .min()
+                .unwrap_or(0);
+            let min_ms = self
+                .renderstages_consumers
+                .values()
+                .map(|o| o.memset_activities.get(&ctx_id).copied().unwrap_or(0))
+                .min()
+                .unwrap_or(0);
+
+            if min_kl > 0 {
+                data.kernel_launches.drain(..min_kl);
+                for offsets in self.renderstages_consumers.values_mut() {
+                    if let Some(o) = offsets.kernel_launches.get_mut(&ctx_id) {
+                        *o -= min_kl;
+                    }
+                }
+                // Also adjust counters consumer offsets for kernel_launches.
+                for offsets in self.counters_consumers.values_mut() {
+                    if let Some(o) = offsets.kernel_launches.get_mut(&ctx_id) {
+                        *o = o.saturating_sub(min_kl);
+                    }
+                }
+            }
+            if min_ka > 0 {
+                data.kernel_activities.drain(..min_ka);
+                for offsets in self.renderstages_consumers.values_mut() {
+                    if let Some(o) = offsets.kernel_activities.get_mut(&ctx_id) {
+                        *o -= min_ka;
+                    }
+                }
+                // Also adjust counters consumer offsets for kernel_activities.
+                for offsets in self.counters_consumers.values_mut() {
+                    if let Some(o) = offsets.kernel_activities.get_mut(&ctx_id) {
+                        *o = o.saturating_sub(min_ka);
+                    }
+                }
+            }
+            if min_mc > 0 {
+                data.memcpy_activities.drain(..min_mc);
+                for offsets in self.renderstages_consumers.values_mut() {
+                    if let Some(o) = offsets.memcpy_activities.get_mut(&ctx_id) {
+                        *o -= min_mc;
+                    }
+                }
+            }
+            if min_ms > 0 {
+                data.memset_activities.drain(..min_ms);
+                for offsets in self.renderstages_consumers.values_mut() {
+                    if let Some(o) = offsets.memset_activities.get_mut(&ctx_id) {
+                        *o -= min_ms;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Advance all counters consumer offsets to the current vector lengths,
+    /// then drain the prefix of each vector that all consumers have consumed.
+    pub fn advance_and_drain_counter_events(&mut self) {
+        // Advance all consumer offsets to current lengths.
+        for offsets in self.counters_consumers.values_mut() {
+            for (&ctx_id, data) in self.context_data.iter() {
+                offsets
+                    .range_info
+                    .entry(ctx_id)
+                    .and_modify(|o| *o = data.range_info.len())
+                    .or_insert(data.range_info.len());
+                offsets
+                    .kernel_launches
+                    .entry(ctx_id)
+                    .and_modify(|o| *o = data.kernel_launches.len())
+                    .or_insert(data.kernel_launches.len());
+                offsets
+                    .kernel_activities
+                    .entry(ctx_id)
+                    .and_modify(|o| *o = data.kernel_activities.len())
+                    .or_insert(data.kernel_activities.len());
+            }
+        }
+
+        // Drain consumed prefix for each context vector.
+        for (&ctx_id, data) in self.context_data.iter_mut() {
+            let min_ri = self
+                .counters_consumers
+                .values()
+                .map(|o| o.range_info.get(&ctx_id).copied().unwrap_or(0))
+                .min()
+                .unwrap_or(0);
+
+            if min_ri > 0 {
+                data.range_info.drain(..min_ri);
+                for offsets in self.counters_consumers.values_mut() {
+                    if let Some(o) = offsets.range_info.get_mut(&ctx_id) {
+                        *o -= min_ri;
+                    }
+                }
+            }
+
+            // kernel_launches and kernel_activities are shared with renderstages,
+            // so only drain if no renderstages consumers exist (otherwise
+            // advance_and_drain_renderstage_events handles them).
+            if self.renderstages_consumers.is_empty() {
+                let min_kl = self
+                    .counters_consumers
+                    .values()
+                    .map(|o| o.kernel_launches.get(&ctx_id).copied().unwrap_or(0))
+                    .min()
+                    .unwrap_or(0);
+                let min_ka = self
+                    .counters_consumers
+                    .values()
+                    .map(|o| o.kernel_activities.get(&ctx_id).copied().unwrap_or(0))
+                    .min()
+                    .unwrap_or(0);
+
+                if min_kl > 0 {
+                    data.kernel_launches.drain(..min_kl);
+                    for offsets in self.counters_consumers.values_mut() {
+                        if let Some(o) = offsets.kernel_launches.get_mut(&ctx_id) {
+                            *o -= min_kl;
+                        }
+                    }
+                }
+                if min_ka > 0 {
+                    data.kernel_activities.drain(..min_ka);
+                    for offsets in self.counters_consumers.values_mut() {
+                        if let Some(o) = offsets.kernel_activities.get_mut(&ctx_id) {
+                            *o -= min_ka;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// The singleton global state instance.
 ///
 /// Protected by a Mutex to ensure thread-safe access from callback handlers.

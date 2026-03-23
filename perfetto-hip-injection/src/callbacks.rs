@@ -19,6 +19,7 @@ use crate::rocprofiler_sys::*;
 use crate::state::{
     AgentInfo, CounterResult, KernelDispatch, MemcopyActivity, MemsetActivity, GLOBAL_STATE,
 };
+use perfetto_gpu_compute_injection::injection_log;
 use perfetto_sdk::track_event::{
     EventContext, TrackEventTimestamp, TrackEventTrack, TrackEventType,
 };
@@ -54,6 +55,8 @@ pub unsafe extern "C" fn buffer_callback(
             Ok(s) => s,
             Err(_) => return,
         };
+
+        let mut api_events_emitted: u64 = 0;
 
         for &header_ptr in header_slice {
             if header_ptr.is_null() {
@@ -240,8 +243,12 @@ pub unsafe extern "C" fn buffer_callback(
                     )));
                     ctx.set_proto_track(&thread_track);
                     perfetto_te_ns::emit(category_index, TrackEventType::SliceEnd, &mut ctx);
+                    api_events_emitted += 1;
                 }
             }
+        }
+        if api_events_emitted > 0 {
+            injection_log!("flushed {} API track events", api_events_emitted);
         }
     });
 }

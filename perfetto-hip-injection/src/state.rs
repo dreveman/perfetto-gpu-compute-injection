@@ -85,17 +85,6 @@ pub struct MemsetActivity {
     pub device_index: i32,
 }
 
-/// A captured HIP runtime API call event from buffer tracing.
-#[derive(Debug, Clone)]
-pub struct ApiActivity {
-    pub kind: u32,
-    pub operation: i32,
-    pub start: u64,
-    pub end: u64,
-    pub thread_id: u64,
-    pub correlation_id: u64,
-}
-
 /// Snapshot of buffer lengths taken when a Perfetto consumer starts.
 /// Used to emit only events recorded after the consumer started.
 #[derive(Debug, Clone, Default)]
@@ -122,8 +111,6 @@ pub struct GlobalState {
     pub memcopies: Vec<MemcopyActivity>,
     /// Captured memory set events.
     pub memsets: Vec<MemsetActivity>,
-    /// Captured HIP runtime API call events.
-    pub hip_api_activities: Vec<ApiActivity>,
     /// Captured counter results from dispatch counting callbacks.
     pub counter_results: Vec<CounterResult>,
     /// kernel_id → kernel_name, populated by code object callbacks.
@@ -159,7 +146,6 @@ impl Default for GlobalState {
             kernel_dispatches: Vec::new(),
             memcopies: Vec::new(),
             memsets: Vec::new(),
-            hip_api_activities: Vec::new(),
             counter_results: Vec::new(),
             kernel_names: HashMap::new(),
             agents: HashMap::new(),

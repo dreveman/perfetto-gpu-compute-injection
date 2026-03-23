@@ -341,20 +341,6 @@ impl GpuActivity for MemsetActivity {
     }
 }
 
-/// Detailed activity information for a CUDA API call (runtime or driver).
-///
-/// Gathered from `CUpti_ActivityAPI` records.
-pub struct ApiActivity {
-    pub kind: CUpti_ActivityKind,
-    pub cbid: u32,
-    pub start: u64,
-    pub end: u64,
-    pub process_id: u32,
-    pub thread_id: u32,
-    pub correlation_id: u32,
-    pub return_value: u32,
-}
-
 /// Records the starting index in each per-context data vector at the moment a
 /// data-source consumer (instance) started.  Emission for that consumer spans
 /// from these offsets to the current end of each vector.
@@ -453,10 +439,6 @@ pub struct GlobalState {
     pub counters_consumers: HashMap<u32, ConsumerStartOffsets>,
     /// Start offsets per active renderstages consumer instance (keyed by inst_id 0-7).
     pub renderstages_consumers: HashMap<u32, ConsumerStartOffsets>,
-    /// Runtime API activities collected from CUPTI activity buffers.
-    pub runtime_api_activities: Vec<ApiActivity>,
-    /// Driver API activities collected from CUPTI activity buffers.
-    pub driver_api_activities: Vec<ApiActivity>,
     /// thread_id → thread name, captured from /proc when first seen.
     pub thread_names: HashMap<u32, String>,
 }
@@ -664,8 +646,6 @@ pub static GLOBAL_STATE: Lazy<Mutex<GlobalState>> = Lazy::new(|| {
         subscriber_handle: std::ptr::null_mut(),
         counters_consumers: HashMap::new(),
         renderstages_consumers: HashMap::new(),
-        runtime_api_activities: Vec::new(),
-        driver_api_activities: Vec::new(),
         thread_names: HashMap::new(),
     })
 });

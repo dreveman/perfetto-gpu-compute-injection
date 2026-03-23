@@ -13,13 +13,16 @@
 // limitations under the License.
 
 use crate::cupti_profiler::{self as profiler, *};
-use crate::state::{
-    ApiActivity, KernelActivity, KernelLaunch, MemcpyActivity, MemsetActivity, GLOBAL_STATE,
-};
+use crate::perfetto_te_ns;
+use crate::state::{KernelActivity, KernelLaunch, MemcpyActivity, MemsetActivity, GLOBAL_STATE};
 use libc::c_void;
 use perfetto_gpu_compute_injection::tracing::{is_counters_enabled, trace_time_ns};
 use perfetto_gpu_compute_injection::{injection_fatal, injection_log};
-use std::{ffi::CStr, panic, ptr};
+use perfetto_sdk::track_event::{
+    EventContext, TrackEventTimestamp, TrackEventTrack, TrackEventType,
+};
+use std::time::Duration;
+use std::{ffi::CStr, ffi::CString, panic, ptr};
 
 /// Buffer size for activity records (8 MB).
 const BUF_SIZE: usize = 8 * 1024 * 1024;
@@ -148,20 +151,71 @@ pub unsafe extern "C" fn buffer_completed(
                         );
                     }
 
-                    let activity = ApiActivity {
-                        kind: a.kind,
-                        cbid: a.cbid,
-                        start: a.start,
-                        end: a.end,
-                        process_id: a.processId,
-                        thread_id: a.threadId,
-                        correlation_id: a.correlationId,
-                        return_value: a.returnValue,
-                    };
-                    if r.kind == CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_RUNTIME {
-                        state.runtime_api_activities.push(activity);
-                    } else {
-                        state.driver_api_activities.push(activity);
+                    // Determine category based on activity kind.
+                    let (domain, category_index) =
+                        if r.kind == CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_RUNTIME {
+                            (
+                                CUpti_CallbackDomain_CUPTI_CB_DOMAIN_RUNTIME_API,
+                                perfetto_te_ns::category_index("cudart"),
+                            )
+                        } else {
+                            (
+                                CUpti_CallbackDomain_CUPTI_CB_DOMAIN_DRIVER_API,
+                                perfetto_te_ns::category_index("cuda"),
+                            )
+                        };
+
+                    if perfetto_te_ns::is_category_enabled(category_index) {
+                        let full_name = profiler::get_callback_name(domain, a.cbid);
+                        let (base_name, version) = match full_name.rfind("_v") {
+                            Some(pos)
+                                if full_name[pos + 2..].chars().all(|c| c.is_ascii_digit()) =>
+                            {
+                                (&full_name[..pos], Some(&full_name[pos + 2..]))
+                            }
+                            _ => (full_name.as_str(), None),
+                        };
+                        let c_name = CString::new(base_name)
+                            .unwrap_or_else(|_| CString::new("unknown").unwrap());
+                        let name_ptr = c_name.as_ptr();
+
+                        let process_uuid = TrackEventTrack::process_track_uuid();
+                        let tname = state.thread_names.get(&tid);
+                        perfetto_gpu_compute_injection::build_thread_track!(
+                            process_uuid: process_uuid,
+                            process_id: a.processId as u64,
+                            thread_id: tid as u64,
+                            thread_name: tname.map(|s| s.as_str()),
+                            => _thread_fields_named, _thread_fields_unnamed, _track_fields, thread_track
+                        );
+
+                        // SliceBegin
+                        let mut ctx = EventContext::default();
+                        ctx.set_timestamp(TrackEventTimestamp::Boot(Duration::from_nanos(a.start)));
+                        ctx.set_proto_track(&thread_track);
+                        ctx.add_debug_arg(
+                            "correlation_id",
+                            perfetto_sdk::track_event::TrackEventDebugArg::Uint64(
+                                a.correlationId as u64,
+                            ),
+                        );
+                        if let Some(ver) = version {
+                            ctx.add_debug_arg(
+                                "version",
+                                perfetto_sdk::track_event::TrackEventDebugArg::String(ver),
+                            );
+                        }
+                        perfetto_te_ns::emit(
+                            category_index,
+                            TrackEventType::SliceBegin(name_ptr),
+                            &mut ctx,
+                        );
+
+                        // SliceEnd
+                        let mut ctx = EventContext::default();
+                        ctx.set_timestamp(TrackEventTimestamp::Boot(Duration::from_nanos(a.end)));
+                        ctx.set_proto_track(&thread_track);
+                        perfetto_te_ns::emit(category_index, TrackEventType::SliceEnd, &mut ctx);
                     }
                 }
             }

@@ -36,7 +36,7 @@ use perfetto_sdk::{
             trace_packet::{TracePacket, TracePacketSequenceFlags},
         },
     },
-    track_event::{EventContext, TrackEvent, TrackEventTimestamp, TrackEventTrack, TrackEventType},
+    track_event::TrackEvent,
     track_event_categories, track_event_set_category_callback,
 };
 use perfetto_sdk_protos_gpu::protos::{
@@ -63,10 +63,8 @@ use state::{
     MEMCPY_STAGE_IID, MEMSET_STAGE_IID,
 };
 use std::{
-    ffi::CString,
     panic, ptr,
     sync::atomic::{AtomicU8, Ordering},
-    time::Duration,
 };
 
 use cupti_profiler as profiler;
@@ -1328,118 +1326,6 @@ fn emit_render_stage_event<T: GpuActivity>(
 // API call track event emission
 // ---------------------------------------------------------------------------
 
-fn emit_api_activities() {
-    let (runtime_activities, driver_activities, thread_names) = {
-        let mut state = match GLOBAL_STATE.lock() {
-            Ok(s) => s,
-            Err(_) => return,
-        };
-        let runtime = std::mem::take(&mut state.runtime_api_activities);
-        let driver = std::mem::take(&mut state.driver_api_activities);
-        let names = std::mem::take(&mut state.thread_names);
-        (runtime, driver, names)
-    };
-
-    // Emit runtime API activities under "cudart" category
-    emit_api_category_activities(
-        &runtime_activities,
-        CUpti_CallbackDomain_CUPTI_CB_DOMAIN_RUNTIME_API,
-        perfetto_te_ns::category_index("cudart"),
-        &thread_names,
-    );
-
-    // Emit driver API activities under "cuda" category
-    emit_api_category_activities(
-        &driver_activities,
-        CUpti_CallbackDomain_CUPTI_CB_DOMAIN_DRIVER_API,
-        perfetto_te_ns::category_index("cuda"),
-        &thread_names,
-    );
-
-    let total = runtime_activities.len() + driver_activities.len();
-    if total > 0 {
-        injection_log!(
-            "emitted {} API call track events ({} runtime, {} driver)",
-            total,
-            runtime_activities.len(),
-            driver_activities.len()
-        );
-    }
-}
-
-fn emit_api_category_activities(
-    activities: &[state::ApiActivity],
-    domain: CUpti_CallbackDomain,
-    category_index: usize,
-    thread_names: &std::collections::HashMap<u32, String>,
-) {
-    if activities.is_empty() || !perfetto_te_ns::is_category_enabled(category_index) {
-        return;
-    }
-
-    let process_uuid = TrackEventTrack::process_track_uuid();
-
-    // Sort by (thread_id, start) for proper nesting per thread
-    let mut sorted: Vec<&state::ApiActivity> = activities.iter().collect();
-    sorted.sort_by_key(|a| (a.thread_id, a.start));
-
-    for activity in &sorted {
-        let full_name = profiler::get_callback_name(domain, activity.cbid);
-        // Strip version suffix (e.g. "_v7000") from the name, add as debug annotation
-        let (base_name, version) = match full_name.rfind("_v") {
-            Some(pos) if full_name[pos + 2..].chars().all(|c| c.is_ascii_digit()) => {
-                (&full_name[..pos], Some(&full_name[pos + 2..]))
-            }
-            _ => (full_name.as_str(), None),
-        };
-        let c_name = CString::new(base_name).unwrap_or_else(|_| CString::new("unknown").unwrap());
-        let name_ptr = c_name.as_ptr();
-
-        // Target the correct thread track using Perfetto's UUID formula:
-        // process_track_uuid ^ gettid(). Include parent_uuid and thread
-        // descriptor so the descriptor is consistent with any SDK-emitted
-        // descriptor for the same thread.
-        let tname = thread_names.get(&activity.thread_id);
-        perfetto_gpu_compute_injection::build_thread_track!(
-            process_uuid: process_uuid,
-            process_id: activity.process_id as u64,
-            thread_id: activity.thread_id as u64,
-            thread_name: tname.map(|s| s.as_str()),
-            => _thread_fields_named, _thread_fields_unnamed, _track_fields, thread_track
-        );
-
-        // SliceBegin
-        let mut ctx = EventContext::default();
-        ctx.set_timestamp(TrackEventTimestamp::Boot(Duration::from_nanos(
-            activity.start,
-        )));
-        ctx.set_proto_track(&thread_track);
-        ctx.add_debug_arg(
-            "correlation_id",
-            perfetto_sdk::track_event::TrackEventDebugArg::Uint64(activity.correlation_id as u64),
-        );
-        if let Some(ver) = version {
-            ctx.add_debug_arg(
-                "version",
-                perfetto_sdk::track_event::TrackEventDebugArg::String(ver),
-            );
-        }
-        perfetto_te_ns::emit(
-            category_index,
-            TrackEventType::SliceBegin(name_ptr),
-            &mut ctx,
-        );
-
-        // SliceEnd
-        let mut ctx = EventContext::default();
-        ctx.set_timestamp(TrackEventTimestamp::Boot(Duration::from_nanos(
-            activity.end,
-        )));
-        ctx.set_proto_track(&thread_track);
-        perfetto_te_ns::emit(category_index, TrackEventType::SliceEnd, &mut ctx);
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Atexit fallback
 // ---------------------------------------------------------------------------
@@ -1462,7 +1348,6 @@ extern "C" fn end_execution() {
         for inst_id in renderstage_ids {
             nvidia.emit_renderstage_events_for_instance(inst_id, None);
         }
-        emit_api_activities();
     });
 }
 

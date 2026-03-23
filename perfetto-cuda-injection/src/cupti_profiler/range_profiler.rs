@@ -87,7 +87,12 @@ impl RangeProfiler {
         params.structSize =
             struct_size_up_to!(CUpti_RangeProfiler_Stop_Params, isAllPassSubmitted: u8);
         params.pRangeProfilerObject = self.range_profiler_object;
-        check_cupti!(unsafe { cuptiRangeProfilerStop(&mut params) });
+        let res = unsafe { cuptiRangeProfilerStop(&mut params) };
+        if res == CUptiResult_CUPTI_ERROR_INVALID_OPERATION {
+            // No profiling pass was active — expected during teardown.
+            return Err(res);
+        }
+        check_cupti!(res);
         self.pass_index = params.passIndex;
         self.target_nesting_level = params.targetNestingLevel;
         self.is_all_pass_submitted = params.isAllPassSubmitted != 0;

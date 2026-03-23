@@ -148,7 +148,7 @@ fn get_nvidia_smi_index_uncached(dev: CUdevice) -> u32 {
     );
 
     // Step 1: Get PCI bus ID from CUDA driver
-    let mut pci_bus_id = [0i8; 64];
+    let mut pci_bus_id = [0 as std::ffi::c_char; 64];
     let res = unsafe { cuDeviceGetPCIBusId(pci_bus_id.as_mut_ptr(), 64, dev) };
     if res != 0 {
         injection_log!(

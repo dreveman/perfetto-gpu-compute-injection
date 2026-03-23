@@ -29,11 +29,13 @@ pub fn demangle_name(mangled: &str) -> String {
 
 /// Simplify a demangled kernel name by stripping the return type,
 /// arguments, and template parameters, leaving just the qualified
-/// function name.
+/// function name. Leading namespaces are progressively dropped until
+/// the namespace prefix (including the trailing `::`) is 8 characters
+/// or fewer.
 ///
 /// Examples:
 ///   "void foo::bar<int>(float*, int)" -> "foo::bar"
-///   "at::native::vectorized_elementwise_kernel<4, ...>(...)" -> "at::native::vectorized_elementwise_kernel"
+///   "at::native::vectorized_elementwise_kernel<4, ...>(...)" -> "vectorized_elementwise_kernel"
 ///   "simple_kernel" -> "simple_kernel"
 pub fn simplify_name(demangled: &str) -> &str {
     let s = demangled.trim();
@@ -57,8 +59,28 @@ pub fn simplify_name(demangled: &str) -> &str {
     // where the function name ends.
     let rest = &s[last_space..];
     let name_len = rest.find(['<', '(']).unwrap_or(rest.len());
+    let qualified = &s[last_space..last_space + name_len];
 
-    &s[last_space..last_space + name_len]
+    // Pass 3: drop leading namespace components until the namespace
+    // prefix (including the final "::") is 8 characters or fewer.
+    let mut result = qualified;
+    while let Some(pos) = result.find("::") {
+        // Check total namespace prefix length including the trailing "::".
+        if let Some(last_sep) = result.rfind("::") {
+            // last_sep + 2 = length of prefix through the final "::"
+            if last_sep + 2 <= 8 {
+                break;
+            }
+        }
+        // Drop this namespace component (prefix + "::")
+        if pos + 2 <= result.len() {
+            result = &result[pos + 2..];
+        } else {
+            break;
+        }
+    }
+
+    result
 }
 
 #[cfg(test)]
@@ -85,9 +107,10 @@ mod tests {
 
     #[test]
     fn nested_templates() {
+        // prefix "at::native::" is 12 > 8, drop "at::" -> "native::" is 8 <= 8, keep
         assert_eq!(
             simplify_name("void at::native::vectorized_elementwise_kernel<4, at::detail::Array<char, 2>>(int, at::detail::Array<char, 2>)"),
-            "at::native::vectorized_elementwise_kernel"
+            "native::vectorized_elementwise_kernel"
         );
     }
 
@@ -116,7 +139,32 @@ mod tests {
 
     #[test]
     fn namespaced_no_args() {
-        assert_eq!(simplify_name("foo::bar::baz"), "foo::bar::baz");
+        // prefix through final "::" is "foo::bar::" (10 > 8), drop "foo::" -> "bar::baz"
+        assert_eq!(simplify_name("foo::bar::baz"), "bar::baz");
+    }
+
+    #[test]
+    fn long_namespace_dropped() {
+        // prefix "very_long_ns::" (14 > 8), drop -> "kernel"
+        assert_eq!(simplify_name("very_long_ns::kernel"), "kernel");
+    }
+
+    #[test]
+    fn multiple_namespaces_partially_dropped() {
+        // prefix "a::b::c::" (9 > 8), drop "a::" -> "b::c::" (6 <= 8), keep
+        assert_eq!(simplify_name("a::b::c::kernel"), "b::c::kernel");
+    }
+
+    #[test]
+    fn drop_until_short_enough() {
+        // prefix "long_ns::mid::" (14 > 8), drop "long_ns::" -> "mid::" (5 <= 8), keep
+        assert_eq!(simplify_name("long_ns::mid::kernel"), "mid::kernel");
+    }
+
+    #[test]
+    fn short_namespace_kept() {
+        // prefix "foo::" (5 <= 8), kept
+        assert_eq!(simplify_name("foo::bar"), "foo::bar");
     }
 
     #[test]

@@ -75,6 +75,12 @@ pub trait GpuBackend: Send + Sync {
 
     /// Finalize the range profiler without disabling activities.
     fn finalize_range_profiler(&self) {}
+
+    /// Flush and emit renderstage events for all active instances (called on periodic flush).
+    fn flush_renderstage_events(&self) {}
+
+    /// Flush and emit counter events for all active instances (called on periodic flush).
+    fn flush_counter_events(&self) {}
 }
 
 static BACKEND: OnceLock<Box<dyn GpuBackend + Send + Sync>> = OnceLock::new();
@@ -230,6 +236,19 @@ pub fn get_counters_data_source() -> &'static DataSource<'static> {
                     // else: other counters consumers still running; no finalization needed.
                     backend().emit_counter_events_for_instance(inst_id, Some(stop_guard));
                 });
+            })
+            .on_flush(move |inst_id, args| {
+                injection_log!(
+                    "counters data source flush requested (instance {})",
+                    inst_id
+                );
+                let flush_guard = args.postpone();
+                std::thread::spawn(move || {
+                    backend().flush_activity_buffers();
+                    backend().flush_counter_events();
+                    injection_log!("counters data source flush complete (instance {})", inst_id);
+                    drop(flush_guard);
+                });
             });
         let mut data_source = DataSource::new();
         let ds_name = get_counters_data_source_name();
@@ -288,6 +307,22 @@ pub fn get_renderstages_data_source() -> &'static DataSource<'static> {
                         backend().flush_activity_buffers();
                     }
                     backend().emit_renderstage_events_for_instance(inst_id, Some(stop_guard));
+                });
+            })
+            .on_flush(move |inst_id, args| {
+                injection_log!(
+                    "renderstages data source flush requested (instance {})",
+                    inst_id
+                );
+                let flush_guard = args.postpone();
+                std::thread::spawn(move || {
+                    backend().flush_activity_buffers();
+                    backend().flush_renderstage_events();
+                    injection_log!(
+                        "renderstages data source flush complete (instance {})",
+                        inst_id
+                    );
+                    drop(flush_guard);
                 });
             });
         let mut data_source = DataSource::new();

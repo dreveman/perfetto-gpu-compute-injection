@@ -226,6 +226,10 @@ impl GpuBackend for CuptiBackend {
                         .zip(data.kernel_launches[launch_start..].iter())
                         .zip(data.kernel_activities[activity_start..].iter())
                     {
+                        // Skip incomplete launches (end timestamp not yet set).
+                        if launch.end == 0 {
+                            continue;
+                        }
                         let gpu_id = activity.gpu_id() as i32;
                         let got_first_counters =
                             GOT_FIRST_COUNTERS.fetch_or(1 << inst_id, Ordering::SeqCst);
@@ -688,9 +692,16 @@ impl GpuBackend for CuptiBackend {
                     }
                 }
 
-                // Emit all events with adjusted timestamps.
-                for events in channel_events.values() {
-                    for event in events {
+                // Merge all channel events into a single list sorted by
+                // timestamp so the sequence is monotonically ordered.
+                let mut all_events: Vec<PendingEvent> = channel_events
+                    .into_values()
+                    .flat_map(|v| v.into_iter())
+                    .collect();
+                all_events.sort_by_key(|e| e.start);
+
+                // Emit all events in global timestamp order.
+                for event in &all_events {
                         let timestamp = event.start;
                         let duration_ns = event.end.saturating_sub(event.start);
                         let got_first_renderstages =
@@ -716,7 +727,6 @@ impl GpuBackend for CuptiBackend {
                                 &event.extra_data,
                             );
                         });
-                    }
                 }
                 let mut sg = Some(stop_guard_opt.take());
                 ctx.flush(move || drop(sg.take()));
@@ -751,6 +761,460 @@ impl GpuBackend for CuptiBackend {
                 emitted,
                 inst_id
             );
+        });
+    }
+
+    fn flush_renderstage_events(&self) {
+        let _ = panic::catch_unwind(|| {
+            let (process_id, process_name) =
+                perfetto_gpu_compute_injection::config::get_process_info();
+
+            let mut state = match GLOBAL_STATE.lock() {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+
+            if state.renderstages_consumers.is_empty() {
+                return;
+            }
+
+            let inst_ids: Vec<u32> = state.renderstages_consumers.keys().copied().collect();
+
+            for inst_id in &inst_ids {
+                let start_offsets = match state.renderstages_consumers.get(inst_id) {
+                    Some(o) => o,
+                    None => continue,
+                };
+
+                get_renderstages_data_source().trace(|ctx: &mut TraceContext| {
+                    if ctx.instance_index() != *inst_id {
+                        return;
+                    }
+                    let mut channels: std::collections::HashSet<(u32, u32)> =
+                        std::collections::HashSet::new();
+                    let mut contexts: std::collections::HashSet<u32> =
+                        std::collections::HashSet::new();
+                    for (ctx_id, data) in state.context_data.iter() {
+                        let ka_start = start_offsets
+                            .kernel_activities
+                            .get(ctx_id)
+                            .copied()
+                            .unwrap_or(0);
+                        let mc_start = start_offsets
+                            .memcpy_activities
+                            .get(ctx_id)
+                            .copied()
+                            .unwrap_or(0);
+                        let ms_start = start_offsets
+                            .memset_activities
+                            .get(ctx_id)
+                            .copied()
+                            .unwrap_or(0);
+                        for activity in data.kernel_activities[ka_start..].iter() {
+                            channels.insert((activity.channel_id, activity.channel_type));
+                            contexts.insert(activity.context_id);
+                        }
+                        for activity in data.memcpy_activities[mc_start..].iter() {
+                            channels.insert((activity.channel_id, activity.channel_type));
+                            contexts.insert(activity.context_id);
+                        }
+                        for activity in data.memset_activities[ms_start..].iter() {
+                            channels.insert((activity.channel_id, activity.channel_type));
+                            contexts.insert(activity.context_id);
+                        }
+                    }
+
+                    struct PendingEvent {
+                        start: u64,
+                        end: u64,
+                        name: String,
+                        extra_data: Vec<(String, String)>,
+                        channel_id: u32,
+                        channel_type: u32,
+                        activity_device_id: u32,
+                        activity_device_uuid: [u8; 16],
+                        activity_context_id: u32,
+                        activity_stream_id: u32,
+                        stage_iid: u64,
+                    }
+
+                    impl state::GpuActivity for PendingEvent {
+                        fn start(&self) -> u64 {
+                            self.start
+                        }
+                        fn end(&self) -> u64 {
+                            self.end
+                        }
+                        fn device_id(&self) -> u32 {
+                            self.activity_device_id
+                        }
+                        fn device_uuid(&self) -> &[u8; 16] {
+                            &self.activity_device_uuid
+                        }
+                        fn context_id(&self) -> u32 {
+                            self.activity_context_id
+                        }
+                        fn stream_id(&self) -> u32 {
+                            self.activity_stream_id
+                        }
+                        fn channel_id(&self) -> u32 {
+                            self.channel_id
+                        }
+                        fn channel_type(&self) -> u32 {
+                            self.channel_type
+                        }
+                        fn stage_iid(&self) -> u64 {
+                            self.stage_iid
+                        }
+                        fn emit_extra_data(
+                            &self,
+                            _process_id: i32,
+                            _process_name: &str,
+                            _emit: &mut dyn FnMut(&str, &str),
+                        ) {
+                        }
+                    }
+
+                    let mut channel_events: std::collections::HashMap<
+                        (u32, u32),
+                        Vec<PendingEvent>,
+                    > = std::collections::HashMap::new();
+
+                    for (ctx_id, data) in state.context_data.iter() {
+                        let launch_start = start_offsets
+                            .kernel_launches
+                            .get(ctx_id)
+                            .copied()
+                            .unwrap_or(0);
+                        let ka_start = start_offsets
+                            .kernel_activities
+                            .get(ctx_id)
+                            .copied()
+                            .unwrap_or(0);
+                        for (launch, activity) in data.kernel_launches[launch_start..]
+                            .iter()
+                            .zip(data.kernel_activities[ka_start..].iter())
+                        {
+                            let (raw_start, raw_end) = if launch.profiled {
+                                (launch.start, launch.end)
+                            } else {
+                                (activity.start, activity.end)
+                            };
+                            let demangled = perfetto_gpu_compute_injection::kernel::demangle_name(
+                                &activity.kernel_name,
+                            );
+                            let mut extra_data_vec: Vec<(String, String)> = Vec::new();
+                            activity.emit_extra_data(
+                                process_id,
+                                &process_name,
+                                &mut |name, value| {
+                                    extra_data_vec.push((name.to_string(), value.to_string()));
+                                },
+                            );
+                            channel_events
+                                .entry((activity.channel_id, activity.channel_type))
+                                .or_default()
+                                .push(PendingEvent {
+                                    start: raw_start,
+                                    end: raw_end,
+                                    name: perfetto_gpu_compute_injection::kernel::simplify_name(
+                                        &demangled,
+                                    )
+                                    .to_string(),
+                                    extra_data: extra_data_vec,
+                                    channel_id: activity.channel_id,
+                                    channel_type: activity.channel_type,
+                                    activity_device_id: activity.device_id,
+                                    activity_device_uuid: activity.device_uuid,
+                                    activity_context_id: activity.context_id,
+                                    activity_stream_id: activity.stream_id,
+                                    stage_iid: state::KERNEL_STAGE_IID,
+                                });
+                        }
+                        let mc_start = start_offsets
+                            .memcpy_activities
+                            .get(ctx_id)
+                            .copied()
+                            .unwrap_or(0);
+                        for activity in data.memcpy_activities[mc_start..].iter() {
+                            let mut extra_data_vec: Vec<(String, String)> = Vec::new();
+                            activity.emit_extra_data(
+                                process_id,
+                                &process_name,
+                                &mut |name, value| {
+                                    extra_data_vec.push((name.to_string(), value.to_string()));
+                                },
+                            );
+                            channel_events
+                                .entry((activity.channel_id, activity.channel_type))
+                                .or_default()
+                                .push(PendingEvent {
+                                    start: activity.start,
+                                    end: activity.end,
+                                    name: format!("Memcpy {}", activity.direction_string()),
+                                    extra_data: extra_data_vec,
+                                    channel_id: activity.channel_id,
+                                    channel_type: activity.channel_type,
+                                    activity_device_id: activity.device_id,
+                                    activity_device_uuid: activity.device_uuid,
+                                    activity_context_id: activity.context_id,
+                                    activity_stream_id: activity.stream_id,
+                                    stage_iid: state::MEMCPY_STAGE_IID,
+                                });
+                        }
+                        let ms_start = start_offsets
+                            .memset_activities
+                            .get(ctx_id)
+                            .copied()
+                            .unwrap_or(0);
+                        for activity in data.memset_activities[ms_start..].iter() {
+                            let mut extra_data_vec: Vec<(String, String)> = Vec::new();
+                            activity.emit_extra_data(
+                                process_id,
+                                &process_name,
+                                &mut |name, value| {
+                                    extra_data_vec.push((name.to_string(), value.to_string()));
+                                },
+                            );
+                            channel_events
+                                .entry((activity.channel_id, activity.channel_type))
+                                .or_default()
+                                .push(PendingEvent {
+                                    start: activity.start,
+                                    end: activity.end,
+                                    name: "Memset".to_string(),
+                                    extra_data: extra_data_vec,
+                                    channel_id: activity.channel_id,
+                                    channel_type: activity.channel_type,
+                                    activity_device_id: activity.device_id,
+                                    activity_device_uuid: activity.device_uuid,
+                                    activity_context_id: activity.context_id,
+                                    activity_stream_id: activity.stream_id,
+                                    stage_iid: state::MEMSET_STAGE_IID,
+                                });
+                        }
+                    }
+
+                    // Sort each channel's events by start time, then clamp to
+                    // prevent overlaps caused by mixed timestamp sources.
+                    for events in channel_events.values_mut() {
+                        events.sort_by_key(|e| e.start);
+                        let mut prev_end: u64 = 0;
+                        for event in events.iter_mut() {
+                            if event.start < prev_end {
+                                event.start = prev_end;
+                            }
+                            if event.end < event.start {
+                                event.end = event.start;
+                            }
+                            prev_end = event.end;
+                        }
+                    }
+
+                    // Merge all channel events into a single list sorted by
+                    // timestamp so the sequence is monotonically ordered.
+                    let mut all_events: Vec<PendingEvent> = channel_events
+                        .into_values()
+                        .flat_map(|v| v.into_iter())
+                        .collect();
+                    all_events.sort_by_key(|e| e.start);
+
+                    // Always emit interned specifications on flush so that
+                    // channels/contexts that first appear after a previous
+                    // flush are properly defined.
+                    if !channels.is_empty() {
+                        ctx.add_packet(|packet: &mut TracePacket| {
+                            emit_interned_specifications(packet, &channels, &contexts, process_id);
+                        });
+                        GOT_FIRST_RENDERSTAGES.fetch_or(1 << inst_id, Ordering::SeqCst);
+                    }
+
+                    for event in &all_events {
+                        let timestamp = event.start;
+                        let duration_ns = event.end.saturating_sub(event.start);
+                        let rs_ctx = RenderStageContext {
+                            channels: &channels,
+                            contexts: &contexts,
+                            process_id,
+                        };
+                        emit_render_stage_event(
+                            ctx,
+                            event,
+                            timestamp,
+                            duration_ns,
+                            false,
+                            &rs_ctx,
+                            &event.name,
+                            &event.extra_data,
+                        );
+                    }
+                    ctx.flush(|| {});
+                });
+            }
+
+            let emitted: usize = inst_ids
+                .iter()
+                .filter_map(|id| state.renderstages_consumers.get(id))
+                .map(|offsets| {
+                    state
+                        .context_data
+                        .iter()
+                        .map(|(ctx_id, data)| {
+                            let ka = offsets.kernel_activities.get(ctx_id).copied().unwrap_or(0);
+                            let mc = offsets.memcpy_activities.get(ctx_id).copied().unwrap_or(0);
+                            let ms = offsets.memset_activities.get(ctx_id).copied().unwrap_or(0);
+                            data.kernel_activities.len().saturating_sub(ka)
+                                + data.memcpy_activities.len().saturating_sub(mc)
+                                + data.memset_activities.len().saturating_sub(ms)
+                        })
+                        .sum::<usize>()
+                })
+                .max()
+                .unwrap_or(0);
+
+            state.advance_and_drain_renderstage_events();
+
+            if emitted > 0 {
+                injection_log!("flushed {} render stage events", emitted);
+            }
+        });
+    }
+
+    fn flush_counter_events(&self) {
+        let _ = panic::catch_unwind(|| {
+            let mut state = match GLOBAL_STATE.lock() {
+                Ok(s) => s,
+                Err(_) => return,
+            };
+
+            if state.counters_consumers.is_empty() {
+                return;
+            }
+
+            let inst_ids: Vec<u32> = state.counters_consumers.keys().copied().collect();
+
+            for inst_id in &inst_ids {
+                let start_offsets = match state.counters_consumers.get(inst_id) {
+                    Some(o) => o,
+                    None => continue,
+                };
+
+                get_counters_data_source().trace(|ctx: &mut TraceContext| {
+                    if ctx.instance_index() != *inst_id {
+                        return;
+                    }
+                    for (ctx_id, data) in state.context_data.iter() {
+                        let range_start =
+                            start_offsets.range_info.get(ctx_id).copied().unwrap_or(0);
+                        let launch_start =
+                            start_offsets.kernel_launches.get(ctx_id).copied().unwrap_or(0);
+                        let activity_start =
+                            start_offsets.kernel_activities.get(ctx_id).copied().unwrap_or(0);
+                        for ((range, launch), activity) in data.range_info[range_start..]
+                            .iter()
+                            .zip(data.kernel_launches[launch_start..].iter())
+                            .zip(data.kernel_activities[activity_start..].iter())
+                        {
+                            // Skip incomplete launches (end timestamp not yet set).
+                            if launch.end == 0 {
+                                continue;
+                            }
+                            let gpu_id = activity.gpu_id() as i32;
+                            let got_first_counters =
+                                GOT_FIRST_COUNTERS.fetch_or(1 << inst_id, Ordering::SeqCst);
+                            if got_first_counters & (1 << inst_id) == 0 {
+                                ctx.add_packet(|packet: &mut TracePacket| {
+                                    packet
+                                        .set_timestamp(launch.start)
+                                        .set_timestamp_clock_id(
+                                            BuiltinClock::BuiltinClockBoottime.into(),
+                                        )
+                                        .set_gpu_counter_event(|event: &mut GpuCounterEvent| {
+                                            event.set_gpu_id(gpu_id).set_counter_descriptor(
+                                                |desc: &mut GpuCounterDescriptor| {
+                                                    for (i, metric) in
+                                                        range.metric_and_values.iter().enumerate()
+                                                    {
+                                                        desc.set_specs(|desc: &mut GpuCounterDescriptorGpuCounterSpec| {
+                                                            desc.set_counter_id(i as u32);
+                                                            desc.set_name(&metric.metric_name);
+                                                            desc.set_groups(GpuCounterDescriptorGpuCounterGroup::Compute);
+                                                        });
+                                                    }
+                                                },
+                                            );
+                                        });
+                                });
+                            }
+                            ctx.add_packet(|packet: &mut TracePacket| {
+                                packet
+                                    .set_timestamp(launch.start)
+                                    .set_timestamp_clock_id(
+                                        BuiltinClock::BuiltinClockBoottime.into(),
+                                    )
+                                    .set_gpu_counter_event(|event: &mut GpuCounterEvent| {
+                                        event.set_gpu_id(gpu_id);
+                                        for (i, _metric) in
+                                            range.metric_and_values.iter().enumerate()
+                                        {
+                                            event.set_counters(
+                                                |counter: &mut GpuCounterEventGpuCounter| {
+                                                    counter
+                                                        .set_counter_id(i as u32)
+                                                        .set_int_value(0);
+                                                },
+                                            );
+                                        }
+                                    });
+                            });
+                            ctx.add_packet(|packet: &mut TracePacket| {
+                                packet
+                                    .set_timestamp(launch.end)
+                                    .set_timestamp_clock_id(
+                                        BuiltinClock::BuiltinClockBoottime.into(),
+                                    )
+                                    .set_gpu_counter_event(|event: &mut GpuCounterEvent| {
+                                        event.set_gpu_id(gpu_id);
+                                        for (i, metric) in
+                                            range.metric_and_values.iter().enumerate()
+                                        {
+                                            event.set_counters(
+                                                |counter: &mut GpuCounterEventGpuCounter| {
+                                                    counter
+                                                        .set_counter_id(i as u32)
+                                                        .set_double_value(metric.value);
+                                                },
+                                            );
+                                        }
+                                    });
+                            });
+                        }
+                    }
+                    ctx.flush(|| {});
+                });
+            }
+
+            let emitted: usize = inst_ids
+                .iter()
+                .filter_map(|id| state.counters_consumers.get(id))
+                .map(|offsets| {
+                    state
+                        .context_data
+                        .iter()
+                        .map(|(ctx_id, data)| {
+                            let start = offsets.range_info.get(ctx_id).copied().unwrap_or(0);
+                            data.range_info.len().saturating_sub(start)
+                        })
+                        .sum::<usize>()
+                })
+                .max()
+                .unwrap_or(0);
+
+            state.advance_and_drain_counter_events();
+
+            if emitted > 0 {
+                injection_log!("flushed {} counter events", emitted);
+            }
         });
     }
 }

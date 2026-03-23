@@ -1,6 +1,6 @@
 [package]
 name = "perfetto-gpu-compute-injection"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2021"
 authors = ["David Reveman <reveman@meta.com>"]
 description = "Perfetto GPU Compute Injection — shared library"

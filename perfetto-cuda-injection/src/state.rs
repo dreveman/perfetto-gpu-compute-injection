@@ -381,12 +381,18 @@ impl CtxProfilerData {
             return;
         }
         if let Some(rp) = &mut self.range_profiler {
-            let _ = rp.stop();
-            let _ = rp.decode_counter_data();
-            let metric_names = rp.validated_metric_names().to_vec();
-            if let Some(me) = &self.metric_evaluator {
-                if let Ok(infos) = me.evaluate_all_ranges(&self.counter_data_image, &metric_names) {
-                    self.range_info.extend(infos);
+            // stop() returns CUPTI_ERROR_INVALID_OPERATION when no profiling
+            // pass is active (e.g. during teardown with no in-flight kernel).
+            // Only proceed with decode + evaluate when stop succeeds.
+            if rp.stop().is_ok() {
+                let _ = rp.decode_counter_data();
+                let metric_names = rp.validated_metric_names().to_vec();
+                if let Some(me) = &self.metric_evaluator {
+                    if let Ok(infos) =
+                        me.evaluate_all_ranges(&self.counter_data_image, &metric_names)
+                    {
+                        self.range_info.extend(infos);
+                    }
                 }
             }
             if disable {

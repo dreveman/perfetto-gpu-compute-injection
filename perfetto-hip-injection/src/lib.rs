@@ -696,6 +696,9 @@ impl GpuBackend for RocprofilerBackend {
     }
 
     fn flush_renderstage_events(&self) {
+        // Force rocprofiler to deliver buffered records so that
+        // kernel_dispatches / memcopies / memsets vectors are up to date.
+        self.flush_activity_buffers();
         let inst_ids: Vec<u32> = GLOBAL_STATE
             .lock()
             .map(|s| s.renderstages_consumers.keys().copied().collect())
@@ -709,6 +712,9 @@ impl GpuBackend for RocprofilerBackend {
     }
 
     fn flush_counter_events(&self) {
+        // Force rocprofiler to deliver buffered records so that
+        // kernel_dispatches are up to date for counter emission.
+        self.flush_activity_buffers();
         let inst_ids: Vec<u32> = GLOBAL_STATE
             .lock()
             .map(|s| s.counters_consumers.keys().copied().collect())

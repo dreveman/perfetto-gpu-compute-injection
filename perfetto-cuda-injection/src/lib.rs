@@ -338,7 +338,10 @@ impl GpuBackend for CuptiBackend {
                     None => return,
                 }
             };
+            let is_flush = stop_guard.is_none();
             let mut stop_guard_opt = stop_guard;
+            let mut updated_prev_ends: std::collections::HashMap<(u32, u32), u64> =
+                std::collections::HashMap::new();
             get_renderstages_data_source().trace(|ctx: &mut TraceContext| {
                 if ctx.instance_index() != inst_id {
                     return;
@@ -666,9 +669,14 @@ impl GpuBackend for CuptiBackend {
 
                 // Sort each channel's events by start time, then clamp to
                 // prevent overlaps caused by mixed timestamp sources.
-                for events in channel_events.values_mut() {
+                // Use persisted prev_end from prior flush batches.
+                for (channel_key, events) in channel_events.iter_mut() {
                     events.sort_by_key(|e| e.start);
-                    let mut prev_end: u64 = 0;
+                    let mut prev_end: u64 = start_offsets
+                        .channel_prev_end
+                        .get(channel_key)
+                        .copied()
+                        .unwrap_or(0);
                     for event in events.iter_mut() {
                         if event.start < prev_end {
                             event.start = prev_end;
@@ -678,6 +686,7 @@ impl GpuBackend for CuptiBackend {
                         }
                         prev_end = event.end;
                     }
+                    updated_prev_ends.insert(*channel_key, prev_end);
                 }
 
                 // Merge all channel events into a single list sorted by
@@ -719,6 +728,12 @@ impl GpuBackend for CuptiBackend {
                 ctx.flush(move || drop(sg.take()));
             });
             drop(stop_guard_opt);
+            // Persist per-channel prev_end timestamps for the next flush batch.
+            if is_flush {
+                if let Some(offsets) = state.renderstages_consumers.get_mut(&inst_id) {
+                    offsets.channel_prev_end = updated_prev_ends;
+                }
+            }
             let emitted: usize = state
                 .context_data
                 .iter()
@@ -752,6 +767,9 @@ impl GpuBackend for CuptiBackend {
     }
 
     fn flush_renderstage_events(&self) {
+        // Force CUPTI to deliver buffered activity records so that
+        // kernel_activities / memcpy / memset vectors are up to date.
+        self.flush_activity_buffers();
         let inst_ids: Vec<u32> = GLOBAL_STATE
             .lock()
             .map(|s| s.renderstages_consumers.keys().copied().collect())
@@ -765,6 +783,9 @@ impl GpuBackend for CuptiBackend {
     }
 
     fn flush_counter_events(&self) {
+        // Force CUPTI to deliver buffered activity records so that
+        // kernel_activities are up to date for the zip with range_info.
+        self.flush_activity_buffers();
         let inst_ids: Vec<u32> = GLOBAL_STATE
             .lock()
             .map(|s| s.counters_consumers.keys().copied().collect())

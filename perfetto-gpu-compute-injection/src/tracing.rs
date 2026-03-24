@@ -244,7 +244,6 @@ pub fn get_counters_data_source() -> &'static DataSource<'static> {
                 );
                 let flush_guard = args.postpone();
                 std::thread::spawn(move || {
-                    backend().flush_activity_buffers();
                     backend().flush_counter_events();
                     injection_log!("counters data source flush complete (instance {})", inst_id);
                     drop(flush_guard);
@@ -316,7 +315,6 @@ pub fn get_renderstages_data_source() -> &'static DataSource<'static> {
                 );
                 let flush_guard = args.postpone();
                 std::thread::spawn(move || {
-                    backend().flush_activity_buffers();
                     backend().flush_renderstage_events();
                     injection_log!(
                         "renderstages data source flush complete (instance {})",

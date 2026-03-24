@@ -326,6 +326,9 @@ pub struct ConsumerStartOffsets {
     pub kernel_activities: HashMap<u32, usize>,
     pub memcpy_activities: HashMap<u32, usize>,
     pub memset_activities: HashMap<u32, usize>,
+    /// Per-channel (channel_id, channel_type) last emitted end timestamp,
+    /// used to clamp overlapping events across flush batches.
+    pub channel_prev_end: HashMap<(u32, u32), u64>,
 }
 
 impl ConsumerStartOffsets {
@@ -429,22 +432,30 @@ pub struct GlobalState {
 unsafe impl Send for GlobalState {}
 
 impl GlobalState {
-    /// Advance all renderstages consumer offsets to the current vector lengths,
-    /// then drain the prefix of each vector that all consumers have consumed.
+    /// Advance all renderstages consumer offsets to the number of entries
+    /// actually consumed by the zip, then drain the prefix that all consumers
+    /// have consumed.
     pub fn advance_and_drain_renderstage_events(&mut self) {
-        // Advance all consumer offsets to current lengths.
+        // Advance consumer offsets. kernel_launches and kernel_activities are
+        // consumed via zip, so both must advance by the same amount:
+        // min(kl_available, ka_available). Memcpy and memset are independent.
         for offsets in self.renderstages_consumers.values_mut() {
             for (&ctx_id, data) in self.context_data.iter() {
+                let kl_off = offsets.kernel_launches.get(&ctx_id).copied().unwrap_or(0);
+                let ka_off = offsets.kernel_activities.get(&ctx_id).copied().unwrap_or(0);
+                let kl_avail = data.kernel_launches.len().saturating_sub(kl_off);
+                let ka_avail = data.kernel_activities.len().saturating_sub(ka_off);
+                let consumed = kl_avail.min(ka_avail);
                 offsets
                     .kernel_launches
                     .entry(ctx_id)
-                    .and_modify(|o| *o = data.kernel_launches.len())
-                    .or_insert(data.kernel_launches.len());
+                    .and_modify(|o| *o = kl_off + consumed)
+                    .or_insert(kl_off + consumed);
                 offsets
                     .kernel_activities
                     .entry(ctx_id)
-                    .and_modify(|o| *o = data.kernel_activities.len())
-                    .or_insert(data.kernel_activities.len());
+                    .and_modify(|o| *o = ka_off + consumed)
+                    .or_insert(ka_off + consumed);
                 offsets
                     .memcpy_activities
                     .entry(ctx_id)
@@ -537,27 +548,37 @@ impl GlobalState {
         }
     }
 
-    /// Advance all counters consumer offsets to the current vector lengths,
-    /// then drain the prefix of each vector that all consumers have consumed.
+    /// Advance all counters consumer offsets to the number of entries actually
+    /// consumed by the triple-zip, then drain the prefix that all consumers
+    /// have consumed.
     pub fn advance_and_drain_counter_events(&mut self) {
-        // Advance all consumer offsets to current lengths.
+        // Advance consumer offsets. range_info, kernel_launches, and
+        // kernel_activities are consumed via triple-zip, so all three must
+        // advance by the same amount: min(ri_available, kl_available, ka_available).
         for offsets in self.counters_consumers.values_mut() {
             for (&ctx_id, data) in self.context_data.iter() {
+                let ri_off = offsets.range_info.get(&ctx_id).copied().unwrap_or(0);
+                let kl_off = offsets.kernel_launches.get(&ctx_id).copied().unwrap_or(0);
+                let ka_off = offsets.kernel_activities.get(&ctx_id).copied().unwrap_or(0);
+                let ri_avail = data.range_info.len().saturating_sub(ri_off);
+                let kl_avail = data.kernel_launches.len().saturating_sub(kl_off);
+                let ka_avail = data.kernel_activities.len().saturating_sub(ka_off);
+                let consumed = ri_avail.min(kl_avail).min(ka_avail);
                 offsets
                     .range_info
                     .entry(ctx_id)
-                    .and_modify(|o| *o = data.range_info.len())
-                    .or_insert(data.range_info.len());
+                    .and_modify(|o| *o = ri_off + consumed)
+                    .or_insert(ri_off + consumed);
                 offsets
                     .kernel_launches
                     .entry(ctx_id)
-                    .and_modify(|o| *o = data.kernel_launches.len())
-                    .or_insert(data.kernel_launches.len());
+                    .and_modify(|o| *o = kl_off + consumed)
+                    .or_insert(kl_off + consumed);
                 offsets
                     .kernel_activities
                     .entry(ctx_id)
-                    .and_modify(|o| *o = data.kernel_activities.len())
-                    .or_insert(data.kernel_activities.len());
+                    .and_modify(|o| *o = ka_off + consumed)
+                    .or_insert(ka_off + consumed);
             }
         }
 

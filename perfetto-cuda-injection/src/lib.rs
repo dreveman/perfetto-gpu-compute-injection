@@ -137,7 +137,15 @@ impl GpuBackend for CuptiBackend {
     }
 
     fn flush_activity_buffers(&self) {
-        let _ = profiler::activity_flush_all(CUpti_ActivityFlag_CUPTI_ACTIVITY_FLAG_FLUSH_FORCED);
+        // cuptiActivityFlushAll deadlocks when called concurrently from
+        // multiple threads.  Use try_lock so that only one thread performs
+        // the actual CUPTI flush; the other skips it (the first call already
+        // delivers all pending records via the buffer_completed callback).
+        static FLUSH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        if let Ok(_guard) = FLUSH_LOCK.try_lock() {
+            let _ =
+                profiler::activity_flush_all(CUpti_ActivityFlag_CUPTI_ACTIVITY_FLAG_FLUSH_FORCED);
+        }
     }
 
     fn finalize_range_profiler(&self) {
@@ -200,121 +208,145 @@ impl GpuBackend for CuptiBackend {
 
     fn emit_counter_events_for_instance(&self, inst_id: u32, stop_guard: Option<StopGuard>) {
         let _ = panic::catch_unwind(|| {
-            let mut state = match GLOBAL_STATE.lock() {
-                Ok(s) => s,
-                Err(_) => return,
-            };
-            let start_offsets = if stop_guard.is_some() {
-                match state.counters_consumers.remove(&inst_id) {
-                    Some(o) => o,
-                    None => return,
-                }
-            } else {
-                match state.counters_consumers.get(&inst_id).cloned() {
-                    Some(o) => o,
-                    None => return,
-                }
-            };
-            let mut stop_guard_opt = stop_guard;
-            get_counters_data_source().trace(|ctx: &mut TraceContext| {
-                if ctx.instance_index() != inst_id {
-                    return;
-                }
+            // Collected counter event data.
+            struct CollectedCounterEvent {
+                timestamp_start: u64,
+                timestamp_end: u64,
+                gpu_id: i32,
+                metrics: Vec<(String, f64)>,
+            }
+
+            // Phase 1: Collect data under GLOBAL_STATE lock, then release.
+            let collected_events = {
+                let mut state = match GLOBAL_STATE.lock() {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+                let start_offsets = if stop_guard.is_some() {
+                    match state.counters_consumers.remove(&inst_id) {
+                        Some(o) => o,
+                        None => return,
+                    }
+                } else {
+                    match state.counters_consumers.get(&inst_id).cloned() {
+                        Some(o) => o,
+                        None => return,
+                    }
+                };
+                let mut events: Vec<CollectedCounterEvent> = Vec::new();
                 for (ctx_id, data) in state.context_data.iter() {
                     let range_start = start_offsets.range_info.get(ctx_id).copied().unwrap_or(0);
-                    let launch_start =
-                        start_offsets.kernel_launches.get(ctx_id).copied().unwrap_or(0);
-                    let activity_start =
-                        start_offsets.kernel_activities.get(ctx_id).copied().unwrap_or(0);
+                    let launch_start = start_offsets
+                        .kernel_launches
+                        .get(ctx_id)
+                        .copied()
+                        .unwrap_or(0);
+                    let activity_start = start_offsets
+                        .kernel_activities
+                        .get(ctx_id)
+                        .copied()
+                        .unwrap_or(0);
                     for ((range, launch), activity) in data.range_info[range_start..]
                         .iter()
                         .zip(data.kernel_launches[launch_start..].iter())
                         .zip(data.kernel_activities[activity_start..].iter())
                     {
-                        // Skip incomplete launches (end timestamp not yet set).
                         if launch.end == 0 {
                             continue;
                         }
-                        let gpu_id = activity.gpu_id() as i32;
-                        let got_first_counters =
-                            GOT_FIRST_COUNTERS.fetch_or(1 << inst_id, Ordering::SeqCst);
-                        if got_first_counters & (1 << inst_id) == 0 {
-                            ctx.add_packet(|packet: &mut TracePacket| {
-                                packet
-                                    .set_timestamp(launch.start)
-                                    .set_timestamp_clock_id(
-                                        BuiltinClock::BuiltinClockBoottime.into(),
-                                    )
-                                    .set_gpu_counter_event(|event: &mut GpuCounterEvent| {
-                                        event.set_gpu_id(gpu_id).set_counter_descriptor(
-                                            |desc: &mut GpuCounterDescriptor| {
-                                                for (i, metric) in
-                                                    range.metric_and_values.iter().enumerate()
-                                                {
-                                                    desc.set_specs(|desc: &mut GpuCounterDescriptorGpuCounterSpec| {
-                                                        desc.set_counter_id(i as u32);
-                                                        desc.set_name(&metric.metric_name);
-                                                        desc.set_groups(GpuCounterDescriptorGpuCounterGroup::Compute);
-                                                    });
-                                                }
-                                            },
-                                        );
-                                    });
-                            });
-                        }
-                        ctx.add_packet(|packet: &mut TracePacket| {
-                            packet
-                                .set_timestamp(launch.start)
-                                .set_timestamp_clock_id(
-                                    BuiltinClock::BuiltinClockBoottime.into(),
-                                )
-                                .set_gpu_counter_event(|event: &mut GpuCounterEvent| {
-                                    event.set_gpu_id(gpu_id);
-                                    for (i, _metric) in range.metric_and_values.iter().enumerate()
-                                    {
-                                        event.set_counters(
-                                            |counter: &mut GpuCounterEventGpuCounter| {
-                                                counter.set_counter_id(i as u32).set_int_value(0);
-                                            },
-                                        );
-                                    }
-                                });
-                        });
-                        ctx.add_packet(|packet: &mut TracePacket| {
-                            packet
-                                .set_timestamp(launch.end)
-                                .set_timestamp_clock_id(
-                                    BuiltinClock::BuiltinClockBoottime.into(),
-                                )
-                                .set_gpu_counter_event(|event: &mut GpuCounterEvent| {
-                                    event.set_gpu_id(gpu_id);
-                                    for (i, metric) in range.metric_and_values.iter().enumerate()
-                                    {
-                                        event.set_counters(
-                                            |counter: &mut GpuCounterEventGpuCounter| {
-                                                counter
-                                                    .set_counter_id(i as u32)
-                                                    .set_double_value(metric.value);
-                                            },
-                                        );
-                                    }
-                                });
+                        events.push(CollectedCounterEvent {
+                            timestamp_start: launch.start,
+                            timestamp_end: launch.end,
+                            gpu_id: activity.gpu_id() as i32,
+                            metrics: range
+                                .metric_and_values
+                                .iter()
+                                .map(|m| (m.metric_name.clone(), m.value))
+                                .collect(),
                         });
                     }
                 }
-                let mut sg = Some(stop_guard_opt.take());
-                ctx.flush(move || drop(sg.take()));
+                events
+                // state (GLOBAL_STATE lock) dropped here
+            };
+
+            // Phase 2: Emit collected events without holding GLOBAL_STATE.
+            // This prevents deadlock with buffer_completed callback.
+            let mut stop_guard_opt = stop_guard;
+            get_counters_data_source().trace(|ctx: &mut TraceContext| {
+                if ctx.instance_index() != inst_id {
+                    return;
+                }
+                for event in &collected_events {
+                    let got_first_counters =
+                        GOT_FIRST_COUNTERS.fetch_or(1 << inst_id, Ordering::SeqCst);
+                    if got_first_counters & (1 << inst_id) == 0 {
+                        ctx.add_packet(|packet: &mut TracePacket| {
+                            packet
+                                .set_timestamp(event.timestamp_start)
+                                .set_timestamp_clock_id(
+                                    BuiltinClock::BuiltinClockBoottime.into(),
+                                )
+                                .set_gpu_counter_event(|ce: &mut GpuCounterEvent| {
+                                    ce.set_gpu_id(event.gpu_id).set_counter_descriptor(
+                                        |desc: &mut GpuCounterDescriptor| {
+                                            for (i, (metric_name, _)) in
+                                                event.metrics.iter().enumerate()
+                                            {
+                                                desc.set_specs(|spec: &mut GpuCounterDescriptorGpuCounterSpec| {
+                                                    spec.set_counter_id(i as u32);
+                                                    spec.set_name(metric_name);
+                                                    spec.set_groups(GpuCounterDescriptorGpuCounterGroup::Compute);
+                                                });
+                                            }
+                                        },
+                                    );
+                                });
+                        });
+                    }
+                    ctx.add_packet(|packet: &mut TracePacket| {
+                        packet
+                            .set_timestamp(event.timestamp_start)
+                            .set_timestamp_clock_id(
+                                BuiltinClock::BuiltinClockBoottime.into(),
+                            )
+                            .set_gpu_counter_event(|ce: &mut GpuCounterEvent| {
+                                ce.set_gpu_id(event.gpu_id);
+                                for (i, _) in event.metrics.iter().enumerate() {
+                                    ce.set_counters(
+                                        |counter: &mut GpuCounterEventGpuCounter| {
+                                            counter.set_counter_id(i as u32).set_int_value(0);
+                                        },
+                                    );
+                                }
+                            });
+                    });
+                    ctx.add_packet(|packet: &mut TracePacket| {
+                        packet
+                            .set_timestamp(event.timestamp_end)
+                            .set_timestamp_clock_id(
+                                BuiltinClock::BuiltinClockBoottime.into(),
+                            )
+                            .set_gpu_counter_event(|ce: &mut GpuCounterEvent| {
+                                ce.set_gpu_id(event.gpu_id);
+                                for (i, (_, value)) in event.metrics.iter().enumerate() {
+                                    ce.set_counters(
+                                        |counter: &mut GpuCounterEventGpuCounter| {
+                                            counter
+                                                .set_counter_id(i as u32)
+                                                .set_double_value(*value);
+                                        },
+                                    );
+                                }
+                            });
+                    });
+                }
+                if let Some(sg) = stop_guard_opt.take() {
+                    let mut sg = Some(Some(sg));
+                    ctx.flush(move || drop(sg.take()));
+                }
             });
             drop(stop_guard_opt);
-            let emitted: usize = state
-                .context_data
-                .iter()
-                .map(|(ctx_id, data)| {
-                    let start = start_offsets.range_info.get(ctx_id).copied().unwrap_or(0);
-                    data.range_info.len().saturating_sub(start)
-                })
-                .sum();
-            injection_log!("emitted {} counter events (instance {})", emitted, inst_id);
         });
     }
 
@@ -323,29 +355,74 @@ impl GpuBackend for CuptiBackend {
             let (process_id, process_name) =
                 perfetto_gpu_compute_injection::config::get_process_info();
 
-            let mut state = match GLOBAL_STATE.lock() {
-                Ok(s) => s,
-                Err(_) => return,
-            };
-            let start_offsets = if stop_guard.is_some() {
-                match state.renderstages_consumers.remove(&inst_id) {
-                    Some(o) => o,
-                    None => return,
+            // PendingEvent holds all data needed to emit a render stage event.
+            struct PendingEvent {
+                start: u64,
+                end: u64,
+                name: String,
+                extra_data: Vec<(String, String)>,
+                channel_id: u32,
+                channel_type: u32,
+                activity_device_id: u32,
+                activity_context_id: u32,
+                activity_stream_id: u32,
+                stage_iid: u64,
+            }
+
+            impl state::GpuActivity for PendingEvent {
+                fn start(&self) -> u64 {
+                    self.start
                 }
-            } else {
-                match state.renderstages_consumers.get(&inst_id).cloned() {
-                    Some(o) => o,
-                    None => return,
+                fn end(&self) -> u64 {
+                    self.end
                 }
-            };
-            let is_flush = stop_guard.is_none();
-            let mut stop_guard_opt = stop_guard;
-            let mut updated_prev_ends: std::collections::HashMap<(u32, u32), u64> =
-                std::collections::HashMap::new();
-            get_renderstages_data_source().trace(|ctx: &mut TraceContext| {
-                if ctx.instance_index() != inst_id {
-                    return;
+                fn device_id(&self) -> u32 {
+                    self.activity_device_id
                 }
+                fn context_id(&self) -> u32 {
+                    self.activity_context_id
+                }
+                fn stream_id(&self) -> u32 {
+                    self.activity_stream_id
+                }
+                fn channel_id(&self) -> u32 {
+                    self.channel_id
+                }
+                fn channel_type(&self) -> u32 {
+                    self.channel_type
+                }
+                fn stage_iid(&self) -> u64 {
+                    self.stage_iid
+                }
+                fn emit_extra_data(
+                    &self,
+                    _process_id: i32,
+                    _process_name: &str,
+                    _emit: &mut dyn FnMut(&str, &str),
+                ) {
+                }
+            }
+
+            // Phase 1: Collect all event data under GLOBAL_STATE lock, then release.
+            let (all_events, channels, contexts, updated_prev_ends, is_flush) = {
+                let mut state = match GLOBAL_STATE.lock() {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+                let start_offsets = if stop_guard.is_some() {
+                    match state.renderstages_consumers.remove(&inst_id) {
+                        Some(o) => o,
+                        None => return,
+                    }
+                } else {
+                    match state.renderstages_consumers.get(&inst_id).cloned() {
+                        Some(o) => o,
+                        None => return,
+                    }
+                };
+                let is_flush = stop_guard.is_none();
+
+                // Build channel and context sets.
                 let mut channels: std::collections::HashSet<(u32, u32)> =
                     std::collections::HashSet::new();
                 let mut contexts: std::collections::HashSet<u32> = std::collections::HashSet::new();
@@ -376,55 +453,6 @@ impl GpuBackend for CuptiBackend {
                     for activity in data.memset_activities[ms_start..].iter() {
                         channels.insert((activity.channel_id, activity.channel_type));
                         contexts.insert(activity.context_id);
-                    }
-                }
-                // Collect all pending events per channel across all contexts,
-                // then sort and clamp timestamps to prevent overlaps within
-                // each channel before emitting.
-                struct PendingEvent {
-                    start: u64,
-                    end: u64,
-                    name: String,
-                    extra_data: Vec<(String, String)>,
-                    channel_id: u32,
-                    channel_type: u32,
-                    activity_device_id: u32,
-                    activity_context_id: u32,
-                    activity_stream_id: u32,
-                    stage_iid: u64,
-                }
-
-                impl state::GpuActivity for PendingEvent {
-                    fn start(&self) -> u64 {
-                        self.start
-                    }
-                    fn end(&self) -> u64 {
-                        self.end
-                    }
-                    fn device_id(&self) -> u32 {
-                        self.activity_device_id
-                    }
-                    fn context_id(&self) -> u32 {
-                        self.activity_context_id
-                    }
-                    fn stream_id(&self) -> u32 {
-                        self.activity_stream_id
-                    }
-                    fn channel_id(&self) -> u32 {
-                        self.channel_id
-                    }
-                    fn channel_type(&self) -> u32 {
-                        self.channel_type
-                    }
-                    fn stage_iid(&self) -> u64 {
-                        self.stage_iid
-                    }
-                    fn emit_extra_data(
-                        &self,
-                        _process_id: i32,
-                        _process_name: &str,
-                        _emit: &mut dyn FnMut(&str, &str),
-                    ) {
                     }
                 }
 
@@ -669,7 +697,8 @@ impl GpuBackend for CuptiBackend {
 
                 // Sort each channel's events by start time, then clamp to
                 // prevent overlaps caused by mixed timestamp sources.
-                // Use persisted prev_end from prior flush batches.
+                let mut updated_prev_ends: std::collections::HashMap<(u32, u32), u64> =
+                    std::collections::HashMap::new();
                 for (channel_key, events) in channel_events.iter_mut() {
                     events.sort_by_key(|e| e.start);
                     let mut prev_end: u64 = start_offsets
@@ -689,15 +718,24 @@ impl GpuBackend for CuptiBackend {
                     updated_prev_ends.insert(*channel_key, prev_end);
                 }
 
-                // Merge all channel events into a single list sorted by
-                // timestamp so the sequence is monotonically ordered.
+                // Merge all channel events into a single list sorted by timestamp.
                 let mut all_events: Vec<PendingEvent> = channel_events
                     .into_values()
                     .flat_map(|v| v.into_iter())
                     .collect();
                 all_events.sort_by_key(|e| e.start);
 
-                // Emit all events in global timestamp order.
+                (all_events, channels, contexts, updated_prev_ends, is_flush)
+                // state (GLOBAL_STATE lock) dropped here
+            };
+
+            // Phase 2: Emit collected events without holding GLOBAL_STATE.
+            // This prevents deadlock with buffer_completed callback.
+            let mut stop_guard_opt = stop_guard;
+            get_renderstages_data_source().trace(|ctx: &mut TraceContext| {
+                if ctx.instance_index() != inst_id {
+                    return;
+                }
                 for event in &all_events {
                     let timestamp = event.start;
                     let duration_ns = event.end.saturating_sub(event.start);
@@ -724,51 +762,25 @@ impl GpuBackend for CuptiBackend {
                         );
                     });
                 }
-                let mut sg = Some(stop_guard_opt.take());
-                ctx.flush(move || drop(sg.take()));
+                if let Some(sg) = stop_guard_opt.take() {
+                    let mut sg = Some(Some(sg));
+                    ctx.flush(move || drop(sg.take()));
+                }
             });
             drop(stop_guard_opt);
-            // Persist per-channel prev_end timestamps for the next flush batch.
+
+            // Phase 3: Re-acquire lock to update channel_prev_end for flush path.
             if is_flush {
-                if let Some(offsets) = state.renderstages_consumers.get_mut(&inst_id) {
-                    offsets.channel_prev_end = updated_prev_ends;
+                if let Ok(mut state) = GLOBAL_STATE.lock() {
+                    if let Some(offsets) = state.renderstages_consumers.get_mut(&inst_id) {
+                        offsets.channel_prev_end = updated_prev_ends;
+                    }
                 }
             }
-            let emitted: usize = state
-                .context_data
-                .iter()
-                .map(|(ctx_id, data)| {
-                    let ka = start_offsets
-                        .kernel_activities
-                        .get(ctx_id)
-                        .copied()
-                        .unwrap_or(0);
-                    let mc = start_offsets
-                        .memcpy_activities
-                        .get(ctx_id)
-                        .copied()
-                        .unwrap_or(0);
-                    let ms = start_offsets
-                        .memset_activities
-                        .get(ctx_id)
-                        .copied()
-                        .unwrap_or(0);
-                    data.kernel_activities.len().saturating_sub(ka)
-                        + data.memcpy_activities.len().saturating_sub(mc)
-                        + data.memset_activities.len().saturating_sub(ms)
-                })
-                .sum();
-            injection_log!(
-                "emitted {} render stage events (instance {})",
-                emitted,
-                inst_id
-            );
         });
     }
 
     fn flush_renderstage_events(&self) {
-        // Force CUPTI to deliver buffered activity records so that
-        // kernel_activities / memcpy / memset vectors are up to date.
         self.flush_activity_buffers();
         let inst_ids: Vec<u32> = GLOBAL_STATE
             .lock()
@@ -783,8 +795,6 @@ impl GpuBackend for CuptiBackend {
     }
 
     fn flush_counter_events(&self) {
-        // Force CUPTI to deliver buffered activity records so that
-        // kernel_activities are up to date for the zip with range_info.
         self.flush_activity_buffers();
         let inst_ids: Vec<u32> = GLOBAL_STATE
             .lock()

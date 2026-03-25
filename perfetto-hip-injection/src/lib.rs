@@ -143,34 +143,39 @@ impl GpuBackend for RocprofilerBackend {
             let (process_id, process_name) =
                 perfetto_gpu_compute_injection::config::get_process_info();
 
-            let mut state = match GLOBAL_STATE.lock() {
-                Ok(s) => s,
-                Err(_) => return,
-            };
-            let start_offsets = if stop_guard.is_some() {
-                match state.renderstages_consumers.remove(&inst_id) {
-                    Some(o) => o,
-                    None => return,
-                }
-            } else {
-                match state.renderstages_consumers.get(&inst_id).cloned() {
-                    Some(o) => o,
-                    None => return,
-                }
-            };
-            let kd_start = start_offsets.kernel_dispatches;
-            let mc_start = start_offsets.memcopies;
-            let ms_start = start_offsets.memsets;
+            // Phase 1: Collect all event data under GLOBAL_STATE lock, then release.
+            struct PendingRenderStageEvent {
+                start_ns: u64,
+                end_ns: u64,
+                gpu_id: i32,
+                hw_queue_iid: u64,
+                stage_iid: u64,
+                name: String,
+                extra_fields: Vec<(String, String)>,
+            }
 
-            let mut stop_guard_opt = stop_guard;
-            get_renderstages_data_source().trace(|ctx: &mut TraceContext| {
-                if ctx.instance_index() != inst_id {
-                    return;
-                }
+            let (events, queues, emit_interned_now) = {
+                let mut state = match GLOBAL_STATE.lock() {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+                let start_offsets = if stop_guard.is_some() {
+                    match state.renderstages_consumers.remove(&inst_id) {
+                        Some(o) => o,
+                        None => return,
+                    }
+                } else {
+                    match state.renderstages_consumers.get(&inst_id).cloned() {
+                        Some(o) => o,
+                        None => return,
+                    }
+                };
+                let kd_start = start_offsets.kernel_dispatches;
+                let mc_start = start_offsets.memcopies;
+                let ms_start = start_offsets.memsets;
 
                 // Collect unique queue handles for interned specs.
-                let mut queues: std::collections::HashSet<u64> =
-                    std::collections::HashSet::new();
+                let mut queues: std::collections::HashSet<u64> = std::collections::HashSet::new();
                 for kd in state.kernel_dispatches[kd_start..].iter() {
                     queues.insert(kd.queue_handle);
                 }
@@ -178,70 +183,9 @@ impl GpuBackend for RocprofilerBackend {
                 let got_first = GOT_FIRST_RENDERSTAGES.fetch_or(1 << inst_id, Ordering::SeqCst);
                 let emit_interned_now = got_first & (1 << inst_id) == 0;
 
-                if emit_interned_now {
-                    ctx.add_packet(|packet: &mut TracePacket| {
-                        packet.set_sequence_flags(
-                            TracePacketSequenceFlags::SeqIncrementalStateCleared as u32,
-                        );
-                        packet.set_interned_data(|interned: &mut InternedData| {
-                            // GPU context: use process as context (no CUDA ctx equivalent).
-                            interned
-                                .set_graphics_contexts(|gctx: &mut InternedGraphicsContext| {
-                                    gctx.set_iid(1);
-                                    gctx.set_pid(process_id);
-                                    gctx.set_api(InternedGraphicsContextApi::Hip);
-                                });
-                            // HW queue specs per distinct queue.
-                            for &queue_handle in &queues {
-                                let iid = (queue_handle & 0xFFFF) + AMD_HW_QUEUE_IID_OFFSET;
-                                interned.set_gpu_specifications(
-                                    |spec: &mut InternedGpuRenderStageSpecification| {
-                                        spec.set_iid(iid);
-                                        spec.set_name(format!("Queue ({})", queue_handle));
-                                        spec.set_category(
-                                            InternedGpuRenderStageSpecificationRenderStageCategory::Compute,
-                                        );
-                                    },
-                                );
-                            }
-                            // Kernel stage spec.
-                            interned.set_gpu_specifications(
-                                |spec: &mut InternedGpuRenderStageSpecification| {
-                                    spec.set_iid(AMD_KERNEL_STAGE_IID);
-                                    spec.set_name("Kernel");
-                                    spec.set_description("HIP Kernel");
-                                    spec.set_category(
-                                        InternedGpuRenderStageSpecificationRenderStageCategory::Compute,
-                                    );
-                                },
-                            );
-                            // Memory copy stage spec.
-                            interned.set_gpu_specifications(
-                                |spec: &mut InternedGpuRenderStageSpecification| {
-                                    spec.set_iid(AMD_MEMCPY_STAGE_IID);
-                                    spec.set_name("MemoryTransfer");
-                                    spec.set_description("HIP Memory Transfer");
-                                    spec.set_category(
-                                        InternedGpuRenderStageSpecificationRenderStageCategory::Other,
-                                    );
-                                },
-                            );
-                            // Memory set stage spec.
-                            interned.set_gpu_specifications(
-                                |spec: &mut InternedGpuRenderStageSpecification| {
-                                    spec.set_iid(AMD_MEMSET_STAGE_IID);
-                                    spec.set_name("MemorySet");
-                                    spec.set_description("HIP Memory Set");
-                                    spec.set_category(
-                                        InternedGpuRenderStageSpecificationRenderStageCategory::Other,
-                                    );
-                                },
-                            );
-                        });
-                    });
-                }
+                let mut events: Vec<PendingRenderStageEvent> = Vec::new();
 
-                // Emit kernel dispatch events.
+                // Kernel dispatch events.
                 for kd in state.kernel_dispatches[kd_start..].iter() {
                     let demangled =
                         perfetto_gpu_compute_injection::kernel::demangle_name(&kd.kernel_name);
@@ -259,59 +203,52 @@ impl GpuBackend for RocprofilerBackend {
                         0.0
                     };
                     let hw_queue_iid = (kd.queue_handle & 0xFFFF) + AMD_HW_QUEUE_IID_OFFSET;
-                    let duration_ns = kd.end_ns.saturating_sub(kd.start_ns);
-
-                    ctx.add_packet(|packet: &mut TracePacket| {
-                        packet
-                            .set_timestamp(kd.start_ns)
-                            .set_timestamp_clock_id(BuiltinClock::BuiltinClockBoottime.into())
-                            .set_gpu_render_stage_event(|event: &mut GpuRenderStageEvent| {
-                                event
-                                    .set_event_id(get_next_event_id())
-                                    .set_duration(duration_ns)
-                                    .set_gpu_id(kd.device_index)
-                                    .set_hw_queue_iid(hw_queue_iid)
-                                    .set_stage_iid(AMD_KERNEL_STAGE_IID)
-                                    .set_context(1)
-                                    .set_name(perfetto_gpu_compute_injection::kernel::simplify_name(&demangled));
-                                let extra_fields: &[(&str, String)] = &[
-                                    ("kernel_name", kd.kernel_name.clone()),
-                                    ("kernel_demangled_name", demangled.clone()),
-                                    ("kernel_type", "Compute".to_string()),
-                                    ("process_id", process_id.to_string()),
-                                    ("process_name", process_name.clone()),
-                                    ("device_id", kd.device_index.to_string()),
-                                    ("arch", kd.arch.clone()),
-                                    ("queue_id", kd.queue_handle.to_string()),
-                                    ("launch__grid_size", grid_size.to_string()),
-                                    ("launch__grid_size_x", kd.grid.0.to_string()),
-                                    ("launch__grid_size_y", kd.grid.1.to_string()),
-                                    ("launch__grid_size_z", kd.grid.2.to_string()),
-                                    ("launch__block_size", workgroup_size.to_string()),
-                                    ("launch__block_size_x", kd.workgroup.0.to_string()),
-                                    ("launch__block_size_y", kd.workgroup.1.to_string()),
-                                    ("launch__block_size_z", kd.workgroup.2.to_string()),
-                                    ("launch__thread_count", thread_count.to_string()),
-                                    (
-                                        "launch__waves_per_multiprocessor",
-                                        format!("{:.2}", waves_per_cu),
-                                    ),
-                                ];
-                                for (name, value) in extra_fields {
-                                    event.set_extra_data(
-                                        |ed: &mut GpuRenderStageEventExtraData| {
-                                            ed.set_name(*name);
-                                            ed.set_value(value.as_str());
-                                        },
-                                    );
-                                }
-                            });
+                    let extra_fields: Vec<(String, String)> = vec![
+                        ("kernel_name".to_string(), kd.kernel_name.clone()),
+                        ("kernel_demangled_name".to_string(), demangled.clone()),
+                        ("kernel_type".to_string(), "Compute".to_string()),
+                        ("process_id".to_string(), process_id.to_string()),
+                        ("process_name".to_string(), process_name.clone()),
+                        ("device_id".to_string(), kd.device_index.to_string()),
+                        ("arch".to_string(), kd.arch.clone()),
+                        ("queue_id".to_string(), kd.queue_handle.to_string()),
+                        ("launch__grid_size".to_string(), grid_size.to_string()),
+                        ("launch__grid_size_x".to_string(), kd.grid.0.to_string()),
+                        ("launch__grid_size_y".to_string(), kd.grid.1.to_string()),
+                        ("launch__grid_size_z".to_string(), kd.grid.2.to_string()),
+                        ("launch__block_size".to_string(), workgroup_size.to_string()),
+                        (
+                            "launch__block_size_x".to_string(),
+                            kd.workgroup.0.to_string(),
+                        ),
+                        (
+                            "launch__block_size_y".to_string(),
+                            kd.workgroup.1.to_string(),
+                        ),
+                        (
+                            "launch__block_size_z".to_string(),
+                            kd.workgroup.2.to_string(),
+                        ),
+                        ("launch__thread_count".to_string(), thread_count.to_string()),
+                        (
+                            "launch__waves_per_multiprocessor".to_string(),
+                            format!("{:.2}", waves_per_cu),
+                        ),
+                    ];
+                    events.push(PendingRenderStageEvent {
+                        start_ns: kd.start_ns,
+                        end_ns: kd.end_ns,
+                        gpu_id: kd.device_index,
+                        hw_queue_iid,
+                        stage_iid: AMD_KERNEL_STAGE_IID,
+                        name: perfetto_gpu_compute_injection::kernel::simplify_name(&demangled)
+                            .to_string(),
+                        extra_fields,
                     });
                 }
 
-                // Emit memory copy events.
+                // Memory copy events.
                 for mc in state.memcopies[mc_start..].iter() {
-                    let duration_ns = mc.end_ns.saturating_sub(mc.start_ns);
                     let memcpy_name = match mc.direction {
                         1 => "Memcpy HtoH",
                         2 => "Memcpy HtoD",
@@ -319,64 +256,138 @@ impl GpuBackend for RocprofilerBackend {
                         4 => "Memcpy DtoD",
                         _ => "Memcpy",
                     };
-                    ctx.add_packet(|packet: &mut TracePacket| {
-                        packet
-                            .set_timestamp(mc.start_ns)
-                            .set_timestamp_clock_id(BuiltinClock::BuiltinClockBoottime.into())
-                            .set_gpu_render_stage_event(|event: &mut GpuRenderStageEvent| {
-                                event
-                                    .set_event_id(get_next_event_id())
-                                    .set_duration(duration_ns)
-                                    .set_gpu_id(mc.device_index)
-                                    .set_hw_queue_iid(AMD_HW_QUEUE_IID_OFFSET)
-                                    .set_stage_iid(AMD_MEMCPY_STAGE_IID)
-                                    .set_context(1)
-                                    .set_name(memcpy_name);
-                                let extra_fields: &[(&str, String)] = &[
-                                    ("process_id", process_id.to_string()),
-                                    ("process_name", process_name.clone()),
-                                    ("device_id", mc.device_index.to_string()),
-                                    ("size_bytes", mc.bytes.to_string()),
-                                    ("direction", mc.direction.to_string()),
-                                ];
-                                for (name, value) in extra_fields {
-                                    event.set_extra_data(
-                                        |ed: &mut GpuRenderStageEventExtraData| {
-                                            ed.set_name(*name);
-                                            ed.set_value(value.as_str());
-                                        },
-                                    );
-                                }
-                            });
+                    let extra_fields: Vec<(String, String)> = vec![
+                        ("process_id".to_string(), process_id.to_string()),
+                        ("process_name".to_string(), process_name.clone()),
+                        ("device_id".to_string(), mc.device_index.to_string()),
+                        ("size_bytes".to_string(), mc.bytes.to_string()),
+                        ("direction".to_string(), mc.direction.to_string()),
+                    ];
+                    events.push(PendingRenderStageEvent {
+                        start_ns: mc.start_ns,
+                        end_ns: mc.end_ns,
+                        gpu_id: mc.device_index,
+                        hw_queue_iid: AMD_HW_QUEUE_IID_OFFSET,
+                        stage_iid: AMD_MEMCPY_STAGE_IID,
+                        name: memcpy_name.to_string(),
+                        extra_fields,
                     });
                 }
 
-                // Emit memory set events.
+                // Memory set events.
                 for ms in state.memsets[ms_start..].iter() {
-                    let duration_ns = ms.end_ns.saturating_sub(ms.start_ns);
+                    let extra_fields: Vec<(String, String)> = vec![
+                        ("process_id".to_string(), process_id.to_string()),
+                        ("process_name".to_string(), process_name.clone()),
+                        ("device_id".to_string(), ms.device_index.to_string()),
+                    ];
+                    events.push(PendingRenderStageEvent {
+                        start_ns: ms.start_ns,
+                        end_ns: ms.end_ns,
+                        gpu_id: ms.device_index,
+                        hw_queue_iid: AMD_HW_QUEUE_IID_OFFSET,
+                        stage_iid: AMD_MEMSET_STAGE_IID,
+                        name: "Memset".to_string(),
+                        extra_fields,
+                    });
+                }
+
+                let emitted = events.len();
+                injection_log!(
+                    "emitted {} AMD render stage events (instance {})",
+                    emitted,
+                    inst_id
+                );
+
+                (events, queues, emit_interned_now)
+                // state (GLOBAL_STATE lock) dropped here
+            };
+
+            // Phase 2: Emit collected events without holding GLOBAL_STATE.
+            // This prevents deadlock with buffer_callback which also needs GLOBAL_STATE.
+            let mut stop_guard_opt = stop_guard;
+            get_renderstages_data_source().trace(|ctx: &mut TraceContext| {
+                if ctx.instance_index() != inst_id {
+                    return;
+                }
+
+                if emit_interned_now {
+                    ctx.add_packet(|packet: &mut TracePacket| {
+                        packet.set_sequence_flags(
+                            TracePacketSequenceFlags::SeqIncrementalStateCleared as u32,
+                        );
+                        packet.set_interned_data(|interned: &mut InternedData| {
+                            interned
+                                .set_graphics_contexts(|gctx: &mut InternedGraphicsContext| {
+                                    gctx.set_iid(1);
+                                    gctx.set_pid(process_id);
+                                    gctx.set_api(InternedGraphicsContextApi::Hip);
+                                });
+                            for &queue_handle in &queues {
+                                let iid = (queue_handle & 0xFFFF) + AMD_HW_QUEUE_IID_OFFSET;
+                                interned.set_gpu_specifications(
+                                    |spec: &mut InternedGpuRenderStageSpecification| {
+                                        spec.set_iid(iid);
+                                        spec.set_name(format!("Queue ({})", queue_handle));
+                                        spec.set_category(
+                                            InternedGpuRenderStageSpecificationRenderStageCategory::Compute,
+                                        );
+                                    },
+                                );
+                            }
+                            interned.set_gpu_specifications(
+                                |spec: &mut InternedGpuRenderStageSpecification| {
+                                    spec.set_iid(AMD_KERNEL_STAGE_IID);
+                                    spec.set_name("Kernel");
+                                    spec.set_description("HIP Kernel");
+                                    spec.set_category(
+                                        InternedGpuRenderStageSpecificationRenderStageCategory::Compute,
+                                    );
+                                },
+                            );
+                            interned.set_gpu_specifications(
+                                |spec: &mut InternedGpuRenderStageSpecification| {
+                                    spec.set_iid(AMD_MEMCPY_STAGE_IID);
+                                    spec.set_name("MemoryTransfer");
+                                    spec.set_description("HIP Memory Transfer");
+                                    spec.set_category(
+                                        InternedGpuRenderStageSpecificationRenderStageCategory::Other,
+                                    );
+                                },
+                            );
+                            interned.set_gpu_specifications(
+                                |spec: &mut InternedGpuRenderStageSpecification| {
+                                    spec.set_iid(AMD_MEMSET_STAGE_IID);
+                                    spec.set_name("MemorySet");
+                                    spec.set_description("HIP Memory Set");
+                                    spec.set_category(
+                                        InternedGpuRenderStageSpecificationRenderStageCategory::Other,
+                                    );
+                                },
+                            );
+                        });
+                    });
+                }
+
+                for event in &events {
+                    let duration_ns = event.end_ns.saturating_sub(event.start_ns);
                     ctx.add_packet(|packet: &mut TracePacket| {
                         packet
-                            .set_timestamp(ms.start_ns)
+                            .set_timestamp(event.start_ns)
                             .set_timestamp_clock_id(BuiltinClock::BuiltinClockBoottime.into())
-                            .set_gpu_render_stage_event(|event: &mut GpuRenderStageEvent| {
-                                event
-                                    .set_event_id(get_next_event_id())
+                            .set_gpu_render_stage_event(|re: &mut GpuRenderStageEvent| {
+                                re.set_event_id(get_next_event_id())
                                     .set_duration(duration_ns)
-                                    .set_gpu_id(ms.device_index)
-                                    .set_hw_queue_iid(AMD_HW_QUEUE_IID_OFFSET)
-                                    .set_stage_iid(AMD_MEMSET_STAGE_IID)
+                                    .set_gpu_id(event.gpu_id)
+                                    .set_hw_queue_iid(event.hw_queue_iid)
+                                    .set_stage_iid(event.stage_iid)
                                     .set_context(1)
-                                    .set_name("Memset");
-                                let extra_fields: &[(&str, String)] = &[
-                                    ("process_id", process_id.to_string()),
-                                    ("process_name", process_name.clone()),
-                                    ("device_id", ms.device_index.to_string()),
-                                ];
-                                for (name, value) in extra_fields {
-                                    event.set_extra_data(
+                                    .set_name(&event.name);
+                                for (name, value) in &event.extra_fields {
+                                    re.set_extra_data(
                                         |ed: &mut GpuRenderStageEventExtraData| {
-                                            ed.set_name(*name);
-                                            ed.set_value(value.as_str());
+                                            ed.set_name(name);
+                                            ed.set_value(value);
                                         },
                                     );
                                 }
@@ -388,15 +399,6 @@ impl GpuBackend for RocprofilerBackend {
                 ctx.flush(move || drop(sg.take()));
             });
             drop(stop_guard_opt);
-
-            let emitted = state.kernel_dispatches.len().saturating_sub(kd_start)
-                + state.memcopies.len().saturating_sub(mc_start)
-                + state.memsets.len().saturating_sub(ms_start);
-            injection_log!(
-                "emitted {} AMD render stage events (instance {})",
-                emitted,
-                inst_id
-            );
         });
     }
 
@@ -599,37 +601,63 @@ impl GpuBackend for RocprofilerBackend {
 
     fn emit_counter_events_for_instance(&self, inst_id: u32, stop_guard: Option<StopGuard>) {
         let _ = panic::catch_unwind(|| {
-            let mut state = match GLOBAL_STATE.lock() {
-                Ok(s) => s,
-                Err(_) => return,
-            };
-            let start_offsets = if stop_guard.is_some() {
-                match state.counters_consumers.remove(&inst_id) {
-                    Some(o) => o,
-                    None => return,
-                }
-            } else {
-                match state.counters_consumers.get(&inst_id).cloned() {
-                    Some(o) => o,
-                    None => return,
-                }
-            };
-            let counter_names = state.counter_names.clone();
-            if counter_names.is_empty() {
-                return;
+            // Collected counter event data.
+            struct CollectedCounterEvent {
+                start_ns: u64,
+                end_ns: u64,
+                device_index: i32,
+                values: Vec<f64>,
             }
-            let cr_start = start_offsets.counter_results;
+
+            // Phase 1: Collect data under GLOBAL_STATE lock, then release.
+            let (collected_events, counter_names) = {
+                let mut state = match GLOBAL_STATE.lock() {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+                let start_offsets = if stop_guard.is_some() {
+                    match state.counters_consumers.remove(&inst_id) {
+                        Some(o) => o,
+                        None => return,
+                    }
+                } else {
+                    match state.counters_consumers.get(&inst_id).cloned() {
+                        Some(o) => o,
+                        None => return,
+                    }
+                };
+                let counter_names = state.counter_names.clone();
+                if counter_names.is_empty() {
+                    return;
+                }
+                let cr_start = start_offsets.counter_results;
+                let events: Vec<CollectedCounterEvent> = state.counter_results[cr_start..]
+                    .iter()
+                    .map(|r| CollectedCounterEvent {
+                        start_ns: r.start_ns,
+                        end_ns: r.end_ns,
+                        device_index: r.device_index,
+                        values: r.values.clone(),
+                    })
+                    .collect();
+                let emitted = events.len();
+                injection_log!("emitted {} counter events (instance {})", emitted, inst_id);
+                (events, counter_names)
+                // state (GLOBAL_STATE lock) dropped here
+            };
+
+            // Phase 2: Emit collected events without holding GLOBAL_STATE.
+            // This prevents deadlock with buffer_callback which also needs GLOBAL_STATE.
             let mut stop_guard_opt = stop_guard;
             get_counters_data_source().trace(|ctx: &mut TraceContext| {
                 if ctx.instance_index() != inst_id {
                     return;
                 }
-                for result in state.counter_results[cr_start..].iter() {
+                for result in &collected_events {
                     let gpu_id = result.device_index;
                     let got_first_counters =
                         GOT_FIRST_COUNTERS.fetch_or(1 << inst_id, Ordering::SeqCst);
                     if got_first_counters & (1 << inst_id) == 0 {
-                        // Descriptor packet (once per instance).
                         ctx.add_packet(|packet: &mut TracePacket| {
                             packet
                                 .set_timestamp(result.start_ns)
@@ -651,7 +679,6 @@ impl GpuBackend for RocprofilerBackend {
                                 });
                         });
                     }
-                    // Zero packet at start_ns.
                     ctx.add_packet(|packet: &mut TracePacket| {
                         packet
                             .set_timestamp(result.start_ns)
@@ -667,7 +694,6 @@ impl GpuBackend for RocprofilerBackend {
                                 }
                             });
                     });
-                    // Values packet at end_ns.
                     ctx.add_packet(|packet: &mut TracePacket| {
                         packet
                             .set_timestamp(result.end_ns)
@@ -690,8 +716,6 @@ impl GpuBackend for RocprofilerBackend {
                 ctx.flush(move || drop(sg.take()));
             });
             drop(stop_guard_opt);
-            let emitted = state.counter_results.len().saturating_sub(cr_start);
-            injection_log!("emitted {} counter events (instance {})", emitted, inst_id);
         });
     }
 

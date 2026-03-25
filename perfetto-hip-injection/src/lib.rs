@@ -154,7 +154,7 @@ impl GpuBackend for RocprofilerBackend {
                 extra_fields: Vec<(String, String)>,
             }
 
-            let (events, queues, emit_interned_now) = {
+            let (events, queues) = {
                 let mut state = match GLOBAL_STATE.lock() {
                     Ok(s) => s,
                     Err(_) => return,
@@ -179,9 +179,6 @@ impl GpuBackend for RocprofilerBackend {
                 for kd in state.kernel_dispatches[kd_start..].iter() {
                     queues.insert(kd.queue_handle);
                 }
-
-                let got_first = GOT_FIRST_RENDERSTAGES.fetch_or(1 << inst_id, Ordering::SeqCst);
-                let emit_interned_now = got_first & (1 << inst_id) == 0;
 
                 let mut events: Vec<PendingRenderStageEvent> = Vec::new();
 
@@ -299,7 +296,7 @@ impl GpuBackend for RocprofilerBackend {
                     inst_id
                 );
 
-                (events, queues, emit_interned_now)
+                (events, queues)
                 // state (GLOBAL_STATE lock) dropped here
             };
 
@@ -311,89 +308,107 @@ impl GpuBackend for RocprofilerBackend {
                     return;
                 }
 
-                if emit_interned_now {
-                    ctx.add_packet(|packet: &mut TracePacket| {
-                        packet.set_sequence_flags(
-                            TracePacketSequenceFlags::SeqIncrementalStateCleared as u32,
-                        );
-                        packet.set_interned_data(|interned: &mut InternedData| {
-                            interned
-                                .set_graphics_contexts(|gctx: &mut InternedGraphicsContext| {
-                                    gctx.set_iid(1);
-                                    gctx.set_pid(process_id);
-                                    gctx.set_api(InternedGraphicsContextApi::Hip);
-                                });
-                            for &queue_handle in &queues {
-                                let iid = (queue_handle & 0xFFFF) + AMD_HW_QUEUE_IID_OFFSET;
+                ctx.with_incremental_state(|ctx: &mut TraceContext, inc_state| {
+                    let was_cleared =
+                        std::mem::replace(&mut inc_state.was_cleared, false);
+                    let got_first =
+                        GOT_FIRST_RENDERSTAGES.fetch_or(1 << inst_id, Ordering::SeqCst);
+                    let emit_interned =
+                        was_cleared || got_first & (1 << inst_id) == 0;
+
+                    if emit_interned {
+                        ctx.add_packet(|packet: &mut TracePacket| {
+                            packet.set_sequence_flags(
+                                TracePacketSequenceFlags::SeqIncrementalStateCleared as u32,
+                            );
+                            packet.set_interned_data(|interned: &mut InternedData| {
+                                interned.set_graphics_contexts(
+                                    |gctx: &mut InternedGraphicsContext| {
+                                        gctx.set_iid(1);
+                                        gctx.set_pid(process_id);
+                                        gctx.set_api(InternedGraphicsContextApi::Hip);
+                                    },
+                                );
+                                for &queue_handle in &queues {
+                                    let iid =
+                                        (queue_handle & 0xFFFF) + AMD_HW_QUEUE_IID_OFFSET;
+                                    interned.set_gpu_specifications(
+                                        |spec: &mut InternedGpuRenderStageSpecification| {
+                                            spec.set_iid(iid);
+                                            spec.set_name(format!(
+                                                "Queue ({})",
+                                                queue_handle
+                                            ));
+                                            spec.set_category(
+                                                InternedGpuRenderStageSpecificationRenderStageCategory::Compute,
+                                            );
+                                        },
+                                    );
+                                }
                                 interned.set_gpu_specifications(
                                     |spec: &mut InternedGpuRenderStageSpecification| {
-                                        spec.set_iid(iid);
-                                        spec.set_name(format!("Queue ({})", queue_handle));
+                                        spec.set_iid(AMD_KERNEL_STAGE_IID);
+                                        spec.set_name("Kernel");
+                                        spec.set_description("HIP Kernel");
                                         spec.set_category(
                                             InternedGpuRenderStageSpecificationRenderStageCategory::Compute,
                                         );
                                     },
                                 );
-                            }
-                            interned.set_gpu_specifications(
-                                |spec: &mut InternedGpuRenderStageSpecification| {
-                                    spec.set_iid(AMD_KERNEL_STAGE_IID);
-                                    spec.set_name("Kernel");
-                                    spec.set_description("HIP Kernel");
-                                    spec.set_category(
-                                        InternedGpuRenderStageSpecificationRenderStageCategory::Compute,
-                                    );
-                                },
-                            );
-                            interned.set_gpu_specifications(
-                                |spec: &mut InternedGpuRenderStageSpecification| {
-                                    spec.set_iid(AMD_MEMCPY_STAGE_IID);
-                                    spec.set_name("MemoryTransfer");
-                                    spec.set_description("HIP Memory Transfer");
-                                    spec.set_category(
-                                        InternedGpuRenderStageSpecificationRenderStageCategory::Other,
-                                    );
-                                },
-                            );
-                            interned.set_gpu_specifications(
-                                |spec: &mut InternedGpuRenderStageSpecification| {
-                                    spec.set_iid(AMD_MEMSET_STAGE_IID);
-                                    spec.set_name("MemorySet");
-                                    spec.set_description("HIP Memory Set");
-                                    spec.set_category(
-                                        InternedGpuRenderStageSpecificationRenderStageCategory::Other,
-                                    );
-                                },
-                            );
-                        });
-                    });
-                }
-
-                for event in &events {
-                    let duration_ns = event.end_ns.saturating_sub(event.start_ns);
-                    ctx.add_packet(|packet: &mut TracePacket| {
-                        packet
-                            .set_timestamp(event.start_ns)
-                            .set_timestamp_clock_id(BuiltinClock::BuiltinClockBoottime.into())
-                            .set_gpu_render_stage_event(|re: &mut GpuRenderStageEvent| {
-                                re.set_event_id(get_next_event_id())
-                                    .set_duration(duration_ns)
-                                    .set_gpu_id(event.gpu_id)
-                                    .set_hw_queue_iid(event.hw_queue_iid)
-                                    .set_stage_iid(event.stage_iid)
-                                    .set_context(1)
-                                    .set_name(&event.name);
-                                for (name, value) in &event.extra_fields {
-                                    re.set_extra_data(
-                                        |ed: &mut GpuRenderStageEventExtraData| {
-                                            ed.set_name(name);
-                                            ed.set_value(value);
-                                        },
-                                    );
-                                }
+                                interned.set_gpu_specifications(
+                                    |spec: &mut InternedGpuRenderStageSpecification| {
+                                        spec.set_iid(AMD_MEMCPY_STAGE_IID);
+                                        spec.set_name("MemoryTransfer");
+                                        spec.set_description("HIP Memory Transfer");
+                                        spec.set_category(
+                                            InternedGpuRenderStageSpecificationRenderStageCategory::Other,
+                                        );
+                                    },
+                                );
+                                interned.set_gpu_specifications(
+                                    |spec: &mut InternedGpuRenderStageSpecification| {
+                                        spec.set_iid(AMD_MEMSET_STAGE_IID);
+                                        spec.set_name("MemorySet");
+                                        spec.set_description("HIP Memory Set");
+                                        spec.set_category(
+                                            InternedGpuRenderStageSpecificationRenderStageCategory::Other,
+                                        );
+                                    },
+                                );
                             });
-                    });
-                }
+                        });
+                    }
+
+                    for event in &events {
+                        let duration_ns = event.end_ns.saturating_sub(event.start_ns);
+                        ctx.add_packet(|packet: &mut TracePacket| {
+                            packet
+                                .set_timestamp(event.start_ns)
+                                .set_timestamp_clock_id(
+                                    BuiltinClock::BuiltinClockBoottime.into(),
+                                )
+                                .set_gpu_render_stage_event(
+                                    |re: &mut GpuRenderStageEvent| {
+                                        re.set_event_id(get_next_event_id())
+                                            .set_duration(duration_ns)
+                                            .set_gpu_id(event.gpu_id)
+                                            .set_hw_queue_iid(event.hw_queue_iid)
+                                            .set_stage_iid(event.stage_iid)
+                                            .set_context(1)
+                                            .set_name(&event.name);
+                                        for (name, value) in &event.extra_fields {
+                                            re.set_extra_data(
+                                                |ed: &mut GpuRenderStageEventExtraData| {
+                                                    ed.set_name(name);
+                                                    ed.set_value(value);
+                                                },
+                                            );
+                                        }
+                                    },
+                                );
+                        });
+                    }
+                });
 
                 let mut sg = Some(stop_guard_opt.take());
                 ctx.flush(move || drop(sg.take()));

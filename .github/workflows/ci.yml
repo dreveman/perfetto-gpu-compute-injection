@@ -58,13 +58,14 @@ jobs:
       run: |
           clang-format --dry-run --Werror -style=Google \
             perfetto-cuda-injection/stubs.cpp perfetto-cuda-injection/wrapper.h \
-            perfetto-hip-injection/stubs.cpp perfetto-hip-injection/wrapper.h
+            perfetto-hip-injection/stubs.cpp perfetto-hip-injection/wrapper.h \
+            perfetto-gpu-probes/stubs.cpp
 
     - name: Lint with Clippy
       run: cargo clippy --workspace --features stubs -- -D warnings
 
     - name: Run tests
-      run: cargo test --workspace --verbose -p perfetto-gpu-compute-injection -p perfetto-cuda-injection
+      run: cargo test --workspace --verbose -p perfetto-gpu-compute-injection -p perfetto-cuda-injection -p perfetto-gpu-probes
 
     - name: Run tests (with stubs)
       run: cargo test --workspace --verbose --features stubs

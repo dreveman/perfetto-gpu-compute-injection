@@ -11,6 +11,9 @@ cargo build --release -p perfetto-cuda-injection --features stubs
 # Build AMD backend with stubs (no ROCm required)
 cargo build --release -p perfetto-hip-injection --features stubs
 
+# Build GPU probes with stubs (no NVML required)
+cargo build --release -p perfetto-gpu-probes --features stubs
+
 # Build NVIDIA backend (requires CUDA toolkit)
 cargo build --release -p perfetto-cuda-injection
 
@@ -41,7 +44,8 @@ cargo fmt --all -- --check
 # Check C/C++ formatting (Google style)
 clang-format --dry-run --Werror -style=Google \
   perfetto-cuda-injection/stubs.cpp perfetto-cuda-injection/wrapper.h \
-  perfetto-hip-injection/stubs.cpp perfetto-hip-injection/wrapper.h
+  perfetto-hip-injection/stubs.cpp perfetto-hip-injection/wrapper.h \
+  perfetto-gpu-probes/stubs.cpp
 
 # Lint with Clippy (CI enforces -D warnings)
 cargo clippy --workspace --features stubs -- -D warnings
@@ -49,7 +53,7 @@ cargo clippy --workspace --features stubs -- -D warnings
 
 ## Architecture
 
-This is a 3-crate Cargo workspace that bridges GPU profiling APIs (NVIDIA CUPTI and AMD rocprofiler) with Perfetto tracing. Each backend injects into GPU applications to capture compute metrics.
+This is a 4-crate Cargo workspace that bridges GPU profiling APIs (NVIDIA CUPTI and AMD rocprofiler) with Perfetto tracing. Each backend injects into GPU applications to capture compute metrics. A separate probes crate provides global GPU counter polling via NVML.
 
 ### Crate Structure
 
@@ -76,6 +80,13 @@ This is a 3-crate Cargo workspace that bridges GPU profiling APIs (NVIDIA CUPTI 
   - `src/rocprofiler_sys/`: Low-level FFI bindings auto-generated via bindgen
   - `stubs.cpp`: C++ stub implementations for the `stubs` feature
   - `wrapper.h`: C header for bindgen input
+
+- **`perfetto-gpu-probes/`** — Global GPU counter polling service (rlib)
+  - `src/lib.rs`: Public API (`run()`), data source registration, signal handling
+  - `src/nvml.rs`: NVML FFI types, dlsym dispatch (or stubs linkage)
+  - `src/poller.rs`: GPU enumeration, polling loop, counter packet emission
+  - `stubs.cpp`: NVML stub implementations for the `stubs` feature
+  - `build.rs`: Stubs compilation
 
 ### Key Design: GpuBackend Trait
 

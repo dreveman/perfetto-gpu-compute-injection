@@ -3,5 +3,6 @@ members = [
     "perfetto-gpu-compute-injection",
     "perfetto-cuda-injection",
     "perfetto-hip-injection",
+    "perfetto-gpu-probes",
 ]
 resolver = "2"

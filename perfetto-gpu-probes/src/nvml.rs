@@ -42,8 +42,29 @@ pub type nvmlDeviceArchitecture_t = u32;
 /// NVML success return value.
 pub const NVML_SUCCESS: nvmlReturn_t = 0;
 
+/// NVML temperature sensor type.
+#[allow(non_camel_case_types)]
+pub type nvmlTemperatureSensors_t = u32;
+
+/// GPU temperature sensor.
+pub const NVML_TEMPERATURE_GPU: nvmlTemperatureSensors_t = 0;
+
+/// NVML utilization information.
+#[repr(C)]
+#[allow(non_camel_case_types)]
+pub struct nvmlUtilization_t {
+    pub gpu: u32,
+    pub memory: u32,
+}
+
 /// Graphics clock type.
 pub const NVML_CLOCK_GRAPHICS: nvmlClockType_t = 0;
+
+/// SM clock type.
+pub const NVML_CLOCK_SM: nvmlClockType_t = 1;
+
+/// Memory clock type.
+pub const NVML_CLOCK_MEM: nvmlClockType_t = 2;
 
 // Architecture constants.
 pub const NVML_DEVICE_ARCH_KEPLER: nvmlDeviceArchitecture_t = 2;
@@ -122,6 +143,16 @@ extern "C" {
         default_limit: *mut u32,
     ) -> nvmlReturn_t;
     pub fn nvmlDeviceGetNumGpuCores(device: nvmlDevice_t, num_cores: *mut u32) -> nvmlReturn_t;
+    pub fn nvmlDeviceGetTemperature(
+        device: nvmlDevice_t,
+        sensor_type: nvmlTemperatureSensors_t,
+        temp: *mut u32,
+    ) -> nvmlReturn_t;
+    pub fn nvmlDeviceGetPowerUsage(device: nvmlDevice_t, power: *mut u32) -> nvmlReturn_t;
+    pub fn nvmlDeviceGetUtilizationRates(
+        device: nvmlDevice_t,
+        utilization: *mut nvmlUtilization_t,
+    ) -> nvmlReturn_t;
 }
 
 // ---------------------------------------------------------------------------
@@ -233,6 +264,9 @@ mod runtime {
     dispatch_fn!(nvmlDeviceGetVbiosVersion(device: nvmlDevice_t, version: *mut c_char, length: u32) -> nvmlReturn_t);
     dispatch_fn!(nvmlDeviceGetPowerManagementDefaultLimit(device: nvmlDevice_t, default_limit: *mut u32) -> nvmlReturn_t);
     dispatch_fn!(nvmlDeviceGetNumGpuCores(device: nvmlDevice_t, num_cores: *mut u32) -> nvmlReturn_t);
+    dispatch_fn!(nvmlDeviceGetTemperature(device: nvmlDevice_t, sensor_type: nvmlTemperatureSensors_t, temp: *mut u32) -> nvmlReturn_t);
+    dispatch_fn!(nvmlDeviceGetPowerUsage(device: nvmlDevice_t, power: *mut u32) -> nvmlReturn_t);
+    dispatch_fn!(nvmlDeviceGetUtilizationRates(device: nvmlDevice_t, utilization: *mut nvmlUtilization_t) -> nvmlReturn_t);
 }
 
 #[cfg(not(feature = "stubs"))]

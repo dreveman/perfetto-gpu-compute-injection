@@ -216,6 +216,58 @@ impl PollableGpu for GpuInfo {
         }
         Some(mem.used)
     }
+    fn read_temperature(&self) -> Option<u32> {
+        let mut temp: u32 = 0;
+        let ret = unsafe {
+            nvml::nvmlDeviceGetTemperature(self.handle, nvml::NVML_TEMPERATURE_GPU, &mut temp)
+        };
+        if ret != nvml::NVML_SUCCESS {
+            return None;
+        }
+        Some(temp)
+    }
+    fn read_power_usage_mw(&self) -> Option<u32> {
+        let mut power: u32 = 0;
+        let ret = unsafe { nvml::nvmlDeviceGetPowerUsage(self.handle, &mut power) };
+        if ret != nvml::NVML_SUCCESS {
+            return None;
+        }
+        Some(power)
+    }
+    fn read_gpu_utilization(&self) -> Option<u32> {
+        let mut util = nvml::nvmlUtilization_t { gpu: 0, memory: 0 };
+        let ret = unsafe { nvml::nvmlDeviceGetUtilizationRates(self.handle, &mut util) };
+        if ret != nvml::NVML_SUCCESS {
+            return None;
+        }
+        Some(util.gpu)
+    }
+    fn read_mem_utilization(&self) -> Option<u32> {
+        let mut util = nvml::nvmlUtilization_t { gpu: 0, memory: 0 };
+        let ret = unsafe { nvml::nvmlDeviceGetUtilizationRates(self.handle, &mut util) };
+        if ret != nvml::NVML_SUCCESS {
+            return None;
+        }
+        Some(util.memory)
+    }
+    fn read_sm_clock(&self) -> Option<u32> {
+        let mut clock: u32 = 0;
+        let ret =
+            unsafe { nvml::nvmlDeviceGetClockInfo(self.handle, nvml::NVML_CLOCK_SM, &mut clock) };
+        if ret != nvml::NVML_SUCCESS {
+            return None;
+        }
+        Some(clock)
+    }
+    fn read_mem_clock(&self) -> Option<u32> {
+        let mut clock: u32 = 0;
+        let ret =
+            unsafe { nvml::nvmlDeviceGetClockInfo(self.handle, nvml::NVML_CLOCK_MEM, &mut clock) };
+        if ret != nvml::NVML_SUCCESS {
+            return None;
+        }
+        Some(clock)
+    }
 }
 
 /// Enumerates all GPUs via NVML.

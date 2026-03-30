@@ -35,7 +35,12 @@ typedef struct {
   char busId[32];
 } nvmlPciInfo_t;
 
-#define NVML_SUCCESS 0
+typedef struct {
+  unsigned int gpu;
+  unsigned int memory;
+} nvmlUtilization_t;
+
+typedef unsigned int nvmlTemperatureSensors_t;
 
 // Stub storage: 2 fake GPUs.
 static void* stub_devices[2] = {(void*)0x1, (void*)0x2};
@@ -60,8 +65,17 @@ nvmlReturn_t nvmlDeviceGetHandleByIndex_v2(unsigned int index,
 nvmlReturn_t nvmlDeviceGetClockInfo(nvmlDevice_t device, nvmlClockType_t type_,
                                     unsigned int* clock) {
   (void)device;
-  (void)type_;
-  *clock = 1500;
+  switch (type_) {
+    case 1:
+      *clock = 1500;
+      break;  // SM clock
+    case 2:
+      *clock = 1200;
+      break;  // Memory clock
+    default:
+      *clock = 1500;
+      break;  // Graphics clock
+  }
   return NVML_SUCCESS;
 }
 
@@ -161,6 +175,29 @@ nvmlReturn_t nvmlDeviceGetNumGpuCores(nvmlDevice_t device,
                                       unsigned int* numCores) {
   (void)device;
   *numCores = 8192;
+  return NVML_SUCCESS;
+}
+
+nvmlReturn_t nvmlDeviceGetTemperature(nvmlDevice_t device,
+                                      nvmlTemperatureSensors_t sensorType,
+                                      unsigned int* temp) {
+  (void)device;
+  (void)sensorType;
+  *temp = 65;
+  return NVML_SUCCESS;
+}
+
+nvmlReturn_t nvmlDeviceGetPowerUsage(nvmlDevice_t device, unsigned int* power) {
+  (void)device;
+  *power = 150000;  // milliwatts
+  return NVML_SUCCESS;
+}
+
+nvmlReturn_t nvmlDeviceGetUtilizationRates(nvmlDevice_t device,
+                                           nvmlUtilization_t* utilization) {
+  (void)device;
+  utilization->gpu = 45;
+  utilization->memory = 30;
   return NVML_SUCCESS;
 }
 

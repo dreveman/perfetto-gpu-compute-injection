@@ -173,6 +173,74 @@ fn parse_pp_dpm_sclk(content: &str) -> Option<u32> {
     None
 }
 
+/// Finds the hwmon directory for an AMD GPU device.
+///
+/// Scans `<card_path>/hwmon/` for the first `hwmon*` entry.
+fn find_hwmon_dir(gpu: &AmdGpuInfo) -> Option<PathBuf> {
+    let hwmon_base = gpu.card_path.join("hwmon");
+    let entries = std::fs::read_dir(&hwmon_base).ok()?;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if name.to_string_lossy().starts_with("hwmon") {
+            return Some(entry.path());
+        }
+    }
+    None
+}
+
+/// Reads the current GPU temperature in degrees Celsius.
+///
+/// Reads `hwmon/hwmon*/temp1_input` which reports millidegrees C.
+pub fn read_gpu_temperature(gpu: &AmdGpuInfo) -> Option<u32> {
+    let hwmon = find_hwmon_dir(gpu)?;
+    let millideg: u32 = std::fs::read_to_string(hwmon.join("temp1_input"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    Some(millideg / 1000)
+}
+
+/// Reads the current GPU power usage in milliwatts.
+///
+/// Reads `hwmon/hwmon*/power1_average` which reports microwatts.
+pub fn read_gpu_power_usage_mw(gpu: &AmdGpuInfo) -> Option<u32> {
+    let hwmon = find_hwmon_dir(gpu)?;
+    let microwatts: u64 = std::fs::read_to_string(hwmon.join("power1_average"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    Some((microwatts / 1000) as u32)
+}
+
+/// Reads the current GPU utilization as a percentage (0-100).
+pub fn read_gpu_utilization(gpu: &AmdGpuInfo) -> Option<u32> {
+    std::fs::read_to_string(gpu.card_path.join("gpu_busy_percent"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// Reads the current memory utilization as a percentage (0-100).
+pub fn read_mem_utilization(gpu: &AmdGpuInfo) -> Option<u32> {
+    std::fs::read_to_string(gpu.card_path.join("mem_busy_percent"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// Reads the current memory clock frequency in MHz from `pp_dpm_mclk`.
+///
+/// Uses the same DPM state format as `pp_dpm_sclk`.
+pub fn read_gpu_mem_clock(gpu: &AmdGpuInfo) -> Option<u32> {
+    let path = gpu.card_path.join("pp_dpm_mclk");
+    let content = std::fs::read_to_string(path).ok()?;
+    parse_pp_dpm_sclk(&content)
+}
+
 /// Reads the current GPU memory usage in bytes from `mem_info_vram_used`.
 pub fn read_gpu_memory_used(gpu: &AmdGpuInfo) -> Option<u64> {
     let path = gpu.card_path.join("mem_info_vram_used");
@@ -371,5 +439,91 @@ mod tests {
             read_gpu_frequency_from(Path::new("/nonexistent/pp_dpm_sclk")),
             None
         );
+    }
+
+    /// Creates a mock AmdGpuInfo pointing at a temporary device directory.
+    fn create_mock_gpu(base: &Path) -> AmdGpuInfo {
+        let device_dir = base.join("device");
+        fs::create_dir_all(&device_dir).unwrap();
+        AmdGpuInfo {
+            index: 0,
+            card_path: device_dir,
+            name: "Test GPU".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_read_gpu_temperature() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gpu = create_mock_gpu(tmp.path());
+        let hwmon_dir = gpu.card_path.join("hwmon").join("hwmon0");
+        fs::create_dir_all(&hwmon_dir).unwrap();
+        fs::write(hwmon_dir.join("temp1_input"), "65000\n").unwrap();
+
+        assert_eq!(read_gpu_temperature(&gpu), Some(65));
+    }
+
+    #[test]
+    fn test_read_gpu_temperature_no_hwmon() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gpu = create_mock_gpu(tmp.path());
+        assert_eq!(read_gpu_temperature(&gpu), None);
+    }
+
+    #[test]
+    fn test_read_gpu_power_usage_mw() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gpu = create_mock_gpu(tmp.path());
+        let hwmon_dir = gpu.card_path.join("hwmon").join("hwmon0");
+        fs::create_dir_all(&hwmon_dir).unwrap();
+        // 150W = 150_000_000 µW = 150_000 mW
+        fs::write(hwmon_dir.join("power1_average"), "150000000\n").unwrap();
+
+        assert_eq!(read_gpu_power_usage_mw(&gpu), Some(150_000));
+    }
+
+    #[test]
+    fn test_read_gpu_utilization() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gpu = create_mock_gpu(tmp.path());
+        fs::write(gpu.card_path.join("gpu_busy_percent"), "45\n").unwrap();
+
+        assert_eq!(read_gpu_utilization(&gpu), Some(45));
+    }
+
+    #[test]
+    fn test_read_gpu_utilization_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gpu = create_mock_gpu(tmp.path());
+        assert_eq!(read_gpu_utilization(&gpu), None);
+    }
+
+    #[test]
+    fn test_read_mem_utilization() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gpu = create_mock_gpu(tmp.path());
+        fs::write(gpu.card_path.join("mem_busy_percent"), "30\n").unwrap();
+
+        assert_eq!(read_mem_utilization(&gpu), Some(30));
+    }
+
+    #[test]
+    fn test_read_gpu_mem_clock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gpu = create_mock_gpu(tmp.path());
+        fs::write(
+            gpu.card_path.join("pp_dpm_mclk"),
+            "0: 500Mhz\n1: 1200Mhz *\n",
+        )
+        .unwrap();
+
+        assert_eq!(read_gpu_mem_clock(&gpu), Some(1200));
+    }
+
+    #[test]
+    fn test_read_gpu_mem_clock_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gpu = create_mock_gpu(tmp.path());
+        assert_eq!(read_gpu_mem_clock(&gpu), None);
     }
 }

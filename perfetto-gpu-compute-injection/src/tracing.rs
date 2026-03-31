@@ -18,6 +18,9 @@ use libc::{clock_gettime, timespec};
 use perfetto_sdk::data_source::{
     DataSource, DataSourceArgsBuilder, DataSourceBufferExhaustedPolicy, StopGuard,
 };
+use perfetto_sdk::pb_decoder::{PbDecoder, PbDecoderField};
+use perfetto_sdk_protos_gpu::protos::config::data_source_config::DataSourceConfigExtFieldNumber;
+use perfetto_sdk_protos_gpu::protos::config::gpu::gpu_counter_config::GpuCounterConfigFieldNumber;
 use std::sync::{
     atomic::{AtomicU64, AtomicU8, Ordering},
     Condvar, Mutex, OnceLock,
@@ -121,6 +124,14 @@ static COUNTERS_ACTIVE_MASK: AtomicU8 = AtomicU8::new(0);
 /// Non-zero means at least one renderstages consumer is running.
 static RENDERSTAGES_ACTIVE_MASK: AtomicU8 = AtomicU8::new(0);
 
+/// Bitmask of instances whose config had `instrumented_sampling: true` (set in on_setup).
+static INSTRUMENTED_SETUP_MASK: AtomicU8 = AtomicU8::new(0);
+
+/// Bitmask of currently active instances with instrumented sampling enabled.
+/// A subset of `COUNTERS_ACTIVE_MASK` — only instances where the consumer requested
+/// `instrumented_sampling: true` in `GpuCounterConfig`.
+static INSTRUMENTED_ACTIVE_MASK: AtomicU8 = AtomicU8::new(0);
+
 /// Condvar flag for waiting on counters data source to start.
 static COUNTERS_STARTED: (Mutex<bool>, Condvar) = (Mutex::new(false), Condvar::new());
 
@@ -193,6 +204,39 @@ pub fn get_counters_data_source() -> &'static DataSource<'static> {
         let data_source_args = DataSourceArgsBuilder::new()
             .buffer_exhausted_policy(DataSourceBufferExhaustedPolicy::StallAndAbort)
             .will_notify_on_stop(true)
+            .on_setup(move |inst_id, config, _| {
+                // Parse DataSourceConfig for gpu_counter_config, then instrumented_sampling.
+                const GPU_COUNTER_CONFIG_FIELD: u32 =
+                    DataSourceConfigExtFieldNumber::GpuCounterConfig as u32;
+                const INSTRUMENTED_SAMPLING_FIELD: u32 =
+                    GpuCounterConfigFieldNumber::InstrumentedSampling as u32;
+                let mut instrumented = false;
+                for item in PbDecoder::new(config) {
+                    if let Ok((
+                        GPU_COUNTER_CONFIG_FIELD,
+                        PbDecoderField::Delimited(gpu_counter_bytes),
+                    )) = item
+                    {
+                        for sub_item in PbDecoder::new(gpu_counter_bytes) {
+                            if let Ok((INSTRUMENTED_SAMPLING_FIELD, PbDecoderField::Varint(v))) =
+                                sub_item
+                            {
+                                instrumented = v != 0;
+                            }
+                        }
+                    }
+                }
+                if instrumented {
+                    INSTRUMENTED_SETUP_MASK.fetch_or(1 << inst_id, Ordering::SeqCst);
+                } else {
+                    INSTRUMENTED_SETUP_MASK.fetch_and(!(1 << inst_id), Ordering::SeqCst);
+                }
+                injection_log!(
+                    "counters data source setup (instance {}): instrumented_sampling={}",
+                    inst_id,
+                    instrumented
+                );
+            })
             .on_start(move |inst_id, _| {
                 GOT_FIRST_COUNTERS.fetch_and(!(1 << inst_id), Ordering::SeqCst);
                 let prev = COUNTERS_ACTIVE_MASK.fetch_or(1 << inst_id, Ordering::SeqCst);
@@ -202,9 +246,15 @@ pub fn get_counters_data_source() -> &'static DataSource<'static> {
                     // Transitioning from no consumers at all: enable base activities.
                     backend().on_first_consumer_start();
                 }
-                if prev == 0 {
-                    // First counters consumer: disable MEMSET to avoid Range Profiler conflict.
-                    backend().on_first_counters_start();
+                let instrumented =
+                    INSTRUMENTED_SETUP_MASK.load(Ordering::SeqCst) & (1 << inst_id) != 0;
+                if instrumented {
+                    let prev_instr =
+                        INSTRUMENTED_ACTIVE_MASK.fetch_or(1 << inst_id, Ordering::SeqCst);
+                    if prev_instr == 0 {
+                        // First instrumented consumer: configure range profiling.
+                        backend().on_first_counters_start();
+                    }
                 }
                 injection_log!("counters data source started (instance {})", inst_id);
                 let (lock, cvar) = &COUNTERS_STARTED;
@@ -215,7 +265,12 @@ pub fn get_counters_data_source() -> &'static DataSource<'static> {
                 let stop_guard = args.postpone();
                 let prev = COUNTERS_ACTIVE_MASK.fetch_and(!(1 << inst_id), Ordering::SeqCst);
                 let remaining = prev & !(1 << inst_id);
-                if remaining == 0 && is_renderstages_enabled() {
+                let was_instrumented = INSTRUMENTED_ACTIVE_MASK
+                    .fetch_and(!(1 << inst_id), Ordering::SeqCst)
+                    & (1 << inst_id)
+                    != 0;
+                INSTRUMENTED_SETUP_MASK.fetch_and(!(1 << inst_id), Ordering::SeqCst);
+                if remaining == 0 && is_renderstages_enabled() && was_instrumented {
                     // Last counters consumer stopped while renderstages still runs:
                     // re-enable MEMSET now that there is no Range Profiler conflict.
                     backend().on_last_counters_stop();
@@ -228,10 +283,12 @@ pub fn get_counters_data_source() -> &'static DataSource<'static> {
                     if !is_counters_enabled() && !is_renderstages_enabled() {
                         // All consumers gone: full teardown (flush + finalize).
                         backend().run_teardown();
-                    } else if !is_counters_enabled() {
+                    } else if !is_counters_enabled() && !is_instrumented_enabled() {
                         // Last counters consumer stopped; renderstages still running.
-                        // Finalize the range profiler without disabling activities.
-                        backend().finalize_range_profiler();
+                        // Only finalize range profiler if instrumented sampling was active.
+                        if was_instrumented {
+                            backend().finalize_range_profiler();
+                        }
                     }
                     // else: other counters consumers still running; no finalization needed.
                     backend().emit_counter_events_for_instance(inst_id, Some(stop_guard));
@@ -340,6 +397,13 @@ pub fn get_renderstages_data_source() -> &'static DataSource<'static> {
 /// Returns true if at least one counters data source consumer is currently active.
 pub fn is_counters_enabled() -> bool {
     COUNTERS_ACTIVE_MASK.load(Ordering::SeqCst) != 0
+}
+
+/// Returns true if at least one counters consumer with `instrumented_sampling: true` is active.
+///
+/// When false, the backends should skip range profiling / dispatch counting to avoid overhead.
+pub fn is_instrumented_enabled() -> bool {
+    INSTRUMENTED_ACTIVE_MASK.load(Ordering::SeqCst) != 0
 }
 
 /// Returns true if at least one renderstages data source consumer is currently active.

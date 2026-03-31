@@ -16,7 +16,7 @@ use crate::cupti_profiler::{self as profiler, *};
 use crate::perfetto_te_ns;
 use crate::state::{KernelActivity, KernelLaunch, MemcpyActivity, MemsetActivity, GLOBAL_STATE};
 use libc::c_void;
-use perfetto_gpu_compute_injection::tracing::{is_counters_enabled, trace_time_ns};
+use perfetto_gpu_compute_injection::tracing::{is_instrumented_enabled, trace_time_ns};
 use perfetto_gpu_compute_injection::{injection_fatal, injection_log};
 use perfetto_sdk::track_event::{
     EventContext, TrackEventTimestamp, TrackEventTrack, TrackEventType,
@@ -241,7 +241,7 @@ pub unsafe extern "C" fn profiler_callback_handler(
         if res != CUptiResult_CUPTI_SUCCESS {
             return;
         }
-        let counters_enabled = is_counters_enabled();
+        let instrumented = is_instrumented_enabled();
         if domain == CUpti_CallbackDomain_CUPTI_CB_DOMAIN_DRIVER_API
             && cbid == CUpti_driver_api_trace_cbid_enum_CUPTI_DRIVER_TRACE_CBID_cuLaunchKernel
         {
@@ -251,8 +251,8 @@ pub unsafe extern "C" fn profiler_callback_handler(
             if cb_data.callbackSite == CUpti_ApiCallbackSite_CUPTI_API_ENTER {
                 if let Ok(mut state) = GLOBAL_STATE.lock() {
                     let active_ctx = state.active_ctx;
-                    // Only manage range profiler sessions when counters are enabled
-                    if counters_enabled {
+                    // Only manage range profiler sessions when instrumented sampling is enabled
+                    if instrumented {
                         match active_ctx {
                             Some(active_ctx) if active_ctx != ctx => {
                                 let active_ctx_id = unsafe { profiler::get_context_id(active_ctx) };
@@ -270,7 +270,7 @@ pub unsafe extern "C" fn profiler_callback_handler(
                         state.active_ctx = Some(ctx);
                         if let Some(data) = state.context_data.get_mut(&ctx_id) {
                             // Initialize range profiler if not yet done
-                            if counters_enabled && data.range_profiler.is_none() {
+                            if instrumented && data.range_profiler.is_none() {
                                 let mut rp = RangeProfiler::new(ctx);
                                 if rp.enable().is_ok()
                                     && rp
@@ -287,7 +287,7 @@ pub unsafe extern "C" fn profiler_callback_handler(
                                 }
                             }
                             // Start profiling pass and push range for this kernel launch
-                            if counters_enabled {
+                            if instrumented {
                                 if let Some(rp) = &data.range_profiler {
                                     let _ = rp.start();
                                     // Push a range so the profiler records counter data.
@@ -326,7 +326,7 @@ pub unsafe extern "C" fn profiler_callback_handler(
                                 function: params.f,
                                 start,
                                 end: 0, // Will be set in API_EXIT when profiler completes
-                                profiled: counters_enabled,
+                                profiled: instrumented,
                                 cache_mode,
                                 max_active_blocks_per_sm,
                             });
@@ -335,7 +335,7 @@ pub unsafe extern "C" fn profiler_callback_handler(
                 }
             } else if cb_data.callbackSite == CUpti_ApiCallbackSite_CUPTI_API_EXIT {
                 // Handle kernel launch completion - decode profiler data and set end timestamp
-                if counters_enabled {
+                if instrumented {
                     if let Ok(mut state) = GLOBAL_STATE.lock() {
                         let ctx_id = unsafe { profiler::get_context_id(ctx) };
                         if let Some(data) = state.context_data.get_mut(&ctx_id) {
@@ -371,8 +371,8 @@ pub unsafe extern "C" fn profiler_callback_handler(
                 let res_data = &*(cbdata as *const CUpti_ResourceData);
                 let ctx = res_data.context;
                 if let Ok(mut state) = GLOBAL_STATE.lock() {
-                    // Only manage active context's range profiler when counters are enabled
-                    if counters_enabled {
+                    // Only manage active context's range profiler when instrumented sampling is enabled
+                    if instrumented {
                         if let Some(active_ctx) = state.active_ctx {
                             let active_ctx_id = unsafe { profiler::get_context_id(active_ctx) };
                             if let Some(data) = state.context_data.get_mut(&active_ctx_id) {
@@ -446,9 +446,9 @@ pub unsafe extern "C" fn profiler_callback_handler(
                         memcpy_activities: Vec::new(),
                         memset_activities: Vec::new(),
                     });
-                    // Only initialize profiler and metric evaluator when counters are enabled
+                    // Only initialize profiler and metric evaluator when instrumented sampling is enabled
                     // Otherwise, just track context data for renderstages
-                    if counters_enabled {
+                    if instrumented {
                         if Profiler::initialize().is_ok() {
                             if let Ok(me) = unsafe { MetricEvaluator::new(ctx) } {
                                 data.metric_evaluator = Some(me);

@@ -20,7 +20,14 @@
 use crate::perfetto_dlog;
 use crate::perfetto_elog;
 use crate::protos::trace::trace_packet::prelude::*;
-use libc::{clock_gettime, timespec, CLOCK_BOOTTIME};
+use libc::{clock_gettime, timespec};
+
+/// Clock ID for timestamps. Use `CLOCK_BOOTTIME` on Linux (includes suspend
+/// time, matching Perfetto's default), fall back to `CLOCK_MONOTONIC` elsewhere.
+#[cfg(target_os = "linux")]
+const TRACE_CLOCK_ID: libc::clockid_t = libc::CLOCK_BOOTTIME;
+#[cfg(not(target_os = "linux"))]
+const TRACE_CLOCK_ID: libc::clockid_t = libc::CLOCK_MONOTONIC;
 use perfetto_sdk::data_source::{DataSource, TraceContext};
 use perfetto_sdk::protos::trace::trace_packet::TracePacket;
 use perfetto_sdk_protos_gpu::protos::{
@@ -106,13 +113,13 @@ impl InstanceStop {
     }
 }
 
-/// Returns the current timestamp in nanoseconds from `CLOCK_BOOTTIME`.
+/// Returns the current timestamp in nanoseconds from the trace clock.
 pub(crate) fn trace_time_ns() -> u64 {
     let mut ts = timespec {
         tv_sec: 0,
         tv_nsec: 0,
     };
-    let ret = unsafe { clock_gettime(CLOCK_BOOTTIME, &mut ts) };
+    let ret = unsafe { clock_gettime(TRACE_CLOCK_ID, &mut ts) };
     if ret != 0 {
         return 0;
     }

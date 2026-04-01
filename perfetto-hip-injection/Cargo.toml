@@ -1,6 +1,6 @@
 [package]
 name = "perfetto-hip-injection"
-version = "0.4.8"
+version = "0.4.9"
 edition = "2021"
 build = "build.rs"
 authors = ["David Reveman <reveman@meta.com>"]

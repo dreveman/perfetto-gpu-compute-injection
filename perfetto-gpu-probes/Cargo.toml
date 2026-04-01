@@ -1,6 +1,6 @@
 [package]
 name = "perfetto-gpu-probes"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 authors = ["David Reveman <reveman@meta.com>"]
 description = "Perfetto GPU Probes — global GPU counter polling service"

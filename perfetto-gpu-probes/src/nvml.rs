@@ -203,6 +203,10 @@ mod runtime {
     const NVML_ERROR_UNINITIALIZED: nvmlReturn_t = 1;
 
     /// Initializes NVML by loading `libnvidia-ml.so.1` and calling `nvmlInit_v2`.
+    ///
+    /// # Safety
+    ///
+    /// Must be called before any other NVML functions.
     #[allow(non_snake_case)]
     pub unsafe fn nvmlInit_v2() -> nvmlReturn_t {
         if get_nvml_handle().is_null() {
@@ -216,6 +220,12 @@ mod runtime {
         (
             $fn_name:ident ( $($arg_name:ident : $arg_ty:ty),* $(,)? ) -> $ret_ty:ty
         ) => {
+            /// Dynamically dispatched NVML function.
+            ///
+            /// # Safety
+            ///
+            /// Caller must uphold the NVML C API contract for this function
+            /// (valid handles, non-null out-pointers, etc.).
             #[allow(non_snake_case)]
             pub unsafe fn $fn_name ( $($arg_name: $arg_ty),* ) -> $ret_ty {
                 static CACHE: OnceLock<Option<usize>> = OnceLock::new();

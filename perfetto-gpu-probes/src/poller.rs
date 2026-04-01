@@ -28,6 +28,13 @@ use libc::{clock_gettime, timespec};
 const TRACE_CLOCK_ID: libc::clockid_t = libc::CLOCK_BOOTTIME;
 #[cfg(not(target_os = "linux"))]
 const TRACE_CLOCK_ID: libc::clockid_t = libc::CLOCK_MONOTONIC;
+
+/// Perfetto builtin clock ID corresponding to `TRACE_CLOCK_ID`.
+/// See `perfetto/common/builtin_clock.proto`.
+#[cfg(target_os = "linux")]
+const PERFETTO_CLOCK_ID: u32 = 6; // BUILTIN_CLOCK_BOOTTIME
+#[cfg(not(target_os = "linux"))]
+const PERFETTO_CLOCK_ID: u32 = 3; // BUILTIN_CLOCK_MONOTONIC
 use perfetto_sdk::data_source::{DataSource, TraceContext};
 use perfetto_sdk::protos::trace::trace_packet::TracePacket;
 use perfetto_sdk_protos_gpu::protos::{
@@ -39,7 +46,7 @@ use perfetto_sdk_protos_gpu::protos::{
     trace::system_info::gpu_info::{GpuInfo, GpuInfoGpu},
     trace::trace_packet::prelude::TracePacketExt as GpuTracePacketExt,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::Duration;
@@ -71,12 +78,6 @@ pub(crate) trait PollableGpu {
         None
     }
     fn read_mem_utilization(&self) -> Option<u32> {
-        None
-    }
-    fn read_sm_clock(&self) -> Option<u32> {
-        None
-    }
-    fn read_mem_clock(&self) -> Option<u32> {
         None
     }
 }
@@ -145,6 +146,8 @@ struct MemSample {
 /// expects kHz, so we multiply by 1000.
 fn emit_ftrace_gpu_frequency(ctx: &mut TraceContext, samples: &[FreqSample], timestamp: u64) {
     ctx.add_packet(|packet: &mut TracePacket| {
+        packet.set_timestamp(timestamp);
+        packet.set_timestamp_clock_id(PERFETTO_CLOCK_ID);
         packet.set_ftrace_events(|bundle| {
             bundle.set_cpu(0);
             for s in samples {
@@ -167,6 +170,8 @@ fn emit_ftrace_gpu_frequency(ctx: &mut TraceContext, samples: &[FreqSample], tim
 /// Uses pid=0 (global total). Size is in bytes.
 fn emit_ftrace_gpu_mem_total(ctx: &mut TraceContext, samples: &[MemSample], timestamp: u64) {
     ctx.add_packet(|packet: &mut TracePacket| {
+        packet.set_timestamp(timestamp);
+        packet.set_timestamp_clock_id(PERFETTO_CLOCK_ID);
         packet.set_ftrace_events(|bundle| {
             bundle.set_cpu(0);
             for s in samples {
@@ -185,36 +190,89 @@ fn emit_ftrace_gpu_mem_total(ctx: &mut TraceContext, samples: &[MemSample], time
 }
 
 /// Counter identifier for a specific GPU counter.
+///
+/// # Multi-GPU counter_id workaround (mode 1 / legacy inline descriptors)
+///
+/// The `GpuCounterEvent` proto supports two descriptor modes:
+///
+///   **Mode 1** — inline `counter_descriptor` on the event itself.
+///   **Mode 2** — `counter_descriptor_iid` referencing an `InternedGpuCounterDescriptor`
+///                in `InternedData` (field 47), which carries its own `gpu_id`.
+///
+/// Mode 2 is the correct solution for multi-GPU: each GPU gets its own interned
+/// descriptor with a distinct `gpu_id`, and the trace processor keys its state
+/// by `TrackId` (derived from `(ugpu, gpu_id, name)`), so counter_ids can be
+/// reused across GPUs without collision.
+///
+/// However, the Rust SDK (`perfetto-sdk-protos-gpu`) does not yet expose the
+/// `gpu_counter_descriptors` field (proto field 47) on `InternedData`, so we
+/// cannot use mode 2 yet.
+///
+/// In mode 1, the trace processor (`gpu_event_parser.cc`) maintains a flat
+/// `gpu_counter_state_` map keyed by `counter_id` alone — there is no `gpu_id`
+/// in the key. When a descriptor is present, it calls
+/// `InternGpuCounterTrack(event.gpu_id(), spec)` to create a track with the
+/// correct GPU association. But on subsequent events (without a descriptor), it
+/// looks up the `TrackId` solely via `gpu_counter_state_[counter_id]`. If two
+/// GPUs share the same counter_id, the second GPU's descriptor overwrites the
+/// first GPU's mapping, and all subsequent samples land on one GPU's track.
+///
+/// **Workaround**: we assign globally unique counter_ids per GPU by computing
+/// `counter_id = gpu_index * NUM_COUNTER_KINDS + base_id`. Each GPU's first
+/// `GpuCounterEvent` includes an inline `counter_descriptor` with that GPU's
+/// counter_ids. The trace processor creates separate tracks per GPU because:
+///   1. Each GPU has distinct counter_ids, avoiding `gpu_counter_state_` collisions.
+///   2. `event.gpu_id()` is set correctly, so `InternGpuCounterTrack` associates
+///      the tracks with the right GPU in the track hierarchy.
+///   3. Counter names remain identical across GPUs ("Temperature", "Power", etc.)
+///      — the trace processor distinguishes tracks via `(ugpu, gpu_id, name)`.
+///
+/// **TODO**: Switch to mode 2 (interned descriptors via `counter_descriptor_iid`
+/// and `InternedGpuCounterDescriptor`) once the `gpu_counter_descriptors` field
+/// is available in `perfetto-sdk-protos-gpu`'s `InternedData` extension. At that
+/// point, counter_ids can go back to a simple 1-based enum and the per-GPU
+/// spacing logic below can be removed.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum CounterKind {
     Temperature,
     PowerW,
-    GpuUtilization,
+    Utilization,
     MemUtilization,
-    SmClock,
-    MemClock,
 }
 
+const ALL_COUNTER_KINDS: [CounterKind; 4] = [
+    CounterKind::Temperature,
+    CounterKind::PowerW,
+    CounterKind::Utilization,
+    CounterKind::MemUtilization,
+];
+
+const NUM_COUNTER_KINDS: u32 = ALL_COUNTER_KINDS.len() as u32;
+
 impl CounterKind {
-    fn counter_id(&self) -> u32 {
+    fn base_id(&self) -> u32 {
         match self {
             Self::Temperature => 1,
             Self::PowerW => 2,
-            Self::GpuUtilization => 3,
+            Self::Utilization => 3,
             Self::MemUtilization => 4,
-            Self::SmClock => 5,
-            Self::MemClock => 6,
         }
+    }
+
+    /// Returns a counter_id unique per (gpu_index, kind) pair.
+    ///
+    /// See the module-level comment on [`CounterKind`] for why this is needed
+    /// (mode 1 workaround for multi-GPU counter track separation).
+    fn counter_id(&self, gpu_index: u32) -> u32 {
+        gpu_index * NUM_COUNTER_KINDS + self.base_id()
     }
 
     fn name(&self) -> &'static str {
         match self {
             Self::Temperature => "Temperature",
             Self::PowerW => "Power",
-            Self::GpuUtilization => "GPU Utilization",
+            Self::Utilization => "Utilization",
             Self::MemUtilization => "Memory Utilization",
-            Self::SmClock => "SM Clock",
-            Self::MemClock => "Memory Clock",
         }
     }
 
@@ -222,8 +280,7 @@ impl CounterKind {
         match self {
             Self::Temperature => GpuCounterDescriptorMeasureUnit::Celsius,
             Self::PowerW => GpuCounterDescriptorMeasureUnit::Watt,
-            Self::GpuUtilization | Self::MemUtilization => GpuCounterDescriptorMeasureUnit::Percent,
-            Self::SmClock | Self::MemClock => GpuCounterDescriptorMeasureUnit::Megahertz,
+            Self::Utilization | Self::MemUtilization => GpuCounterDescriptorMeasureUnit::Percent,
         }
     }
 
@@ -231,15 +288,6 @@ impl CounterKind {
         GpuCounterDescriptorGpuCounterGroup::System
     }
 }
-
-const ALL_COUNTER_KINDS: [CounterKind; 6] = [
-    CounterKind::Temperature,
-    CounterKind::PowerW,
-    CounterKind::GpuUtilization,
-    CounterKind::MemUtilization,
-    CounterKind::SmClock,
-    CounterKind::MemClock,
-];
 
 /// A counter sample from a single GPU.
 struct CounterSample {
@@ -250,12 +298,15 @@ struct CounterSample {
 
 /// Emits GpuCounterEvent packets for changed counter values.
 ///
-/// When `emit_descriptors` is true, the inline `counter_descriptor` is included
-/// in each event so the trace processor knows the counter metadata.
+/// Each GPU's first event includes an inline `counter_descriptor` with that
+/// GPU's unique counter_ids (see [`CounterKind`] doc for details on the mode 1
+/// multi-GPU workaround). `gpus_needing_descriptors` tracks which GPUs have
+/// not yet had their descriptor emitted.
 fn emit_gpu_counter_events(
     ctx: &mut TraceContext,
     samples: &[CounterSample],
-    emit_descriptors: bool,
+    gpus_needing_descriptors: &mut HashSet<u32>,
+    timestamp: u64,
 ) {
     // Group samples by gpu_index so each GPU gets one GpuCounterEvent packet.
     let mut by_gpu: HashMap<u32, Vec<&CounterSample>> = HashMap::new();
@@ -264,20 +315,23 @@ fn emit_gpu_counter_events(
     }
 
     for (&gpu_index, gpu_samples) in &by_gpu {
+        let emit_desc = gpus_needing_descriptors.remove(&gpu_index);
         ctx.add_packet(|packet: &mut TracePacket| {
+            packet.set_timestamp(timestamp);
+            packet.set_timestamp_clock_id(PERFETTO_CLOCK_ID);
             packet.set_gpu_counter_event(|event: &mut GpuCounterEvent| {
                 event.set_gpu_id(gpu_index as i32);
                 for s in gpu_samples {
                     event.set_counters(|counter: &mut GpuCounterEventGpuCounter| {
-                        counter.set_counter_id(s.kind.counter_id());
+                        counter.set_counter_id(s.kind.counter_id(s.gpu_index));
                         counter.set_double_value(s.value);
                     });
                 }
-                if emit_descriptors {
+                if emit_desc {
                     event.set_counter_descriptor(|desc: &mut GpuCounterDescriptor| {
                         for kind in &ALL_COUNTER_KINDS {
                             desc.set_specs(|spec: &mut GpuCounterDescriptorGpuCounterSpec| {
-                                spec.set_counter_id(kind.counter_id());
+                                spec.set_counter_id(kind.counter_id(gpu_index));
                                 spec.set_name(kind.name());
                                 spec.set_numerator_units(kind.unit());
                                 spec.set_groups(kind.group());
@@ -319,7 +373,10 @@ pub(crate) fn build_display_names(metadata: &[GpuMetadata]) -> Vec<String> {
 /// Emits a single `GpuInfo` TracePacket containing metadata for all GPUs.
 pub(crate) fn emit_gpu_info(ctx: &mut TraceContext, metadata: &[GpuMetadata]) {
     let display_names = build_display_names(metadata);
+    let timestamp = trace_time_ns();
     ctx.add_packet(|packet: &mut TracePacket| {
+        packet.set_timestamp(timestamp);
+        packet.set_timestamp_clock_id(PERFETTO_CLOCK_ID);
         packet.set_gpu_info(|info: &mut GpuInfo| {
             for (meta, display_name) in metadata.iter().zip(display_names.iter()) {
                 info.set_gpus(|g: &mut GpuInfoGpu| {
@@ -361,7 +418,7 @@ pub(crate) fn run_poll_loop<G: PollableGpu>(
     data_source: &'static DataSource<'static>,
     inst_id: u32,
     stop: &InstanceStop,
-    poll_ms: u64,
+    poll_us: u64,
 ) {
     let gpus = enumerate();
     if gpus.is_empty() {
@@ -375,9 +432,7 @@ pub(crate) fn run_poll_loop<G: PollableGpu>(
     let mut last_power: Vec<Option<u32>> = vec![None; gpus.len()];
     let mut last_gpu_util: Vec<Option<u32>> = vec![None; gpus.len()];
     let mut last_mem_util: Vec<Option<u32>> = vec![None; gpus.len()];
-    let mut last_sm_clock: Vec<Option<u32>> = vec![None; gpus.len()];
-    let mut last_mem_clock: Vec<Option<u32>> = vec![None; gpus.len()];
-    let mut need_counter_descriptors = true;
+    let mut gpus_needing_descriptors: HashSet<u32> = gpus.iter().map(|g| g.index()).collect();
 
     while !stop.is_stopped() {
         // Collect changed samples before entering the trace closure.
@@ -424,6 +479,12 @@ pub(crate) fn run_poll_loop<G: PollableGpu>(
             if let Some(temp) = gpu.read_temperature() {
                 if last_temp[i] != Some(temp) {
                     last_temp[i] = Some(temp);
+                    perfetto_dlog!(
+                        "{} GPU {}: temperature {} C",
+                        backend_name,
+                        gpu.index(),
+                        temp
+                    );
                     counter_samples.push(CounterSample {
                         gpu_index: gpu.index(),
                         kind: CounterKind::Temperature,
@@ -434,6 +495,12 @@ pub(crate) fn run_poll_loop<G: PollableGpu>(
             if let Some(power_mw) = gpu.read_power_usage_mw() {
                 if last_power[i] != Some(power_mw) {
                     last_power[i] = Some(power_mw);
+                    perfetto_dlog!(
+                        "{} GPU {}: power {} mW",
+                        backend_name,
+                        gpu.index(),
+                        power_mw
+                    );
                     counter_samples.push(CounterSample {
                         gpu_index: gpu.index(),
                         kind: CounterKind::PowerW,
@@ -444,9 +511,15 @@ pub(crate) fn run_poll_loop<G: PollableGpu>(
             if let Some(gpu_util) = gpu.read_gpu_utilization() {
                 if last_gpu_util[i] != Some(gpu_util) {
                     last_gpu_util[i] = Some(gpu_util);
+                    perfetto_dlog!(
+                        "{} GPU {}: utilization {}%",
+                        backend_name,
+                        gpu.index(),
+                        gpu_util
+                    );
                     counter_samples.push(CounterSample {
                         gpu_index: gpu.index(),
-                        kind: CounterKind::GpuUtilization,
+                        kind: CounterKind::Utilization,
                         value: gpu_util as f64,
                     });
                 }
@@ -454,30 +527,16 @@ pub(crate) fn run_poll_loop<G: PollableGpu>(
             if let Some(mem_util) = gpu.read_mem_utilization() {
                 if last_mem_util[i] != Some(mem_util) {
                     last_mem_util[i] = Some(mem_util);
+                    perfetto_dlog!(
+                        "{} GPU {}: memory utilization {}%",
+                        backend_name,
+                        gpu.index(),
+                        mem_util
+                    );
                     counter_samples.push(CounterSample {
                         gpu_index: gpu.index(),
                         kind: CounterKind::MemUtilization,
                         value: mem_util as f64,
-                    });
-                }
-            }
-            if let Some(sm_clock) = gpu.read_sm_clock() {
-                if last_sm_clock[i] != Some(sm_clock) {
-                    last_sm_clock[i] = Some(sm_clock);
-                    counter_samples.push(CounterSample {
-                        gpu_index: gpu.index(),
-                        kind: CounterKind::SmClock,
-                        value: sm_clock as f64,
-                    });
-                }
-            }
-            if let Some(mem_clock) = gpu.read_mem_clock() {
-                if last_mem_clock[i] != Some(mem_clock) {
-                    last_mem_clock[i] = Some(mem_clock);
-                    counter_samples.push(CounterSample {
-                        gpu_index: gpu.index(),
-                        kind: CounterKind::MemClock,
-                        value: mem_clock as f64,
                     });
                 }
             }
@@ -488,7 +547,6 @@ pub(crate) fn run_poll_loop<G: PollableGpu>(
 
         if has_ftrace || has_counters {
             let timestamp = trace_time_ns();
-            let emit_descriptors = need_counter_descriptors && has_counters;
             data_source.trace(|ctx: &mut TraceContext| {
                 if ctx.instance_index() != inst_id {
                     return;
@@ -500,15 +558,91 @@ pub(crate) fn run_poll_loop<G: PollableGpu>(
                     emit_ftrace_gpu_mem_total(ctx, &mem_samples, timestamp);
                 }
                 if has_counters {
-                    emit_gpu_counter_events(ctx, &counter_samples, emit_descriptors);
+                    emit_gpu_counter_events(
+                        ctx,
+                        &counter_samples,
+                        &mut gpus_needing_descriptors,
+                        timestamp,
+                    );
                 }
             });
-            if emit_descriptors {
-                need_counter_descriptors = false;
-            }
         }
 
-        stop.wait(Duration::from_millis(poll_ms));
+        stop.wait(Duration::from_micros(poll_us));
+    }
+
+    // Emit one final sample with all last-known values so counter tracks
+    // extend to the end of the trace session (counters are backwards-looking).
+    let mut final_freq_samples = Vec::new();
+    let mut final_mem_samples = Vec::new();
+    let mut final_counter_samples = Vec::new();
+    for (i, gpu) in gpus.iter().enumerate() {
+        if let Some(freq_mhz) = last_freq[i] {
+            final_freq_samples.push(FreqSample {
+                gpu_index: gpu.index(),
+                freq_khz: freq_mhz as u64 * 1000,
+            });
+        }
+        if let Some(mem_used) = last_mem[i] {
+            final_mem_samples.push(MemSample {
+                gpu_index: gpu.index(),
+                size_bytes: mem_used,
+            });
+        }
+        if let Some(temp) = last_temp[i] {
+            final_counter_samples.push(CounterSample {
+                gpu_index: gpu.index(),
+                kind: CounterKind::Temperature,
+                value: temp as f64,
+            });
+        }
+        if let Some(power_mw) = last_power[i] {
+            final_counter_samples.push(CounterSample {
+                gpu_index: gpu.index(),
+                kind: CounterKind::PowerW,
+                value: power_mw as f64 / 1000.0,
+            });
+        }
+        if let Some(gpu_util) = last_gpu_util[i] {
+            final_counter_samples.push(CounterSample {
+                gpu_index: gpu.index(),
+                kind: CounterKind::Utilization,
+                value: gpu_util as f64,
+            });
+        }
+        if let Some(mem_util) = last_mem_util[i] {
+            final_counter_samples.push(CounterSample {
+                gpu_index: gpu.index(),
+                kind: CounterKind::MemUtilization,
+                value: mem_util as f64,
+            });
+        }
+    }
+
+    let has_final = !final_freq_samples.is_empty()
+        || !final_mem_samples.is_empty()
+        || !final_counter_samples.is_empty();
+    if has_final {
+        let timestamp = trace_time_ns();
+        data_source.trace(|ctx: &mut TraceContext| {
+            if ctx.instance_index() != inst_id {
+                return;
+            }
+            if !final_freq_samples.is_empty() {
+                emit_ftrace_gpu_frequency(ctx, &final_freq_samples, timestamp);
+            }
+            if !final_mem_samples.is_empty() {
+                emit_ftrace_gpu_mem_total(ctx, &final_mem_samples, timestamp);
+            }
+            if !final_counter_samples.is_empty() {
+                emit_gpu_counter_events(
+                    ctx,
+                    &final_counter_samples,
+                    &mut gpus_needing_descriptors,
+                    timestamp,
+                );
+            }
+        });
     }
 
     perfetto_dlog!("{} polling loop stopped (id={})", backend_name, inst_id);

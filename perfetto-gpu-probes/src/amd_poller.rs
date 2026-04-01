@@ -85,14 +85,6 @@ impl PollableGpu for AmdGpuInfo {
     fn read_mem_utilization(&self) -> Option<u32> {
         amd_sysfs::read_mem_utilization(self)
     }
-    fn read_sm_clock(&self) -> Option<u32> {
-        // AMD GPUs don't have a separate SM clock; the shader/GFX clock
-        // is already reported by read_frequency() via pp_dpm_sclk.
-        amd_sysfs::read_gpu_frequency(self)
-    }
-    fn read_mem_clock(&self) -> Option<u32> {
-        amd_sysfs::read_gpu_mem_clock(self)
-    }
 }
 
 /// Runs the AMD polling loop for a single instance. Blocks until `stop` is signaled.
@@ -100,7 +92,7 @@ pub(crate) fn run_poll_loop(
     data_source: &'static DataSource<'static>,
     inst_id: u32,
     stop: &InstanceStop,
-    poll_ms: u64,
+    poll_us: u64,
 ) {
     crate::poller::run_poll_loop(
         amd_sysfs::enumerate_amd_gpus,
@@ -108,6 +100,6 @@ pub(crate) fn run_poll_loop(
         data_source,
         inst_id,
         stop,
-        poll_ms,
+        poll_us,
     );
 }

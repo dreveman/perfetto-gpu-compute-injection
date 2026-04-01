@@ -24,7 +24,7 @@ use perfetto_gpu_compute_injection::config::Config;
 use perfetto_gpu_compute_injection::injection_log;
 use perfetto_gpu_compute_injection::tracing::{
     get_counters_data_source, get_next_event_id, get_renderstages_data_source, register_backend,
-    trace_time_ns, GpuBackend, GOT_FIRST_COUNTERS, GOT_FIRST_RENDERSTAGES,
+    trace_time_ns, GpuBackend, GOT_FIRST_RENDERSTAGES,
 };
 use perfetto_sdk::{
     data_source::{StopGuard, TraceContext},
@@ -63,6 +63,7 @@ use state::{
     MEMCPY_STAGE_IID, MEMSET_STAGE_IID,
 };
 use std::{
+    collections::HashSet,
     panic, ptr,
     sync::atomic::{AtomicU8, Ordering},
 };
@@ -272,15 +273,47 @@ impl GpuBackend for CuptiBackend {
 
             // Phase 2: Emit collected events without holding GLOBAL_STATE.
             // This prevents deadlock with buffer_completed callback.
+            //
+            // Counter ID offset and multi-GPU workaround (mode 1 / legacy inline
+            // descriptors):
+            //
+            // Counter IDs use a large offset (4096) to avoid collision with the
+            // gpu-probes crate's counters (Temperature, Power, Utilization, etc.)
+            // which use small counter_id values starting at 1.
+            //
+            // For multi-GPU support we assign globally unique counter_ids per GPU:
+            //   counter_id = COUNTER_ID_OFFSET + gpu_id * num_metrics + metric_index
+            //
+            // This is needed because the trace processor's mode 1 (inline
+            // counter_descriptor) keys its gpu_counter_state_ map by counter_id
+            // alone — there is no gpu_id in the key. If two GPUs share the same
+            // counter_id, the second GPU's descriptor overwrites the first and all
+            // samples land on one GPU's track.
+            //
+            // Each GPU's first GpuCounterEvent includes an inline
+            // counter_descriptor so the trace processor creates separate tracks
+            // per GPU (the descriptor's gpu_id associates tracks with the right
+            // GPU in the hierarchy).
+            //
+            // TODO: Switch to mode 2 (interned descriptors via
+            // counter_descriptor_iid and InternedGpuCounterDescriptor) once the
+            // gpu_counter_descriptors field is available in perfetto-sdk-protos-gpu's
+            // InternedData extension. At that point, counter_ids can be simplified
+            // and the per-GPU spacing logic can be removed.
+            const COUNTER_ID_OFFSET: u32 = 4096;
+            let num_metrics = collected_events
+                .first()
+                .map_or(0, |e| e.metrics.len() as u32);
+            let mut gpus_needing_descriptors: HashSet<i32> =
+                collected_events.iter().map(|e| e.gpu_id).collect();
             let mut stop_guard_opt = stop_guard;
             get_counters_data_source().trace(|ctx: &mut TraceContext| {
                 if ctx.instance_index() != inst_id {
                     return;
                 }
                 for event in &collected_events {
-                    let got_first_counters =
-                        GOT_FIRST_COUNTERS.fetch_or(1 << inst_id, Ordering::SeqCst);
-                    if got_first_counters & (1 << inst_id) == 0 {
+                    let emit_desc = gpus_needing_descriptors.remove(&event.gpu_id);
+                    if emit_desc {
                         ctx.add_packet(|packet: &mut TracePacket| {
                             packet
                                 .set_timestamp(event.timestamp_start)
@@ -294,7 +327,9 @@ impl GpuBackend for CuptiBackend {
                                                 event.metrics.iter().enumerate()
                                             {
                                                 desc.set_specs(|spec: &mut GpuCounterDescriptorGpuCounterSpec| {
-                                                    spec.set_counter_id(i as u32);
+                                                    spec.set_counter_id(
+                                                        COUNTER_ID_OFFSET + event.gpu_id as u32 * num_metrics + i as u32,
+                                                    );
                                                     spec.set_name(metric_name);
                                                     spec.set_groups(GpuCounterDescriptorGpuCounterGroup::Compute);
                                                 });
@@ -315,7 +350,11 @@ impl GpuBackend for CuptiBackend {
                                 for (i, _) in event.metrics.iter().enumerate() {
                                     ce.set_counters(
                                         |counter: &mut GpuCounterEventGpuCounter| {
-                                            counter.set_counter_id(i as u32).set_int_value(0);
+                                            counter
+                                                .set_counter_id(
+                                                    COUNTER_ID_OFFSET + event.gpu_id as u32 * num_metrics + i as u32,
+                                                )
+                                                .set_int_value(0);
                                         },
                                     );
                                 }
@@ -333,7 +372,9 @@ impl GpuBackend for CuptiBackend {
                                     ce.set_counters(
                                         |counter: &mut GpuCounterEventGpuCounter| {
                                             counter
-                                                .set_counter_id(i as u32)
+                                                .set_counter_id(
+                                                    COUNTER_ID_OFFSET + event.gpu_id as u32 * num_metrics + i as u32,
+                                                )
                                                 .set_double_value(*value);
                                         },
                                     );
@@ -480,6 +521,25 @@ impl GpuBackend for CuptiBackend {
                         } else {
                             (activity.start, activity.end)
                         };
+                        // CUPTI returns start=0/end=0 when timestamp collection
+                        // failed for an activity. It can also return end < start
+                        // for partially-completed or corrupted records. Skip
+                        // these to avoid emitting render stage events with
+                        // invalid timestamps.
+                        // TODO: investigate root cause. This tends to happen
+                        // during large bursts (1000s of kernels/memsets in quick
+                        // succession), suggesting a CUPTI activity buffer
+                        // overflow or race condition in timestamp collection.
+                        if raw_start == 0 || raw_end < raw_start {
+                            injection_log!(
+                                "WARNING: kernel activity with invalid timestamps \
+                                 (start={}, end={}), skipping: {}",
+                                raw_start,
+                                raw_end,
+                                activity.kernel_name
+                            );
+                            continue;
+                        }
                         let demangled = perfetto_gpu_compute_injection::kernel::demangle_name(
                             &activity.kernel_name,
                         );
@@ -647,6 +707,16 @@ impl GpuBackend for CuptiBackend {
                         .copied()
                         .unwrap_or(0);
                     for activity in data.memcpy_activities[mc_start..].iter() {
+                        if activity.start == 0 || activity.end < activity.start {
+                            injection_log!(
+                                "WARNING: memcpy activity with invalid timestamps \
+                                 (start={}, end={}), skipping: {} bytes",
+                                activity.start,
+                                activity.end,
+                                activity.bytes
+                            );
+                            continue;
+                        }
                         let mut extra_data_vec: Vec<(String, String)> = Vec::new();
                         activity.emit_extra_data(process_id, &process_name, &mut |name, value| {
                             extra_data_vec.push((name.to_string(), value.to_string()));
@@ -673,6 +743,16 @@ impl GpuBackend for CuptiBackend {
                         .copied()
                         .unwrap_or(0);
                     for activity in data.memset_activities[ms_start..].iter() {
+                        if activity.start == 0 || activity.end < activity.start {
+                            injection_log!(
+                                "WARNING: memset activity with invalid timestamps \
+                                 (start={}, end={}), skipping: {} bytes",
+                                activity.start,
+                                activity.end,
+                                activity.bytes
+                            );
+                            continue;
+                        }
                         let mut extra_data_vec: Vec<(String, String)> = Vec::new();
                         activity.emit_extra_data(process_id, &process_name, &mut |name, value| {
                             extra_data_vec.push((name.to_string(), value.to_string()));

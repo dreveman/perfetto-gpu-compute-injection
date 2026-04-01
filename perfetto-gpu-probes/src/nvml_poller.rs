@@ -250,24 +250,6 @@ impl PollableGpu for GpuInfo {
         }
         Some(util.memory)
     }
-    fn read_sm_clock(&self) -> Option<u32> {
-        let mut clock: u32 = 0;
-        let ret =
-            unsafe { nvml::nvmlDeviceGetClockInfo(self.handle, nvml::NVML_CLOCK_SM, &mut clock) };
-        if ret != nvml::NVML_SUCCESS {
-            return None;
-        }
-        Some(clock)
-    }
-    fn read_mem_clock(&self) -> Option<u32> {
-        let mut clock: u32 = 0;
-        let ret =
-            unsafe { nvml::nvmlDeviceGetClockInfo(self.handle, nvml::NVML_CLOCK_MEM, &mut clock) };
-        if ret != nvml::NVML_SUCCESS {
-            return None;
-        }
-        Some(clock)
-    }
 }
 
 /// Enumerates all GPUs via NVML.
@@ -328,9 +310,9 @@ pub(crate) fn run_poll_loop(
     data_source: &'static DataSource<'static>,
     inst_id: u32,
     stop: &InstanceStop,
-    poll_ms: u64,
+    poll_us: u64,
 ) {
-    crate::poller::run_poll_loop(enumerate_gpus, "NVML", data_source, inst_id, stop, poll_ms);
+    crate::poller::run_poll_loop(enumerate_gpus, "NVML", data_source, inst_id, stop, poll_us);
 }
 
 #[cfg(all(test, feature = "stubs"))]

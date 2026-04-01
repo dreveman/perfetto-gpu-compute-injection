@@ -95,9 +95,9 @@ macro_rules! perfetto_dlog {
 #[derive(Parser)]
 #[command(name = "traced_gpu_probes")]
 struct Args {
-    /// Poll interval in milliseconds.
+    /// Poll interval in microseconds.
     #[arg(long, default_value_t = 100)]
-    poll_interval_ms: u64,
+    poll_interval_us: u64,
 
     /// Enable verbose logging.
     #[arg(long)]
@@ -162,7 +162,7 @@ fn register_polled_data_source(
     instance_configs: &'static LazyLock<Mutex<HashMap<u32, u64>>>,
     instances: &'static LazyLock<Mutex<HashMap<u32, Arc<InstanceStop>>>>,
     poll_fn: PollFn,
-    default_poll_ms: u64,
+    default_poll_us: u64,
     ds_name: &str,
 ) -> &'static DataSource<'static> {
     ds_cell.get_or_init(|| {
@@ -175,20 +175,20 @@ fn register_polled_data_source(
                         period_ns,
                         inst_id
                     );
-                    let poll_ms = period_ns.div_ceil(1_000_000);
+                    let poll_us = period_ns.div_ceil(1_000);
                     instance_configs
                         .lock()
                         .expect("mutex poisoned")
-                        .insert(inst_id, poll_ms);
+                        .insert(inst_id, poll_us);
                 }
             })
             .on_start(move |inst_id, _| {
                 perfetto_dlog!("StartDataSource(id={})", inst_id);
-                let poll_ms = instance_configs
+                let poll_us = instance_configs
                     .lock()
                     .expect("mutex poisoned")
                     .remove(&inst_id)
-                    .unwrap_or(default_poll_ms);
+                    .unwrap_or(default_poll_us);
                 let stop = Arc::new(InstanceStop::new());
                 instances
                     .lock()
@@ -196,7 +196,7 @@ fn register_polled_data_source(
                     .insert(inst_id, Arc::clone(&stop));
                 let ds = ds_cell.get().expect("data source not registered");
                 std::thread::spawn(move || {
-                    poll_fn(ds, inst_id, &stop, poll_ms);
+                    poll_fn(ds, inst_id, &stop, poll_us);
                 });
             })
             .on_stop(move |inst_id, args| {
@@ -229,7 +229,7 @@ fn register_polled_data_source(
 
 /// Tries to initialize NVML and register the `gpu.counters.nv` data source.
 /// Returns true if successful, false if NVML is unavailable.
-fn try_register_nvml_data_source(poll_ms: u64) -> bool {
+fn try_register_nvml_data_source(poll_us: u64) -> bool {
     let ret = unsafe { nvml::nvmlInit_v2() };
     if ret != nvml::NVML_SUCCESS {
         perfetto_dlog!(
@@ -244,7 +244,7 @@ fn try_register_nvml_data_source(poll_ms: u64) -> bool {
         &NVML_INSTANCE_CONFIGS,
         &NVML_INSTANCES,
         nvml_poller::run_poll_loop,
-        poll_ms,
+        poll_us,
         "gpu.counters.nv",
     );
     NVML_AVAILABLE.store(true, Ordering::Relaxed);
@@ -253,7 +253,7 @@ fn try_register_nvml_data_source(poll_ms: u64) -> bool {
 
 /// Tries to discover AMD GPUs and register the `gpu.counters.amd` data source.
 /// Returns true if AMD GPUs were found, false otherwise.
-fn try_register_amd_data_source(poll_ms: u64) -> bool {
+fn try_register_amd_data_source(poll_us: u64) -> bool {
     let gpus = amd_sysfs::enumerate_amd_gpus();
     if gpus.is_empty() {
         perfetto_dlog!("No AMD GPUs found, skipping gpu.counters.amd");
@@ -265,7 +265,7 @@ fn try_register_amd_data_source(poll_ms: u64) -> bool {
         &AMD_INSTANCE_CONFIGS,
         &AMD_INSTANCES,
         amd_poller::run_poll_loop,
-        poll_ms,
+        poll_us,
         "gpu.counters.amd",
     );
     true
@@ -372,7 +372,7 @@ pub fn run(args: &[String]) -> i32 {
             return if e.use_stderr() { 1 } else { 0 };
         }
     };
-    let poll_interval_ms = parsed.poll_interval_ms;
+    let poll_interval_us = parsed.poll_interval_us;
     VERBOSE.store(parsed.verbose, Ordering::Relaxed);
 
     // Initialize Perfetto producer (connects to system tracing service).
@@ -383,8 +383,8 @@ pub fn run(args: &[String]) -> i32 {
     );
 
     // Register available data sources.
-    try_register_nvml_data_source(poll_interval_ms);
-    try_register_amd_data_source(poll_interval_ms);
+    try_register_nvml_data_source(poll_interval_us);
+    try_register_amd_data_source(poll_interval_us);
     register_gpu_info_data_source();
 
     // Notify parent process that all data sources are registered, matching

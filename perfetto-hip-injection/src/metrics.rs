@@ -23,14 +23,19 @@ pub const DEFAULT_METRICS: &[&str] = &[
     "SQ_INSTS_LDS",
     "SQ_INSTS_FLAT",
     "SQ_INSTS_GDS",
-    "GRBM_COUNT",
-    "GRBM_GUI_ACTIVE",
+    "GRBM_GUI_ACTIVE_avr",
+    "SQ_BUSY_CYCLES_avr",
     "TA_BUSY_avr",
     "TCP_TCC_READ_REQ_sum",
     "TCP_TCC_WRITE_REQ_sum",
     "TCC_HIT_sum",
     "TCC_MISS_sum",
 ];
+
+/// Synthetic counter names computed from hardware counters and agent
+/// properties. These are appended to counter_names after the hardware
+/// counters and have their values computed in record_counting_callback.
+pub const SYNTHETIC_COUNTERS: &[&str] = &["GRBM_TIME_DUR_max"];
 
 /// Parses a comma or semicolon separated string of metrics.
 ///

@@ -186,11 +186,30 @@ impl GpuBackend for RocprofilerBackend {
                 for kd in state.kernel_dispatches[kd_start..].iter() {
                     let demangled =
                         perfetto_gpu_compute_injection::kernel::demangle_name(&kd.kernel_name);
-                    let grid_size = kd.grid.0 * kd.grid.1 * kd.grid.2;
+                    // rocprofiler's grid_size is total work-items per dimension
+                    // (gridDim * blockDim), not the number of blocks. Derive
+                    // the actual grid (block count) by dividing out the
+                    // workgroup size.
+                    let grid_x = if kd.workgroup.0 > 0 {
+                        kd.grid.0 / kd.workgroup.0
+                    } else {
+                        kd.grid.0
+                    };
+                    let grid_y = if kd.workgroup.1 > 0 {
+                        kd.grid.1 / kd.workgroup.1
+                    } else {
+                        kd.grid.1
+                    };
+                    let grid_z = if kd.workgroup.2 > 0 {
+                        kd.grid.2 / kd.workgroup.2
+                    } else {
+                        kd.grid.2
+                    };
+                    let grid_size = grid_x * grid_y * grid_z;
                     let workgroup_size = kd.workgroup.0 * kd.workgroup.1 * kd.workgroup.2;
-                    let thread_count = grid_size * workgroup_size;
+                    let thread_count = kd.grid.0 * kd.grid.1 * kd.grid.2;
                     let total_waves = if kd.wave_front_size > 0 {
-                        (grid_size * workgroup_size).div_ceil(kd.wave_front_size)
+                        thread_count.div_ceil(kd.wave_front_size)
                     } else {
                         0
                     };
@@ -200,6 +219,8 @@ impl GpuBackend for RocprofilerBackend {
                         0.0
                     };
                     let hw_queue_iid = (kd.queue_handle & 0xFFFF) + AMD_HW_QUEUE_IID_OFFSET;
+                    // max_engine_clk_fcompute is in MHz.
+                    let clock_freq_hz = kd.max_engine_clk_fcompute as f64 * 1_000_000.0;
                     let extra_fields: Vec<(String, String)> = vec![
                         ("kernel_name".to_string(), kd.kernel_name.clone()),
                         ("kernel_demangled_name".to_string(), demangled.clone()),
@@ -210,9 +231,9 @@ impl GpuBackend for RocprofilerBackend {
                         ("arch".to_string(), kd.arch.clone()),
                         ("queue_id".to_string(), kd.queue_handle.to_string()),
                         ("launch__grid_size".to_string(), grid_size.to_string()),
-                        ("launch__grid_size_x".to_string(), kd.grid.0.to_string()),
-                        ("launch__grid_size_y".to_string(), kd.grid.1.to_string()),
-                        ("launch__grid_size_z".to_string(), kd.grid.2.to_string()),
+                        ("launch__grid_size_x".to_string(), grid_x.to_string()),
+                        ("launch__grid_size_y".to_string(), grid_y.to_string()),
+                        ("launch__grid_size_z".to_string(), grid_z.to_string()),
                         ("launch__block_size".to_string(), workgroup_size.to_string()),
                         (
                             "launch__block_size_x".to_string(),
@@ -230,6 +251,10 @@ impl GpuBackend for RocprofilerBackend {
                         (
                             "launch__waves_per_multiprocessor".to_string(),
                             format!("{:.2}", waves_per_cu),
+                        ),
+                        (
+                            "GRBM_GUI_ACTIVE_avr_per_second".to_string(),
+                            format!("{:.0}", clock_freq_hz),
                         ),
                     ];
                     events.push(PendingRenderStageEvent {
@@ -502,18 +527,42 @@ impl GpuBackend for RocprofilerBackend {
             );
 
             // Match requested metrics against available counters.
+            // Some counters have a built-in aggregation suffix that
+            // rocprofiler knows natively (e.g. "TCP_TCC_READ_REQ_sum",
+            // "TA_BUSY_avr"). Try the full name first. If not found,
+            // strip a "_avg", "_sum", or "_max" suffix, look up the base
+            // counter, and apply the aggregation in record_counting_callback.
             let mut matched_ids: Vec<rocprofiler_counter_id_t> = Vec::new();
             let mut matched_names: Vec<String> = Vec::new();
             for metric in &requested_metrics {
-                if let Some(&cid) = name_to_id.get(metric) {
+                if let Some(&cid) = name_to_id.get(metric.as_str()) {
+                    // Counter exists as-is in rocprofiler (native suffix).
                     matched_ids.push(cid);
                     matched_names.push(metric.clone());
                 } else {
-                    injection_log!(
-                        "agent {:#x}: requested counter '{}' not available",
-                        agent_handle,
-                        metric
-                    );
+                    let base_name = metric
+                        .strip_suffix("_avr")
+                        .or_else(|| metric.strip_suffix("_sum"))
+                        .or_else(|| metric.strip_suffix("_max"))
+                        .or_else(|| metric.strip_suffix("_min"));
+                    if let Some((base, cid)) =
+                        base_name.and_then(|b| name_to_id.get(b).map(|&c| (b, c)))
+                    {
+                        matched_ids.push(cid);
+                        matched_names.push(metric.clone());
+                        injection_log!(
+                            "agent {:#x}: '{}' -> base counter '{}'",
+                            agent_handle,
+                            metric,
+                            base
+                        );
+                    } else {
+                        injection_log!(
+                            "agent {:#x}: requested counter '{}' not available",
+                            agent_handle,
+                            metric
+                        );
+                    }
                 }
             }
 
@@ -558,6 +607,11 @@ impl GpuBackend for RocprofilerBackend {
                     state.counter_names = matched_names;
                     for (idx, cid) in matched_ids.iter().enumerate() {
                         state.counter_id_to_index.insert(cid.handle, idx);
+                    }
+                    // Append synthetic counters (computed from hardware
+                    // counters, not collected by rocprofiler).
+                    for &name in metrics::SYNTHETIC_COUNTERS {
+                        state.counter_names.push(name.to_string());
                     }
                 }
             }

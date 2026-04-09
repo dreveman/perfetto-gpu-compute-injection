@@ -120,6 +120,8 @@ pub unsafe extern "C" fn buffer_callback(
                 let arch = agent_info.map(|a| a.arch.clone()).unwrap_or_default();
                 let wave_front_size = agent_info.map(|a| a.wave_front_size).unwrap_or(0);
                 let cu_count = agent_info.map(|a| a.cu_count).unwrap_or(0);
+                let max_engine_clk_fcompute =
+                    agent_info.map(|a| a.max_engine_clk_fcompute).unwrap_or(0);
 
                 state.kernel_dispatches.push(KernelDispatch {
                     kernel_name,
@@ -136,6 +138,7 @@ pub unsafe extern "C" fn buffer_callback(
                     arch,
                     wave_front_size,
                     cu_count,
+                    max_engine_clk_fcompute,
                 });
             } else if kind == ROCPROFILER_BUFFER_TRACING_MEMORY_COPY {
                 if hdr.payload.is_null() {
@@ -333,6 +336,7 @@ pub unsafe extern "C" fn agents_callback(
                             arch,
                             wave_front_size: agent.wave_front_size,
                             cu_count: agent.cu_count,
+                            max_engine_clk_fcompute: agent.max_engine_clk_fcompute,
                         },
                     );
                 }
@@ -414,7 +418,11 @@ pub unsafe extern "C" fn record_counting_callback(
             .map(|a| a.device_index)
             .unwrap_or(0);
 
+        // Sum counter values across all instances (per-SE, per-XCD dimensions).
+        // rocprofiler returns multiple records per counter — one per hardware
+        // instance. Track instance counts for counters that need averaging.
         let mut values = vec![0.0_f64; num_counters];
+        let mut instance_counts = vec![0u32; num_counters];
         for record in records {
             let mut counter_id = rocprofiler_counter_id_t { handle: 0 };
             let status = rocprofiler_query_record_counter_id(record.id, &mut counter_id);
@@ -422,7 +430,42 @@ pub unsafe extern "C" fn record_counting_callback(
                 continue;
             }
             if let Some(&idx) = state.counter_id_to_index.get(&counter_id.handle) {
-                values[idx] = record.counter_value;
+                values[idx] += record.counter_value;
+                instance_counts[idx] += 1;
+            }
+        }
+
+        // Apply per-counter aggregation based on the suffix in the metric
+        // name. Counters with a "_avg" suffix that was NOT a native
+        // rocprofiler name are averaged across instances. Native suffixes
+        // (like "TA_BUSY_avr", "TCP_TCC_READ_REQ_sum") are already
+        // aggregated by rocprofiler and left as sums here.
+        for (idx, name) in state.counter_names.iter().enumerate() {
+            if name.ends_with("_avr") && instance_counts[idx] > 1 {
+                values[idx] /= instance_counts[idx] as f64;
+            }
+        }
+
+        // Compute synthetic GRBM_TIME_DUR_max from elapsed cycles and
+        // max clock frequency. duration_ns = elapsed_cycles / freq_hz * 1e9.
+        let max_clk_mhz = state
+            .agents
+            .get(&info.agent_id.handle)
+            .map(|a| a.max_engine_clk_fcompute)
+            .unwrap_or(0);
+        let elapsed_idx = state
+            .counter_names
+            .iter()
+            .position(|n| n == "GRBM_GUI_ACTIVE_avr");
+        let duration_idx = state
+            .counter_names
+            .iter()
+            .position(|n| n == "GRBM_TIME_DUR_max");
+        if let (Some(ei), Some(di)) = (elapsed_idx, duration_idx) {
+            if max_clk_mhz > 0 {
+                let elapsed_cycles = values[ei];
+                let freq_hz = max_clk_mhz as f64 * 1_000_000.0;
+                values[di] = elapsed_cycles / freq_hz * 1e9;
             }
         }
 

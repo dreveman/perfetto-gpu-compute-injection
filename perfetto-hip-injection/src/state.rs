@@ -44,6 +44,8 @@ pub struct AgentInfo {
     pub wave_front_size: u32,
     /// Number of compute units.
     pub cu_count: u32,
+    /// Maximum shader engine clock frequency (MHz).
+    pub max_engine_clk_fcompute: u32,
 }
 
 /// A captured kernel dispatch event from rocprofiler buffer tracing.
@@ -64,9 +66,9 @@ pub struct KernelDispatch {
     pub wave_front_size: u32,
     /// Number of compute units.
     pub cu_count: u32,
+    /// Maximum shader engine clock frequency (MHz).
+    pub max_engine_clk_fcompute: u32,
 }
-
-/// A captured memory copy event.
 #[derive(Debug, Clone)]
 pub struct MemcopyActivity {
     pub bytes: u64,

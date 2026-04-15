@@ -27,7 +27,7 @@ clap = { version = "4", features = ["derive"] }
 libc = "0.2"
 paste = "1"
 perfetto-sdk = "0.3"
-perfetto-sdk-protos-gpu = "0.3.2"
+perfetto-sdk-protos-gpu = "0.3.4"
 
 [dev-dependencies]
 tempfile = "3"

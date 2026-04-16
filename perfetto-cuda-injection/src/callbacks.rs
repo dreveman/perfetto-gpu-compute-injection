@@ -24,6 +24,7 @@ use perfetto_sdk::track_event::{
     EventContext, TrackEventProtoField, TrackEventProtoFields, TrackEventTimestamp,
     TrackEventTrack, TrackEventType,
 };
+use std::cell::RefCell;
 use std::time::Duration;
 use std::{ffi::CStr, ffi::CString, panic, ptr};
 
@@ -31,6 +32,16 @@ use std::{ffi::CStr, ffi::CString, panic, ptr};
 const BUF_SIZE: usize = 8 * 1024 * 1024;
 /// Alignment for activity buffers (8 bytes).
 const ALIGN_SIZE: usize = 8;
+
+thread_local! {
+    /// Per-thread NVTX range name stack, maintained by push/pop callbacks.
+    static NVTX_RANGE_STACK: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Returns a snapshot of the current thread's NVTX range stack.
+pub fn nvtx_range_stack() -> Vec<String> {
+    NVTX_RANGE_STACK.with(|stack| stack.borrow().clone())
+}
 
 /// Callback for CUPTI to request a buffer for storing activity records.
 /// # Safety
@@ -277,13 +288,15 @@ pub unsafe extern "C" fn profiler_callback_handler(
                     } else {
                         String::new()
                     };
+                    let configs: Vec<_> =
+                        (0..8u32).map(|id| (id, get_counter_config(id))).collect();
+                    // Phase 1: kernel name filtering.
                     let mut mask: u8 = 0;
                     let mut need_demangled = false;
-                    for id in 0..8u32 {
-                        if let Some(cfg) = get_counter_config(id) {
+                    for &(id, ref cfg) in &configs {
+                        if let Some(cfg) = cfg {
                             let isc = &cfg.instrumented_sampling_config;
                             if isc.activity_name_filters.is_empty() {
-                                // No filters → this instance wants all kernels.
                                 mask |= 1 << id;
                             } else {
                                 need_demangled = true;
@@ -293,16 +306,50 @@ pub unsafe extern "C" fn profiler_callback_handler(
                     if need_demangled {
                         let demangled =
                             perfetto_gpu_compute_injection::kernel::demangle_name(&mangled);
-                        for id in 0..8u32 {
+                        for &(id, ref cfg) in &configs {
                             if mask & (1 << id) != 0 {
-                                continue; // already included
+                                continue;
                             }
-                            if let Some(cfg) = get_counter_config(id) {
+                            if let Some(cfg) = cfg {
                                 if cfg
                                     .instrumented_sampling_config
                                     .should_profile_kernel(&mangled, &demangled)
                                 {
                                     mask |= 1 << id;
+                                }
+                            }
+                        }
+                    }
+                    // Phase 2: NVTX range filtering. Clear bits for instances
+                    // whose NVTX include/exclude globs reject the current context.
+                    if mask != 0 {
+                        let mut need_nvtx = false;
+                        for &(id, ref cfg) in &configs {
+                            if mask & (1 << id) != 0 {
+                                if let Some(cfg) = cfg {
+                                    let isc = &cfg.instrumented_sampling_config;
+                                    if !isc.activity_tx_include_globs.is_empty()
+                                        || !isc.activity_tx_exclude_globs.is_empty()
+                                    {
+                                        need_nvtx = true;
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        if need_nvtx {
+                            let nvtx_stack = nvtx_range_stack();
+                            for &(id, ref cfg) in &configs {
+                                if mask & (1 << id) == 0 {
+                                    continue;
+                                }
+                                if let Some(cfg) = cfg {
+                                    if !cfg
+                                        .instrumented_sampling_config
+                                        .should_profile_in_nvtx_context(&nvtx_stack)
+                                    {
+                                        mask &= !(1 << id);
+                                    }
                                 }
                             }
                         }
@@ -572,6 +619,21 @@ pub unsafe extern "C" fn profiler_callback_handler(
             if cb_data.callbackSite == CUpti_ApiCallbackSite_CUPTI_API_ENTER {
                 injection_log!("cudaDeviceReset detected, flushing activity buffers");
                 let _ = profiler::activity_flush_all(0);
+            }
+        } else if domain == CUpti_CallbackDomain_CUPTI_CB_DOMAIN_NVTX {
+            // Track NVTX range push/pop for activity_tx_include/exclude_globs filtering.
+            if cbid == CUpti_nvtx_api_trace_cbid_CUPTI_CBID_NVTX_nvtxRangePushA {
+                let nvtx_data = &*(cbdata as *const CUpti_NvtxData);
+                // For nvtxRangePushA, functionParams points to const char**
+                let msg_ptr = *(nvtx_data.functionParams as *const *const std::os::raw::c_char);
+                if !msg_ptr.is_null() {
+                    let name = CStr::from_ptr(msg_ptr).to_string_lossy().to_string();
+                    NVTX_RANGE_STACK.with(|stack| stack.borrow_mut().push(name));
+                }
+            } else if cbid == CUpti_nvtx_api_trace_cbid_CUPTI_CBID_NVTX_nvtxRangePop {
+                NVTX_RANGE_STACK.with(|stack| {
+                    stack.borrow_mut().pop();
+                });
             }
         }
     });

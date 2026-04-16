@@ -185,6 +185,40 @@ impl InstrumentedSamplingConfig {
             glob_match(&filter.name_glob, name)
         })
     }
+
+    /// Returns whether a kernel should be profiled based on the current NVTX
+    /// range stack and the `activity_tx_include_globs` / `activity_tx_exclude_globs`.
+    ///
+    /// - If both lists are empty, returns `true` (no NVTX filtering).
+    /// - If include globs are set, at least one range name in the stack must
+    ///   match at least one include glob.
+    /// - If exclude globs are set, no range name in the stack may match any
+    ///   exclude glob.
+    pub fn should_profile_in_nvtx_context(&self, nvtx_stack: &[String]) -> bool {
+        if self.activity_tx_include_globs.is_empty() && self.activity_tx_exclude_globs.is_empty() {
+            return true;
+        }
+        // Exclude check: reject if any range matches any exclude glob.
+        for range_name in nvtx_stack {
+            for glob in &self.activity_tx_exclude_globs {
+                if glob_match(glob, range_name) {
+                    return false;
+                }
+            }
+        }
+        // Include check: require at least one range to match an include glob.
+        if self.activity_tx_include_globs.is_empty() {
+            return true;
+        }
+        for range_name in nvtx_stack {
+            for glob in &self.activity_tx_include_globs {
+                if glob_match(glob, range_name) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
 }
 
 /// Parsed `GpuCounterConfig` fields from the Perfetto trace config.
@@ -345,5 +379,55 @@ mod tests {
         assert!(isc.should_profile_kernel("x", "matmul_kernel()"));
         assert!(isc.should_profile_kernel("x", "reduce_kernel()"));
         assert!(!isc.should_profile_kernel("x", "softmax_kernel()"));
+    }
+
+    #[test]
+    fn test_nvtx_context_empty_globs() {
+        let isc = InstrumentedSamplingConfig::default();
+        assert!(isc.should_profile_in_nvtx_context(&[]));
+        assert!(isc.should_profile_in_nvtx_context(&["anything".to_string()]));
+    }
+
+    #[test]
+    fn test_nvtx_context_include_match() {
+        let isc = InstrumentedSamplingConfig {
+            activity_tx_include_globs: vec!["training*".to_string()],
+            ..Default::default()
+        };
+        assert!(isc.should_profile_in_nvtx_context(&["training_step".to_string()]));
+        assert!(!isc.should_profile_in_nvtx_context(&["inference".to_string()]));
+        assert!(!isc.should_profile_in_nvtx_context(&[]));
+    }
+
+    #[test]
+    fn test_nvtx_context_exclude_match() {
+        let isc = InstrumentedSamplingConfig {
+            activity_tx_exclude_globs: vec!["warmup*".to_string()],
+            ..Default::default()
+        };
+        assert!(isc.should_profile_in_nvtx_context(&["training_step".to_string()]));
+        assert!(!isc.should_profile_in_nvtx_context(&["warmup_phase".to_string()]));
+        assert!(isc.should_profile_in_nvtx_context(&[]));
+    }
+
+    #[test]
+    fn test_nvtx_context_nested_stack() {
+        let isc = InstrumentedSamplingConfig {
+            activity_tx_include_globs: vec!["training*".to_string()],
+            activity_tx_exclude_globs: vec!["*backward*".to_string()],
+            ..Default::default()
+        };
+        // Inner range matches include — profiled.
+        assert!(isc
+            .should_profile_in_nvtx_context(
+                &["epoch_1".to_string(), "training_step".to_string(),]
+            ));
+        // Inner range matches exclude — skipped even though outer matches include.
+        assert!(!isc.should_profile_in_nvtx_context(&[
+            "training_step".to_string(),
+            "backward_pass".to_string(),
+        ]));
+        // No include match.
+        assert!(!isc.should_profile_in_nvtx_context(&["inference".to_string()]));
     }
 }

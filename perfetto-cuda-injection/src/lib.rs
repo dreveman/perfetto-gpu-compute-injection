@@ -1133,6 +1133,7 @@ fn register_profiler_callbacks() -> Result<CUpti_SubscriberHandle, CUptiResult> 
         )
     }?;
     unsafe { profiler::enable_domain(1, subscriber, CUpti_CallbackDomain_CUPTI_CB_DOMAIN_STATE) }?;
+    unsafe { profiler::enable_domain(1, subscriber, CUpti_CallbackDomain_CUPTI_CB_DOMAIN_NVTX) }?;
     unsafe {
         profiler::enable_callback(
             1,

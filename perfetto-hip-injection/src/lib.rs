@@ -237,7 +237,6 @@ impl GpuBackend for RocprofilerBackend {
                     let extra_fields: Vec<(String, String)> = vec![
                         ("kernel_name".to_string(), kd.kernel_name.clone()),
                         ("kernel_demangled_name".to_string(), demangled.clone()),
-                        ("kernel_type".to_string(), "Compute".to_string()),
                         ("process_id".to_string(), process_id.to_string()),
                         ("process_name".to_string(), process_name.clone()),
                         ("device_id".to_string(), kd.device_index.to_string()),

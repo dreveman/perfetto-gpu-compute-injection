@@ -203,21 +203,9 @@ impl GpuBackend for RocprofilerBackend {
                     // (gridDim * blockDim), not the number of blocks. Derive
                     // the actual grid (block count) by dividing out the
                     // workgroup size.
-                    let grid_x = if kd.workgroup.0 > 0 {
-                        kd.grid.0 / kd.workgroup.0
-                    } else {
-                        kd.grid.0
-                    };
-                    let grid_y = if kd.workgroup.1 > 0 {
-                        kd.grid.1 / kd.workgroup.1
-                    } else {
-                        kd.grid.1
-                    };
-                    let grid_z = if kd.workgroup.2 > 0 {
-                        kd.grid.2 / kd.workgroup.2
-                    } else {
-                        kd.grid.2
-                    };
+                    let grid_x = kd.grid.0.checked_div(kd.workgroup.0).unwrap_or(kd.grid.0);
+                    let grid_y = kd.grid.1.checked_div(kd.workgroup.1).unwrap_or(kd.grid.1);
+                    let grid_z = kd.grid.2.checked_div(kd.workgroup.2).unwrap_or(kd.grid.2);
                     let grid_size = grid_x * grid_y * grid_z;
                     let workgroup_size = kd.workgroup.0 * kd.workgroup.1 * kd.workgroup.2;
                     let thread_count = kd.grid.0 * kd.grid.1 * kd.grid.2;

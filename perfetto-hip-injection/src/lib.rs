@@ -20,7 +20,7 @@ mod state;
 use perfetto_gpu_compute_injection::injection_log;
 use perfetto_gpu_compute_injection::tracing::{
     get_counters_data_source, get_next_event_id, get_renderstages_data_source, register_backend,
-    GpuBackend, GOT_FIRST_RENDERSTAGES,
+    GpuBackend, GOT_FIRST_COUNTERS, GOT_FIRST_RENDERSTAGES,
 };
 use perfetto_sdk::{
     data_source::{StopGuard, TraceContext},
@@ -41,7 +41,9 @@ use perfetto_sdk_protos_gpu::protos::{
     },
     trace::{
         gpu::{
-            gpu_counter_event::{GpuCounterEvent, GpuCounterEventGpuCounter},
+            gpu_counter_event::{
+                GpuCounterEvent, GpuCounterEventGpuCounter, InternedGpuCounterDescriptor,
+            },
             gpu_render_stage_event::{
                 GpuRenderStageEvent, GpuRenderStageEventExtraData,
                 InternedGpuRenderStageSpecification,
@@ -80,6 +82,14 @@ const AMD_HW_QUEUE_IID_OFFSET: u64 = 1000;
 // ---------------------------------------------------------------------------
 
 struct RocprofilerBackend;
+
+/// Collected counter event data for emission outside of GLOBAL_STATE lock.
+struct CollectedCounterEvent {
+    start_ns: u64,
+    end_ns: u64,
+    device_index: i32,
+    values: Vec<f64>,
+}
 
 impl GpuBackend for RocprofilerBackend {
     fn default_data_source_suffix(&self) -> &'static str {
@@ -670,14 +680,6 @@ impl GpuBackend for RocprofilerBackend {
 
     fn emit_counter_events_for_instance(&self, inst_id: u32, stop_guard: Option<StopGuard>) {
         let _ = panic::catch_unwind(|| {
-            // Collected counter event data.
-            struct CollectedCounterEvent {
-                start_ns: u64,
-                end_ns: u64,
-                device_index: i32,
-                values: Vec<f64>,
-            }
-
             // Phase 1: Collect data under GLOBAL_STATE lock, then release.
             let (collected_events, counter_names) = {
                 let mut state = match GLOBAL_STATE.lock() {
@@ -717,37 +719,7 @@ impl GpuBackend for RocprofilerBackend {
 
             // Phase 2: Emit collected events without holding GLOBAL_STATE.
             // This prevents deadlock with buffer_callback which also needs GLOBAL_STATE.
-            //
-            // Counter ID offset and multi-GPU workaround (mode 1 / legacy inline
-            // descriptors):
-            //
-            // Counter IDs use a large offset (4096) to avoid collision with the
-            // gpu-probes crate's counters (Temperature, Power, Utilization, etc.)
-            // which use small counter_id values starting at 1.
-            //
-            // For multi-GPU support we assign globally unique counter_ids per GPU:
-            //   counter_id = COUNTER_ID_OFFSET + gpu_id * num_metrics + metric_index
-            //
-            // This is needed because the trace processor's mode 1 (inline
-            // counter_descriptor) keys its gpu_counter_state_ map by counter_id
-            // alone — there is no gpu_id in the key. If two GPUs share the same
-            // counter_id, the second GPU's descriptor overwrites the first and all
-            // samples land on one GPU's track.
-            //
-            // Each GPU's first GpuCounterEvent includes an inline
-            // counter_descriptor so the trace processor creates separate tracks
-            // per GPU (the descriptor's gpu_id associates tracks with the right
-            // GPU in the hierarchy).
-            //
-            // TODO: Switch to mode 2 (interned descriptors via
-            // counter_descriptor_iid and InternedGpuCounterDescriptor) once the
-            // gpu_counter_descriptors field is available in perfetto-sdk-protos-gpu's
-            // InternedData extension. At that point, counter_ids can be simplified
-            // and the per-GPU spacing logic can be removed.
-            const COUNTER_ID_OFFSET: u32 = 4096;
-            let num_metrics = counter_names.len() as u32;
-            let mut gpus_needing_descriptors: HashSet<i32> =
-                collected_events.iter().map(|e| e.device_index).collect();
+            let gpu_ids: HashSet<i32> = collected_events.iter().map(|e| e.device_index).collect();
             let mut stop_guard_opt = stop_guard;
             get_counters_data_source().trace(|ctx: &mut TraceContext| {
                 if ctx.instance_index() != inst_id {
@@ -755,68 +727,49 @@ impl GpuBackend for RocprofilerBackend {
                 }
                 for result in &collected_events {
                     let gpu_id = result.device_index;
-                    let emit_desc = gpus_needing_descriptors.remove(&gpu_id);
-                    if emit_desc {
+                    let got_first_counters =
+                        GOT_FIRST_COUNTERS.fetch_or(1 << inst_id, Ordering::SeqCst);
+                    ctx.with_incremental_state(|ctx: &mut TraceContext, inc_state| {
+                        let was_cleared = std::mem::replace(&mut inc_state.was_cleared, false);
+                        let emit_interned = was_cleared || got_first_counters & (1 << inst_id) == 0;
+                        if emit_interned {
+                            emit_interned_counter_descriptors(ctx, &counter_names, &gpu_ids);
+                        }
+                        let desc_iid = gpu_id as u64 + 1;
+                        // Emit start sample (zero values).
                         ctx.add_packet(|packet: &mut TracePacket| {
                             packet
                                 .set_timestamp(result.start_ns)
-                                .set_timestamp_clock_id(
-                                    BuiltinClock::BuiltinClockBoottime.into(),
-                                )
+                                .set_timestamp_clock_id(BuiltinClock::BuiltinClockBoottime.into())
                                 .set_gpu_counter_event(|event: &mut GpuCounterEvent| {
-                                    event.set_gpu_id(gpu_id).set_counter_descriptor(
-                                        |desc: &mut GpuCounterDescriptor| {
-                                            for (i, name) in counter_names.iter().enumerate() {
-                                                desc.set_specs(|spec: &mut GpuCounterDescriptorGpuCounterSpec| {
-                                                    spec.set_counter_id(
-                                                        COUNTER_ID_OFFSET + gpu_id as u32 * num_metrics + i as u32,
-                                                    );
-                                                    spec.set_name(name);
-                                                    spec.set_groups(GpuCounterDescriptorGpuCounterGroup::Compute);
-                                                });
-                                            }
-                                        },
-                                    );
+                                    event.set_counter_descriptor_iid(desc_iid);
+                                    for i in 0..counter_names.len() {
+                                        event.set_counters(
+                                            |counter: &mut GpuCounterEventGpuCounter| {
+                                                counter.set_counter_id(i as u32).set_int_value(0);
+                                            },
+                                        );
+                                    }
                                 });
                         });
-                    }
-                    ctx.add_packet(|packet: &mut TracePacket| {
-                        packet
-                            .set_timestamp(result.start_ns)
-                            .set_timestamp_clock_id(BuiltinClock::BuiltinClockBoottime.into())
-                            .set_gpu_counter_event(|event: &mut GpuCounterEvent| {
-                                event.set_gpu_id(gpu_id);
-                                for i in 0..counter_names.len() {
-                                    event.set_counters(
-                                        |counter: &mut GpuCounterEventGpuCounter| {
-                                            counter
-                                                .set_counter_id(
-                                                    COUNTER_ID_OFFSET + gpu_id as u32 * num_metrics + i as u32,
-                                                )
-                                                .set_int_value(0);
-                                        },
-                                    );
-                                }
-                            });
-                    });
-                    ctx.add_packet(|packet: &mut TracePacket| {
-                        packet
-                            .set_timestamp(result.end_ns)
-                            .set_timestamp_clock_id(BuiltinClock::BuiltinClockBoottime.into())
-                            .set_gpu_counter_event(|event: &mut GpuCounterEvent| {
-                                event.set_gpu_id(gpu_id);
-                                for (i, &value) in result.values.iter().enumerate() {
-                                    event.set_counters(
-                                        |counter: &mut GpuCounterEventGpuCounter| {
-                                            counter
-                                                .set_counter_id(
-                                                    COUNTER_ID_OFFSET + gpu_id as u32 * num_metrics + i as u32,
-                                                )
-                                                .set_double_value(value);
-                                        },
-                                    );
-                                }
-                            });
+                        // Emit end sample (actual values).
+                        ctx.add_packet(|packet: &mut TracePacket| {
+                            packet
+                                .set_timestamp(result.end_ns)
+                                .set_timestamp_clock_id(BuiltinClock::BuiltinClockBoottime.into())
+                                .set_gpu_counter_event(|event: &mut GpuCounterEvent| {
+                                    event.set_counter_descriptor_iid(desc_iid);
+                                    for (i, &value) in result.values.iter().enumerate() {
+                                        event.set_counters(
+                                            |counter: &mut GpuCounterEventGpuCounter| {
+                                                counter
+                                                    .set_counter_id(i as u32)
+                                                    .set_double_value(value);
+                                            },
+                                        );
+                                    }
+                                });
+                        });
                     });
                 }
                 let mut sg = Some(stop_guard_opt.take());
@@ -886,6 +839,42 @@ extern "C" fn end_execution() {
         for inst_id in counter_ids {
             amd.emit_counter_events_for_instance(inst_id, None);
         }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Counter descriptor interning helpers
+// ---------------------------------------------------------------------------
+
+/// Emit interned counter descriptors for all GPUs in the batch.
+///
+/// Each GPU gets one `InternedGpuCounterDescriptor` with iid = gpu_id + 1,
+/// containing all counter specs with simple 0-based counter_ids. The gpu_id
+/// on the interned descriptor handles per-GPU track separation.
+fn emit_interned_counter_descriptors(
+    ctx: &mut TraceContext,
+    counter_names: &[String],
+    gpu_ids: &HashSet<i32>,
+) {
+    ctx.add_packet(|packet: &mut TracePacket| {
+        packet.set_sequence_flags(TracePacketSequenceFlags::SeqIncrementalStateCleared as u32);
+        packet.set_interned_data(|interned: &mut InternedData| {
+            for &gpu_id in gpu_ids {
+                interned.set_gpu_counter_descriptors(|desc: &mut InternedGpuCounterDescriptor| {
+                    desc.set_iid(gpu_id as u64 + 1);
+                    desc.set_gpu_id(gpu_id);
+                    desc.set_counter_descriptor(|cd: &mut GpuCounterDescriptor| {
+                        for (i, name) in counter_names.iter().enumerate() {
+                            cd.set_specs(|spec: &mut GpuCounterDescriptorGpuCounterSpec| {
+                                spec.set_counter_id(i as u32);
+                                spec.set_name(name);
+                                spec.set_groups(GpuCounterDescriptorGpuCounterGroup::Compute);
+                            });
+                        }
+                    });
+                });
+            }
+        });
     });
 }
 

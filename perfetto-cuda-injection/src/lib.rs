@@ -908,7 +908,7 @@ fn emit_interned_specifications(
             };
             interned.set_gpu_specifications(|spec: &mut InternedGpuRenderStageSpecification| {
                 spec.set_iid(queue_iid);
-                spec.set_name(format!("Channel ({})", channel_id));
+                spec.set_name(format!("Channel #{}", channel_id + 1));
                 spec.set_category(queue_category);
             });
         }

@@ -364,15 +364,15 @@ impl GpuBackend for RocprofilerBackend {
                                         gctx.set_api(InternedGraphicsContextApi::Hip);
                                     },
                                 );
-                                for &queue_handle in &queues {
+                                for (idx, &queue_handle) in queues.iter().enumerate() {
                                     let iid =
                                         (queue_handle & 0xFFFF) + AMD_HW_QUEUE_IID_OFFSET;
                                     interned.set_gpu_specifications(
                                         |spec: &mut InternedGpuRenderStageSpecification| {
                                             spec.set_iid(iid);
                                             spec.set_name(format!(
-                                                "Queue ({})",
-                                                queue_handle
+                                                "Queue #{}",
+                                                idx + 1
                                             ));
                                             spec.set_category(
                                                 InternedGpuRenderStageSpecificationRenderStageCategory::Compute,

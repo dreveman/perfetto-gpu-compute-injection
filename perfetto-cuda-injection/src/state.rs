@@ -37,6 +37,8 @@ pub trait GpuActivity {
     fn channel_type(&self) -> u32;
     /// Stage IID for this activity type.
     fn stage_iid(&self) -> u64;
+    /// CUPTI correlation ID linking this GPU activity to its API call.
+    fn correlation_id(&self) -> u32;
     /// Emit extra_data fields specific to this activity type.
     fn emit_extra_data(
         &self,
@@ -93,6 +95,8 @@ pub struct KernelActivity {
     pub channel_id: u32,
     /// Channel type (compute, async memcpy, etc.).
     pub channel_type: u32,
+    /// CUPTI correlation ID linking this activity to its API call.
+    pub correlation_id: u32,
 }
 
 /// Stage IID constants for render stage events.
@@ -125,6 +129,9 @@ impl GpuActivity for KernelActivity {
     }
     fn stage_iid(&self) -> u64 {
         KERNEL_STAGE_IID
+    }
+    fn correlation_id(&self) -> u32 {
+        self.correlation_id
     }
     fn emit_extra_data(
         &self,
@@ -163,6 +170,8 @@ pub struct MemcpyActivity {
     pub channel_id: u32,
     /// Channel type.
     pub channel_type: u32,
+    /// CUPTI correlation ID linking this activity to its API call.
+    pub correlation_id: u32,
 }
 
 impl MemcpyActivity {
@@ -209,6 +218,9 @@ impl GpuActivity for MemcpyActivity {
     fn stage_iid(&self) -> u64 {
         MEMCPY_STAGE_IID
     }
+    fn correlation_id(&self) -> u32 {
+        self.correlation_id
+    }
     fn emit_extra_data(
         &self,
         process_id: i32,
@@ -249,6 +261,8 @@ pub struct MemsetActivity {
     pub channel_id: u32,
     /// Channel type.
     pub channel_type: u32,
+    /// CUPTI correlation ID linking this activity to its API call.
+    pub correlation_id: u32,
 }
 
 impl MemsetActivity {
@@ -292,6 +306,9 @@ impl GpuActivity for MemsetActivity {
     }
     fn stage_iid(&self) -> u64 {
         MEMSET_STAGE_IID
+    }
+    fn correlation_id(&self) -> u32 {
+        self.correlation_id
     }
     fn emit_extra_data(
         &self,

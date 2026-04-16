@@ -20,7 +20,7 @@ mod state;
 use perfetto_gpu_compute_injection::injection_log;
 use perfetto_gpu_compute_injection::tracing::{
     get_counters_data_source, get_next_event_id, get_renderstages_data_source, register_backend,
-    GpuBackend, GOT_FIRST_COUNTERS, GOT_FIRST_RENDERSTAGES,
+    GpuBackend,
 };
 use perfetto_sdk::{
     data_source::{StopGuard, TraceContext},
@@ -57,7 +57,7 @@ use perfetto_sdk_protos_gpu::protos::{
 };
 use rocprofiler_sys::*;
 use state::{ConsumerStartOffsets, CounterConsumerStartOffsets, GLOBAL_STATE};
-use std::{collections::HashSet, panic, sync::atomic::Ordering};
+use std::{collections::HashSet, panic};
 
 // ---------------------------------------------------------------------------
 // Track event categories for HIP API call tracing
@@ -346,12 +346,8 @@ impl GpuBackend for RocprofilerBackend {
                 ctx.with_incremental_state(|ctx: &mut TraceContext, inc_state| {
                     let was_cleared =
                         std::mem::replace(&mut inc_state.was_cleared, false);
-                    let got_first =
-                        GOT_FIRST_RENDERSTAGES.fetch_or(1 << inst_id, Ordering::SeqCst);
-                    let emit_interned =
-                        was_cleared || got_first & (1 << inst_id) == 0;
 
-                    if emit_interned {
+                    if was_cleared {
                         ctx.add_packet(|packet: &mut TracePacket| {
                             packet.set_sequence_flags(
                                 TracePacketSequenceFlags::SeqIncrementalStateCleared as u32,
@@ -727,12 +723,9 @@ impl GpuBackend for RocprofilerBackend {
                 }
                 for result in &collected_events {
                     let gpu_id = result.device_index;
-                    let got_first_counters =
-                        GOT_FIRST_COUNTERS.fetch_or(1 << inst_id, Ordering::SeqCst);
                     ctx.with_incremental_state(|ctx: &mut TraceContext, inc_state| {
                         let was_cleared = std::mem::replace(&mut inc_state.was_cleared, false);
-                        let emit_interned = was_cleared || got_first_counters & (1 << inst_id) == 0;
-                        if emit_interned {
+                        if was_cleared {
                             emit_interned_counter_descriptors(ctx, &counter_names, &gpu_ids);
                         }
                         let desc_iid = gpu_id as u64 + 1;

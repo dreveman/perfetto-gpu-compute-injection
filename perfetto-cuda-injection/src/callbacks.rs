@@ -358,8 +358,28 @@ pub unsafe extern "C" fn profiler_callback_handler(
                 } else {
                     0
                 };
-                let should_profile = profiled_instances != 0;
+                // Phase 3: skip/count filtering (requires GLOBAL_STATE lock
+                // for per-instance dispatch counters).
+                let mut profiled_instances = profiled_instances;
                 if let Ok(mut state) = GLOBAL_STATE.lock() {
+                    if profiled_instances != 0 {
+                        for id in 0..8u32 {
+                            if profiled_instances & (1 << id) == 0 {
+                                continue;
+                            }
+                            if let Some(cfg) = get_counter_config(id) {
+                                let isc = &cfg.instrumented_sampling_config;
+                                if !isc.activity_ranges.is_empty() {
+                                    let count = state.dispatch_counters[id as usize];
+                                    state.dispatch_counters[id as usize] += 1;
+                                    if !isc.should_profile_at_count(count) {
+                                        profiled_instances &= !(1 << id);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let should_profile = profiled_instances != 0;
                     let active_ctx = state.active_ctx;
                     // Only manage range profiler sessions when instrumented sampling is enabled
                     if should_profile {

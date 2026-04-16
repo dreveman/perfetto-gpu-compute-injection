@@ -36,13 +36,19 @@ const PERFETTO_CLOCK_ID: u32 = 6; // BUILTIN_CLOCK_BOOTTIME
 #[cfg(not(target_os = "linux"))]
 const PERFETTO_CLOCK_ID: u32 = 3; // BUILTIN_CLOCK_MONOTONIC
 use perfetto_sdk::data_source::{DataSource, TraceContext};
-use perfetto_sdk::protos::trace::trace_packet::TracePacket;
+use perfetto_sdk::protos::trace::{
+    interned_data::interned_data::InternedData,
+    trace_packet::{TracePacket, TracePacketSequenceFlags},
+};
 use perfetto_sdk_protos_gpu::protos::{
     common::gpu_counter_descriptor::{
         GpuCounterDescriptor, GpuCounterDescriptorGpuCounterGroup,
         GpuCounterDescriptorGpuCounterSpec, GpuCounterDescriptorMeasureUnit,
     },
-    trace::gpu::gpu_counter_event::{GpuCounterEvent, GpuCounterEventGpuCounter},
+    trace::gpu::gpu_counter_event::{
+        GpuCounterEvent, GpuCounterEventGpuCounter, InternedGpuCounterDescriptor,
+    },
+    trace::interned_data::interned_data::prelude::*,
     trace::system_info::gpu_info::{GpuInfo, GpuInfoGpu},
     trace::trace_packet::prelude::TracePacketExt as GpuTracePacketExt,
 };
@@ -190,48 +196,6 @@ fn emit_ftrace_gpu_mem_total(ctx: &mut TraceContext, samples: &[MemSample], time
 }
 
 /// Counter identifier for a specific GPU counter.
-///
-/// # Multi-GPU counter_id workaround (mode 1 / legacy inline descriptors)
-///
-/// The `GpuCounterEvent` proto supports two descriptor modes:
-///
-///   **Mode 1** — inline `counter_descriptor` on the event itself.
-///   **Mode 2** — `counter_descriptor_iid` referencing an `InternedGpuCounterDescriptor`
-///                in `InternedData` (field 47), which carries its own `gpu_id`.
-///
-/// Mode 2 is the correct solution for multi-GPU: each GPU gets its own interned
-/// descriptor with a distinct `gpu_id`, and the trace processor keys its state
-/// by `TrackId` (derived from `(ugpu, gpu_id, name)`), so counter_ids can be
-/// reused across GPUs without collision.
-///
-/// However, the Rust SDK (`perfetto-sdk-protos-gpu`) does not yet expose the
-/// `gpu_counter_descriptors` field (proto field 47) on `InternedData`, so we
-/// cannot use mode 2 yet.
-///
-/// In mode 1, the trace processor (`gpu_event_parser.cc`) maintains a flat
-/// `gpu_counter_state_` map keyed by `counter_id` alone — there is no `gpu_id`
-/// in the key. When a descriptor is present, it calls
-/// `InternGpuCounterTrack(event.gpu_id(), spec)` to create a track with the
-/// correct GPU association. But on subsequent events (without a descriptor), it
-/// looks up the `TrackId` solely via `gpu_counter_state_[counter_id]`. If two
-/// GPUs share the same counter_id, the second GPU's descriptor overwrites the
-/// first GPU's mapping, and all subsequent samples land on one GPU's track.
-///
-/// **Workaround**: we assign globally unique counter_ids per GPU by computing
-/// `counter_id = gpu_index * NUM_COUNTER_KINDS + base_id`. Each GPU's first
-/// `GpuCounterEvent` includes an inline `counter_descriptor` with that GPU's
-/// counter_ids. The trace processor creates separate tracks per GPU because:
-///   1. Each GPU has distinct counter_ids, avoiding `gpu_counter_state_` collisions.
-///   2. `event.gpu_id()` is set correctly, so `InternGpuCounterTrack` associates
-///      the tracks with the right GPU in the track hierarchy.
-///   3. Counter names remain identical across GPUs ("Temperature", "Power", etc.)
-///      — the trace processor distinguishes tracks via `(ugpu, gpu_id, name)`.
-///
-/// **TODO**: Switch to mode 2 (interned descriptors via `counter_descriptor_iid`
-/// and `InternedGpuCounterDescriptor`) once the `gpu_counter_descriptors` field
-/// is available in `perfetto-sdk-protos-gpu`'s `InternedData` extension. At that
-/// point, counter_ids can go back to a simple 1-based enum and the per-GPU
-/// spacing logic below can be removed.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum CounterKind {
     Temperature,
@@ -247,24 +211,14 @@ const ALL_COUNTER_KINDS: [CounterKind; 4] = [
     CounterKind::MemUtilization,
 ];
 
-const NUM_COUNTER_KINDS: u32 = ALL_COUNTER_KINDS.len() as u32;
-
 impl CounterKind {
-    fn base_id(&self) -> u32 {
+    fn counter_id(&self) -> u32 {
         match self {
             Self::Temperature => 1,
             Self::PowerW => 2,
             Self::Utilization => 3,
             Self::MemUtilization => 4,
         }
-    }
-
-    /// Returns a counter_id unique per (gpu_index, kind) pair.
-    ///
-    /// See the module-level comment on [`CounterKind`] for why this is needed
-    /// (mode 1 workaround for multi-GPU counter track separation).
-    fn counter_id(&self, gpu_index: u32) -> u32 {
-        gpu_index * NUM_COUNTER_KINDS + self.base_id()
     }
 
     fn name(&self) -> &'static str {
@@ -296,18 +250,50 @@ struct CounterSample {
     value: f64,
 }
 
+/// Emits interned counter descriptors for all GPUs.
+///
+/// Each GPU gets one `InternedGpuCounterDescriptor` with iid = gpu_index + 1,
+/// containing all counter specs. The gpu_id on the interned descriptor handles
+/// per-GPU track separation in the trace processor.
+fn emit_interned_counter_descriptors(ctx: &mut TraceContext, gpu_indices: &HashSet<u32>) {
+    ctx.add_packet(|packet: &mut TracePacket| {
+        packet.set_sequence_flags(TracePacketSequenceFlags::SeqIncrementalStateCleared as u32);
+        packet.set_interned_data(|interned: &mut InternedData| {
+            for &gpu_index in gpu_indices {
+                interned.set_gpu_counter_descriptors(|desc: &mut InternedGpuCounterDescriptor| {
+                    desc.set_iid(gpu_index as u64 + 1);
+                    desc.set_gpu_id(gpu_index as i32);
+                    desc.set_counter_descriptor(|cd: &mut GpuCounterDescriptor| {
+                        for kind in &ALL_COUNTER_KINDS {
+                            cd.set_specs(|spec: &mut GpuCounterDescriptorGpuCounterSpec| {
+                                spec.set_counter_id(kind.counter_id());
+                                spec.set_name(kind.name());
+                                spec.set_numerator_units(kind.unit());
+                                spec.set_groups(kind.group());
+                            });
+                        }
+                    });
+                });
+            }
+        });
+    });
+}
+
 /// Emits GpuCounterEvent packets for changed counter values.
 ///
-/// Each GPU's first event includes an inline `counter_descriptor` with that
-/// GPU's unique counter_ids (see [`CounterKind`] doc for details on the mode 1
-/// multi-GPU workaround). `gpus_needing_descriptors` tracks which GPUs have
-/// not yet had their descriptor emitted.
+/// Counter events reference the interned descriptor via `counter_descriptor_iid`.
 fn emit_gpu_counter_events(
     ctx: &mut TraceContext,
     samples: &[CounterSample],
-    gpus_needing_descriptors: &mut HashSet<u32>,
+    descriptors_emitted: &mut bool,
+    gpu_indices: &HashSet<u32>,
     timestamp: u64,
 ) {
+    if !*descriptors_emitted {
+        emit_interned_counter_descriptors(ctx, gpu_indices);
+        *descriptors_emitted = true;
+    }
+
     // Group samples by gpu_index so each GPU gets one GpuCounterEvent packet.
     let mut by_gpu: HashMap<u32, Vec<&CounterSample>> = HashMap::new();
     for s in samples {
@@ -315,28 +301,16 @@ fn emit_gpu_counter_events(
     }
 
     for (&gpu_index, gpu_samples) in &by_gpu {
-        let emit_desc = gpus_needing_descriptors.remove(&gpu_index);
+        let desc_iid = gpu_index as u64 + 1;
         ctx.add_packet(|packet: &mut TracePacket| {
             packet.set_timestamp(timestamp);
             packet.set_timestamp_clock_id(PERFETTO_CLOCK_ID);
             packet.set_gpu_counter_event(|event: &mut GpuCounterEvent| {
-                event.set_gpu_id(gpu_index as i32);
+                event.set_counter_descriptor_iid(desc_iid);
                 for s in gpu_samples {
                     event.set_counters(|counter: &mut GpuCounterEventGpuCounter| {
-                        counter.set_counter_id(s.kind.counter_id(s.gpu_index));
+                        counter.set_counter_id(s.kind.counter_id());
                         counter.set_double_value(s.value);
-                    });
-                }
-                if emit_desc {
-                    event.set_counter_descriptor(|desc: &mut GpuCounterDescriptor| {
-                        for kind in &ALL_COUNTER_KINDS {
-                            desc.set_specs(|spec: &mut GpuCounterDescriptorGpuCounterSpec| {
-                                spec.set_counter_id(kind.counter_id(gpu_index));
-                                spec.set_name(kind.name());
-                                spec.set_numerator_units(kind.unit());
-                                spec.set_groups(kind.group());
-                            });
-                        }
                     });
                 }
             });
@@ -432,7 +406,8 @@ pub(crate) fn run_poll_loop<G: PollableGpu>(
     let mut last_power: Vec<Option<u32>> = vec![None; gpus.len()];
     let mut last_gpu_util: Vec<Option<u32>> = vec![None; gpus.len()];
     let mut last_mem_util: Vec<Option<u32>> = vec![None; gpus.len()];
-    let mut gpus_needing_descriptors: HashSet<u32> = gpus.iter().map(|g| g.index()).collect();
+    let gpu_indices: HashSet<u32> = gpus.iter().map(|g| g.index()).collect();
+    let mut descriptors_emitted = false;
 
     while !stop.is_stopped() {
         // Collect changed samples before entering the trace closure.
@@ -561,7 +536,8 @@ pub(crate) fn run_poll_loop<G: PollableGpu>(
                     emit_gpu_counter_events(
                         ctx,
                         &counter_samples,
-                        &mut gpus_needing_descriptors,
+                        &mut descriptors_emitted,
+                        &gpu_indices,
                         timestamp,
                     );
                 }
@@ -638,7 +614,8 @@ pub(crate) fn run_poll_loop<G: PollableGpu>(
                 emit_gpu_counter_events(
                     ctx,
                     &final_counter_samples,
-                    &mut gpus_needing_descriptors,
+                    &mut descriptors_emitted,
+                    &gpu_indices,
                     timestamp,
                 );
             }

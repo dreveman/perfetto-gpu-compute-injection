@@ -20,6 +20,7 @@ use crate::state::{
     AgentInfo, CounterResult, KernelDispatch, MemcopyActivity, MemsetActivity, GLOBAL_STATE,
 };
 use perfetto_gpu_compute_injection::injection_log;
+use perfetto_gpu_compute_injection::tracing::get_counter_config;
 use perfetto_sdk::track_event::{
     EventContext, TrackEventProtoField, TrackEventProtoFields, TrackEventTimestamp,
     TrackEventTrack, TrackEventType,
@@ -377,12 +378,81 @@ pub unsafe extern "C" fn dispatch_counting_callback(
     _callback_data: *mut std::os::raw::c_void,
 ) {
     let _ = panic::catch_unwind(|| {
-        let agent_handle = dispatch_data.dispatch_info.agent_id.handle;
-        if let Ok(state) = GLOBAL_STATE.lock() {
-            if let Some(&config_handle) = state.counter_configs.get(&agent_handle) {
-                *config = rocprofiler_counter_config_id_t {
-                    handle: config_handle,
-                };
+        let info = &dispatch_data.dispatch_info;
+        let agent_handle = info.agent_id.handle;
+        if let Ok(mut state) = GLOBAL_STATE.lock() {
+            // Look up kernel name for filtering.
+            let kernel_name = state
+                .kernel_names
+                .get(&info.kernel_id)
+                .cloned()
+                .unwrap_or_default();
+
+            // Skip internal ROCm runtime kernels (same check as buffer_callback).
+            if kernel_name.starts_with("__amd_rocclr_") {
+                return;
+            }
+
+            // Compute profiled_instances bitmask.
+            let mut mask: u8 = 0;
+            // Phase 1: kernel name filtering.
+            let mut need_demangled = false;
+            for id in 0..8u32 {
+                if let Some(cfg) = get_counter_config(id) {
+                    let isc = &cfg.instrumented_sampling_config;
+                    if isc.activity_name_filters.is_empty() {
+                        mask |= 1 << id;
+                    } else {
+                        need_demangled = true;
+                    }
+                }
+            }
+            if need_demangled {
+                let demangled = perfetto_gpu_compute_injection::kernel::demangle_name(&kernel_name);
+                for id in 0..8u32 {
+                    if mask & (1 << id) != 0 {
+                        continue;
+                    }
+                    if let Some(cfg) = get_counter_config(id) {
+                        if cfg
+                            .instrumented_sampling_config
+                            .should_profile_kernel(&kernel_name, &demangled)
+                        {
+                            mask |= 1 << id;
+                        }
+                    }
+                }
+            }
+            // Phase 2: NVTX filtering — skipped for HIP (no roctx callbacks).
+            // Phase 3: skip/count filtering.
+            if mask != 0 {
+                for id in 0..8u32 {
+                    if mask & (1 << id) == 0 {
+                        continue;
+                    }
+                    if let Some(cfg) = get_counter_config(id) {
+                        let isc = &cfg.instrumented_sampling_config;
+                        if !isc.activity_ranges.is_empty() {
+                            let count = state.dispatch_counters[id as usize];
+                            state.dispatch_counters[id as usize] += 1;
+                            if !isc.should_profile_at_count(count) {
+                                mask &= !(1 << id);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if mask != 0 {
+                if let Some(&config_handle) = state.counter_configs.get(&agent_handle) {
+                    *config = rocprofiler_counter_config_id_t {
+                        handle: config_handle,
+                    };
+                }
+                // Store bitmask for record_counting_callback to pick up.
+                state
+                    .dispatch_profiled_instances
+                    .insert(dispatch_data.correlation_id.internal, mask);
             }
         }
     });
@@ -486,12 +556,19 @@ pub unsafe extern "C" fn record_counting_callback(
             }
         }
 
+        // Retrieve the profiled_instances bitmask stored by dispatch_counting_callback.
+        let profiled_instances = state
+            .dispatch_profiled_instances
+            .remove(&dispatch_data.correlation_id.internal)
+            .unwrap_or(0xFF); // default: all instances if no filtering was applied
+
         state.counter_results.push(CounterResult {
             kernel_name,
             start_ns: dispatch_data.start_timestamp,
             end_ns: dispatch_data.end_timestamp,
             device_index,
             values,
+            profiled_instances,
         });
     });
 }

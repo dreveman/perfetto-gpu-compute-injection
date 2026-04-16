@@ -89,6 +89,8 @@ struct CollectedCounterEvent {
     end_ns: u64,
     device_index: i32,
     values: Vec<f64>,
+    /// Bitmask of instance IDs that want counters for this dispatch.
+    profiled_instances: u8,
 }
 
 impl GpuBackend for RocprofilerBackend {
@@ -733,6 +735,7 @@ impl GpuBackend for RocprofilerBackend {
                         end_ns: r.end_ns,
                         device_index: r.device_index,
                         values: r.values.clone(),
+                        profiled_instances: r.profiled_instances,
                     })
                     .collect();
                 let emitted = events.len();
@@ -740,6 +743,14 @@ impl GpuBackend for RocprofilerBackend {
                 (events, counter_names)
                 // state (GLOBAL_STATE lock) dropped here
             };
+
+            // Per-instance filtering: skip dispatches where this instance's
+            // bit is not set in profiled_instances.
+            let inst_bit = 1u8 << inst_id;
+            let collected_events: Vec<_> = collected_events
+                .into_iter()
+                .filter(|e| e.profiled_instances & inst_bit != 0)
+                .collect();
 
             // Filter counter_names and values to only those requested by
             // this instance's config. When counter_names is empty in the

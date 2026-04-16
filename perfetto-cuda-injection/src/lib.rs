@@ -23,8 +23,8 @@ use metrics::parse_metrics;
 use perfetto_gpu_compute_injection::config::Config;
 use perfetto_gpu_compute_injection::injection_log;
 use perfetto_gpu_compute_injection::tracing::{
-    get_counters_data_source, get_next_event_id, get_renderstages_data_source, register_backend,
-    trace_time_ns, GpuBackend,
+    get_counter_config, get_counters_data_source, get_next_event_id, get_renderstages_data_source,
+    register_backend, trace_time_ns, GpuBackend,
 };
 use perfetto_sdk::{
     data_source::{StopGuard, TraceContext},
@@ -127,7 +127,31 @@ impl GpuBackend for CuptiBackend {
         }
     }
 
-    fn on_first_counters_start(&self) {}
+    fn on_first_counters_start(&self) {
+        // Compute the union of counter_names across all active instances.
+        // The profiler collects all requested metrics; each instance only
+        // sees the subset it asked for during emission.
+        let mut union_names: Vec<String> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        for id in 0..8u32 {
+            if let Some(cfg) = get_counter_config(id) {
+                for name in &cfg.counter_names {
+                    if seen.insert(name.clone()) {
+                        union_names.push(name.clone());
+                    }
+                }
+            }
+        }
+        if !union_names.is_empty() {
+            if let Ok(mut state) = GLOBAL_STATE.lock() {
+                injection_log!(
+                    "using {} counter names from trace config (union of all instances)",
+                    union_names.len()
+                );
+                state.config.metrics = union_names;
+            }
+        }
+    }
 
     fn on_last_counters_stop(&self) {}
 
@@ -271,6 +295,28 @@ impl GpuBackend for CuptiBackend {
                 }
                 events
                 // state (GLOBAL_STATE lock) dropped here
+            };
+
+            // Filter metrics to only those requested by this instance's config.
+            // When counter_names is empty (env var fallback), emit all metrics.
+            let collected_events = if let Some(cfg) = get_counter_config(inst_id) {
+                if cfg.counter_names.is_empty() {
+                    collected_events
+                } else {
+                    let requested: HashSet<&str> =
+                        cfg.counter_names.iter().map(|s| s.as_str()).collect();
+                    collected_events
+                        .into_iter()
+                        .map(|mut e| {
+                            e.metrics
+                                .retain(|(name, _)| requested.contains(name.as_str()));
+                            e
+                        })
+                        .filter(|e| !e.metrics.is_empty())
+                        .collect()
+                }
+            } else {
+                collected_events
             };
 
             // Phase 2: Emit collected events without holding GLOBAL_STATE.

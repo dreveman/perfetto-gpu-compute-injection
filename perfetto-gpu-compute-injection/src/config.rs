@@ -97,6 +97,20 @@ pub fn parse_metrics(input: &str, defaults: &[&str]) -> Vec<String> {
         .collect()
 }
 
+/// Parsed `GpuCounterConfig` fields from the Perfetto trace config.
+///
+/// Populated in the counters data source `on_setup` callback.
+/// Extensible for future fields (e.g., `InstrumentedSamplingConfig`
+/// activity filters, ranges).
+#[derive(Debug, Clone, Default)]
+pub struct CounterConfig {
+    /// Whether instrumented (per-kernel) counter sampling is enabled.
+    pub instrumented_sampling: bool,
+    /// Metric names from the trace config's `counter_names` field.
+    /// When non-empty, these override `INJECTION_METRICS` and backend defaults.
+    pub counter_names: Vec<String>,
+}
+
 impl Config {
     /// Loads configuration from environment variables.
     ///

@@ -19,8 +19,8 @@ mod state;
 
 use perfetto_gpu_compute_injection::injection_log;
 use perfetto_gpu_compute_injection::tracing::{
-    get_counters_data_source, get_next_event_id, get_renderstages_data_source, register_backend,
-    GpuBackend,
+    get_counter_config, get_counters_data_source, get_next_event_id, get_renderstages_data_source,
+    register_backend, GpuBackend,
 };
 use perfetto_sdk::{
     data_source::{StopGuard, TraceContext},
@@ -454,6 +454,30 @@ impl GpuBackend for RocprofilerBackend {
         // enumerate counters when only gpu.renderstages is enabled.
         use callbacks::{dispatch_counting_callback, record_counting_callback};
 
+        // Compute the union of counter_names across all active instances.
+        // The profiler collects all requested metrics; each instance only
+        // sees the subset it asked for during emission.
+        let mut union_names: Vec<String> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        for id in 0..8u32 {
+            if let Some(cfg) = get_counter_config(id) {
+                for name in &cfg.counter_names {
+                    if seen.insert(name.clone()) {
+                        union_names.push(name.clone());
+                    }
+                }
+            }
+        }
+        if !union_names.is_empty() {
+            if let Ok(mut state) = GLOBAL_STATE.lock() {
+                injection_log!(
+                    "using {} counter names from trace config (union of all instances)",
+                    union_names.len()
+                );
+                state.config.metrics = union_names;
+            }
+        }
+
         let requested_metrics: Vec<String> = GLOBAL_STATE
             .lock()
             .ok()
@@ -713,6 +737,34 @@ impl GpuBackend for RocprofilerBackend {
                 // state (GLOBAL_STATE lock) dropped here
             };
 
+            // Filter counter_names and values to only those requested by
+            // this instance's config. When counter_names is empty in the
+            // config (env var fallback), emit all counters.
+            let (filtered_names, filter_indices): (Vec<String>, Option<Vec<usize>>) =
+                if let Some(cfg) = get_counter_config(inst_id) {
+                    if cfg.counter_names.is_empty() {
+                        (counter_names, None)
+                    } else {
+                        let requested: HashSet<&str> =
+                            cfg.counter_names.iter().map(|s| s.as_str()).collect();
+                        let indices: Vec<usize> = counter_names
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, n)| requested.contains(n.as_str()))
+                            .map(|(i, _)| i)
+                            .collect();
+                        let names: Vec<String> =
+                            indices.iter().map(|&i| counter_names[i].clone()).collect();
+                        (names, Some(indices))
+                    }
+                } else {
+                    (counter_names, None)
+                };
+
+            if filtered_names.is_empty() {
+                return;
+            }
+
             // Phase 2: Emit collected events without holding GLOBAL_STATE.
             // This prevents deadlock with buffer_callback which also needs GLOBAL_STATE.
             let gpu_ids: HashSet<i32> = collected_events.iter().map(|e| e.device_index).collect();
@@ -726,7 +778,7 @@ impl GpuBackend for RocprofilerBackend {
                     ctx.with_incremental_state(|ctx: &mut TraceContext, inc_state| {
                         let was_cleared = std::mem::replace(&mut inc_state.was_cleared, false);
                         if was_cleared {
-                            emit_interned_counter_descriptors(ctx, &counter_names, &gpu_ids);
+                            emit_interned_counter_descriptors(ctx, &filtered_names, &gpu_ids);
                         }
                         let desc_iid = gpu_id as u64 + 1;
                         // Emit start sample (zero values).
@@ -736,7 +788,7 @@ impl GpuBackend for RocprofilerBackend {
                                 .set_timestamp_clock_id(BuiltinClock::BuiltinClockBoottime.into())
                                 .set_gpu_counter_event(|event: &mut GpuCounterEvent| {
                                     event.set_counter_descriptor_iid(desc_iid);
-                                    for i in 0..counter_names.len() {
+                                    for i in 0..filtered_names.len() {
                                         event.set_counters(
                                             |counter: &mut GpuCounterEventGpuCounter| {
                                                 counter.set_counter_id(i as u32).set_int_value(0);
@@ -752,12 +804,19 @@ impl GpuBackend for RocprofilerBackend {
                                 .set_timestamp_clock_id(BuiltinClock::BuiltinClockBoottime.into())
                                 .set_gpu_counter_event(|event: &mut GpuCounterEvent| {
                                     event.set_counter_descriptor_iid(desc_iid);
-                                    for (i, &value) in result.values.iter().enumerate() {
+                                    let values_iter: Vec<f64> = match &filter_indices {
+                                        Some(indices) => indices
+                                            .iter()
+                                            .filter_map(|&i| result.values.get(i).copied())
+                                            .collect(),
+                                        None => result.values.clone(),
+                                    };
+                                    for (i, value) in values_iter.iter().enumerate() {
                                         event.set_counters(
                                             |counter: &mut GpuCounterEventGpuCounter| {
                                                 counter
                                                     .set_counter_id(i as u32)
-                                                    .set_double_value(value);
+                                                    .set_double_value(*value);
                                             },
                                         );
                                     }

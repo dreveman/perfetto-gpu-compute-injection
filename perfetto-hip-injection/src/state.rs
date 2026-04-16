@@ -25,6 +25,8 @@ pub struct CounterResult {
     pub end_ns: u64,
     pub device_index: i32,
     pub values: Vec<f64>, // values in same order as counter_names
+    /// Bitmask of data source instance IDs that requested counters for this dispatch.
+    pub profiled_instances: u8,
 }
 
 /// Snapshot of counter_results length when a Perfetto counter consumer starts.
@@ -145,6 +147,11 @@ pub struct GlobalState {
     pub thread_names: HashMap<u64, String>,
     pub config: Config,
     pub initialized: bool,
+    /// Per-instance dispatch counter for activity_ranges skip/count sampling.
+    pub dispatch_counters: [u64; 8],
+    /// Temporary per-dispatch profiled_instances bitmask, keyed by correlation_id.
+    /// Set in dispatch_counting_callback, consumed in record_counting_callback.
+    pub dispatch_profiled_instances: HashMap<u64, u8>,
 }
 
 #[allow(clippy::derivable_impls)]
@@ -168,6 +175,8 @@ impl Default for GlobalState {
             thread_names: HashMap::new(),
             config: Config::default(),
             initialized: false,
+            dispatch_counters: [0; 8],
+            dispatch_profiled_instances: HashMap::new(),
         }
     }
 }

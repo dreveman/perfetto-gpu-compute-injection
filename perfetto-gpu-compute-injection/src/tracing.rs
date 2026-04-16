@@ -109,12 +109,6 @@ pub fn get_next_event_id() -> u64 {
     NEXT_EVENT_ID.fetch_add(1, Ordering::SeqCst)
 }
 
-/// Tracks whether the first counters have been received for a given data source instance.
-pub static GOT_FIRST_COUNTERS: AtomicU8 = AtomicU8::new(0);
-
-/// Tracks whether the first renderstages have been emitted for a given data source instance.
-pub static GOT_FIRST_RENDERSTAGES: AtomicU8 = AtomicU8::new(0);
-
 /// Bitmask of currently active counters data source instances (one bit per inst_id 0-7).
 /// Non-zero means at least one counters consumer is running.
 /// Always stays 0 for AMD since the AMD backend never registers the counters data source.
@@ -238,7 +232,6 @@ pub fn get_counters_data_source() -> &'static DataSource<'static> {
                 );
             })
             .on_start(move |inst_id, _| {
-                GOT_FIRST_COUNTERS.fetch_and(!(1 << inst_id), Ordering::SeqCst);
                 let prev = COUNTERS_ACTIVE_MASK.fetch_or(1 << inst_id, Ordering::SeqCst);
                 // Snapshot start offsets before any kernels are recorded for this instance.
                 backend().register_counters_consumer(inst_id);
@@ -331,7 +324,6 @@ pub fn get_renderstages_data_source() -> &'static DataSource<'static> {
             .buffer_exhausted_policy(DataSourceBufferExhaustedPolicy::StallAndAbort)
             .will_notify_on_stop(true)
             .on_start(move |inst_id, _| {
-                GOT_FIRST_RENDERSTAGES.fetch_and(!(1 << inst_id), Ordering::SeqCst);
                 let prev = RENDERSTAGES_ACTIVE_MASK.fetch_or(1 << inst_id, Ordering::SeqCst);
                 backend().register_renderstages_consumer(inst_id);
                 if prev == 0 && !is_counters_enabled() {

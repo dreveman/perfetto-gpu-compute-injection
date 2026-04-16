@@ -24,7 +24,7 @@ use perfetto_gpu_compute_injection::config::Config;
 use perfetto_gpu_compute_injection::injection_log;
 use perfetto_gpu_compute_injection::tracing::{
     get_counters_data_source, get_next_event_id, get_renderstages_data_source, register_backend,
-    trace_time_ns, GpuBackend, GOT_FIRST_COUNTERS, GOT_FIRST_RENDERSTAGES,
+    trace_time_ns, GpuBackend,
 };
 use perfetto_sdk::{
     data_source::{StopGuard, TraceContext},
@@ -283,12 +283,9 @@ impl GpuBackend for CuptiBackend {
                     return;
                 }
                 for event in &collected_events {
-                    let got_first_counters =
-                        GOT_FIRST_COUNTERS.fetch_or(1 << inst_id, Ordering::SeqCst);
                     ctx.with_incremental_state(|ctx: &mut TraceContext, inc_state| {
                         let was_cleared = std::mem::replace(&mut inc_state.was_cleared, false);
-                        let emit_interned = was_cleared || got_first_counters & (1 << inst_id) == 0;
-                        if emit_interned {
+                        if was_cleared {
                             emit_interned_counter_descriptors(ctx, &collected_events, &gpu_ids);
                         }
                         // Emit start sample (zero values).
@@ -765,12 +762,8 @@ impl GpuBackend for CuptiBackend {
                 for event in &all_events {
                     let timestamp = event.start;
                     let duration_ns = event.end.saturating_sub(event.start);
-                    let got_first_renderstages =
-                        GOT_FIRST_RENDERSTAGES.fetch_or(1 << inst_id, Ordering::SeqCst);
                     ctx.with_incremental_state(|ctx: &mut TraceContext, inc_state| {
                         let was_cleared = std::mem::replace(&mut inc_state.was_cleared, false);
-                        let emit_interned =
-                            was_cleared || got_first_renderstages & (1 << inst_id) == 0;
                         let rs_ctx = RenderStageContext {
                             channels: &channels,
                             contexts: &contexts,
@@ -781,7 +774,7 @@ impl GpuBackend for CuptiBackend {
                             event,
                             timestamp,
                             duration_ns,
-                            emit_interned,
+                            was_cleared,
                             &rs_ctx,
                             &event.name,
                             &event.extra_data,

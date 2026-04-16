@@ -610,7 +610,6 @@ impl GpuBackend for CuptiBackend {
                         };
                         emit("kernel_name", &activity.kernel_name);
                         emit("kernel_demangled_name", &demangled);
-                        emit("kernel_type", "Compute");
                         emit("process_id", &process_id.to_string());
                         emit("process_name", &process_name);
                         emit("device_id", &activity.device_id.to_string());

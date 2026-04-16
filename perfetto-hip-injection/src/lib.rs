@@ -19,8 +19,8 @@ mod state;
 
 use perfetto_gpu_compute_injection::injection_log;
 use perfetto_gpu_compute_injection::tracing::{
-    get_counter_config, get_counters_data_source, get_next_event_id, get_renderstages_data_source,
-    register_backend, GpuBackend,
+    get_counter_config, get_counters_data_source, get_renderstages_data_source, register_backend,
+    GpuBackend,
 };
 use perfetto_sdk::{
     data_source::{StopGuard, TraceContext},
@@ -162,6 +162,7 @@ impl GpuBackend for RocprofilerBackend {
                 stage_iid: u64,
                 name: String,
                 extra_fields: Vec<(String, String)>,
+                correlation_id: u64,
             }
 
             let (events, queues) = {
@@ -276,6 +277,7 @@ impl GpuBackend for RocprofilerBackend {
                         name: perfetto_gpu_compute_injection::kernel::simplify_name(&demangled)
                             .to_string(),
                         extra_fields,
+                        correlation_id: kd.correlation_id,
                     });
                 }
 
@@ -303,6 +305,7 @@ impl GpuBackend for RocprofilerBackend {
                         stage_iid: AMD_MEMCPY_STAGE_IID,
                         name: memcpy_name.to_string(),
                         extra_fields,
+                        correlation_id: mc.correlation_id,
                     });
                 }
 
@@ -321,6 +324,7 @@ impl GpuBackend for RocprofilerBackend {
                         stage_iid: AMD_MEMSET_STAGE_IID,
                         name: "Memset".to_string(),
                         extra_fields,
+                        correlation_id: ms.correlation_id,
                     });
                 }
 
@@ -420,7 +424,7 @@ impl GpuBackend for RocprofilerBackend {
                                 )
                                 .set_gpu_render_stage_event(
                                     |re: &mut GpuRenderStageEvent| {
-                                        re.set_event_id(get_next_event_id())
+                                        re.set_event_id(event.correlation_id)
                                             .set_duration(duration_ns)
                                             .set_gpu_id(event.gpu_id)
                                             .set_hw_queue_iid(event.hw_queue_iid)

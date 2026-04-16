@@ -140,6 +140,53 @@ pub struct InstrumentedSamplingConfig {
     pub activity_ranges: Vec<ActivityRange>,
 }
 
+/// Simple glob pattern matcher supporting `*` (any sequence) and `?` (single char).
+pub fn glob_match(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let (mut star_pi, mut star_ti) = (usize::MAX, 0usize);
+    while ti < t.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star_pi = pi;
+            star_ti = ti;
+            pi += 1;
+        } else if star_pi != usize::MAX {
+            pi = star_pi + 1;
+            star_ti += 1;
+            ti = star_ti;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+impl InstrumentedSamplingConfig {
+    /// Returns whether a kernel should be profiled based on `activity_name_filters`.
+    ///
+    /// If no filters are configured, all kernels are profiled.
+    /// Otherwise, a kernel is profiled if it matches **any** filter's glob pattern.
+    pub fn should_profile_kernel(&self, mangled: &str, demangled: &str) -> bool {
+        if self.activity_name_filters.is_empty() {
+            return true;
+        }
+        self.activity_name_filters.iter().any(|filter| {
+            let name = match filter.name_base {
+                ActivityNameFilterNameBase::MangledKernelName => mangled,
+                ActivityNameFilterNameBase::DemangledKernelName => demangled,
+            };
+            glob_match(&filter.name_glob, name)
+        })
+    }
+}
+
 /// Parsed `GpuCounterConfig` fields from the Perfetto trace config.
 ///
 /// Populated in the counters data source `on_setup` callback.
@@ -229,5 +276,74 @@ mod tests {
         let defaults = &["d1", "d2"];
         let metrics = parse_metrics("", defaults);
         assert_eq!(metrics, vec!["d1", "d2"]);
+    }
+
+    #[test]
+    fn test_glob_match() {
+        assert!(glob_match("*", "anything"));
+        assert!(glob_match("foo*", "foobar"));
+        assert!(glob_match("*bar", "foobar"));
+        assert!(glob_match("*baz*", "foobazqux"));
+        assert!(glob_match("f?o", "foo"));
+        assert!(glob_match("exact", "exact"));
+        assert!(!glob_match("foo", "bar"));
+        assert!(!glob_match("foo*", "barfoo"));
+        assert!(!glob_match("f?o", "fo"));
+        assert!(glob_match("", ""));
+        assert!(!glob_match("", "x"));
+        assert!(glob_match("*", ""));
+        assert!(glob_match("**", "abc"));
+    }
+
+    #[test]
+    fn test_should_profile_kernel_empty_filters() {
+        let isc = InstrumentedSamplingConfig::default();
+        assert!(isc.should_profile_kernel("_Z3foov", "foo()"));
+    }
+
+    #[test]
+    fn test_should_profile_kernel_mangled_filter() {
+        let isc = InstrumentedSamplingConfig {
+            activity_name_filters: vec![ActivityNameFilter {
+                name_glob: "*foo*".to_string(),
+                name_base: ActivityNameFilterNameBase::MangledKernelName,
+            }],
+            ..Default::default()
+        };
+        assert!(isc.should_profile_kernel("_Z3foov", "foo()"));
+        assert!(!isc.should_profile_kernel("_Z3barv", "bar()"));
+    }
+
+    #[test]
+    fn test_should_profile_kernel_demangled_filter() {
+        let isc = InstrumentedSamplingConfig {
+            activity_name_filters: vec![ActivityNameFilter {
+                name_glob: "*matmul*".to_string(),
+                name_base: ActivityNameFilterNameBase::DemangledKernelName,
+            }],
+            ..Default::default()
+        };
+        assert!(isc.should_profile_kernel("_Z13matmul_kernelv", "matmul_kernel()"));
+        assert!(!isc.should_profile_kernel("_Z13reduce_kernelv", "reduce_kernel()"));
+    }
+
+    #[test]
+    fn test_should_profile_kernel_multiple_filters_or() {
+        let isc = InstrumentedSamplingConfig {
+            activity_name_filters: vec![
+                ActivityNameFilter {
+                    name_glob: "*matmul*".to_string(),
+                    name_base: ActivityNameFilterNameBase::DemangledKernelName,
+                },
+                ActivityNameFilter {
+                    name_glob: "*reduce*".to_string(),
+                    name_base: ActivityNameFilterNameBase::DemangledKernelName,
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(isc.should_profile_kernel("x", "matmul_kernel()"));
+        assert!(isc.should_profile_kernel("x", "reduce_kernel()"));
+        assert!(!isc.should_profile_kernel("x", "softmax_kernel()"));
     }
 }

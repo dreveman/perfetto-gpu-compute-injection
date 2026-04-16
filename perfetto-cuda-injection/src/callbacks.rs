@@ -16,7 +16,9 @@ use crate::cupti_profiler::{self as profiler, *};
 use crate::perfetto_te_ns;
 use crate::state::{KernelActivity, KernelLaunch, MemcpyActivity, MemsetActivity, GLOBAL_STATE};
 use libc::c_void;
-use perfetto_gpu_compute_injection::tracing::{is_instrumented_enabled, trace_time_ns};
+use perfetto_gpu_compute_injection::tracing::{
+    get_counter_config, is_instrumented_enabled, trace_time_ns,
+};
 use perfetto_gpu_compute_injection::{injection_fatal, injection_log};
 use perfetto_sdk::track_event::{
     EventContext, TrackEventProtoField, TrackEventProtoFields, TrackEventTimestamp,
@@ -265,10 +267,55 @@ pub unsafe extern "C" fn profiler_callback_handler(
             let ctx = cb_data.context;
             let params = &*(cb_data.functionParams as *const cuLaunchKernel_params);
             if cb_data.callbackSite == CUpti_ApiCallbackSite_CUPTI_API_ENTER {
+                // Compute bitmask of instance IDs that want counters for this kernel.
+                // Profile if any instance wants it (non-zero bitmask).
+                let profiled_instances: u8 = if instrumented {
+                    let mangled = if !cb_data.symbolName.is_null() {
+                        CStr::from_ptr(cb_data.symbolName)
+                            .to_string_lossy()
+                            .to_string()
+                    } else {
+                        String::new()
+                    };
+                    let mut mask: u8 = 0;
+                    let mut need_demangled = false;
+                    for id in 0..8u32 {
+                        if let Some(cfg) = get_counter_config(id) {
+                            let isc = &cfg.instrumented_sampling_config;
+                            if isc.activity_name_filters.is_empty() {
+                                // No filters → this instance wants all kernels.
+                                mask |= 1 << id;
+                            } else {
+                                need_demangled = true;
+                            }
+                        }
+                    }
+                    if need_demangled {
+                        let demangled =
+                            perfetto_gpu_compute_injection::kernel::demangle_name(&mangled);
+                        for id in 0..8u32 {
+                            if mask & (1 << id) != 0 {
+                                continue; // already included
+                            }
+                            if let Some(cfg) = get_counter_config(id) {
+                                if cfg
+                                    .instrumented_sampling_config
+                                    .should_profile_kernel(&mangled, &demangled)
+                                {
+                                    mask |= 1 << id;
+                                }
+                            }
+                        }
+                    }
+                    mask
+                } else {
+                    0
+                };
+                let should_profile = profiled_instances != 0;
                 if let Ok(mut state) = GLOBAL_STATE.lock() {
                     let active_ctx = state.active_ctx;
                     // Only manage range profiler sessions when instrumented sampling is enabled
-                    if instrumented {
+                    if should_profile {
                         match active_ctx {
                             Some(active_ctx) if active_ctx != ctx => {
                                 let active_ctx_id = unsafe { profiler::get_context_id(active_ctx) };
@@ -286,7 +333,7 @@ pub unsafe extern "C" fn profiler_callback_handler(
                         state.active_ctx = Some(ctx);
                         if let Some(data) = state.context_data.get_mut(&ctx_id) {
                             // Initialize range profiler if not yet done
-                            if instrumented && data.range_profiler.is_none() {
+                            if should_profile && data.range_profiler.is_none() {
                                 let mut rp = RangeProfiler::new(ctx);
                                 if rp.enable().is_ok()
                                     && rp
@@ -303,7 +350,7 @@ pub unsafe extern "C" fn profiler_callback_handler(
                                 }
                             }
                             // Start profiling pass and push range for this kernel launch
-                            if instrumented {
+                            if should_profile {
                                 if let Some(rp) = &data.range_profiler {
                                     let _ = rp.start();
                                     // Push a range so the profiler records counter data.
@@ -342,7 +389,7 @@ pub unsafe extern "C" fn profiler_callback_handler(
                                 function: params.f,
                                 start,
                                 end: 0, // Will be set in API_EXIT when profiler completes
-                                profiled: instrumented,
+                                profiled_instances,
                                 cache_mode,
                                 max_active_blocks_per_sm,
                             });
@@ -350,11 +397,17 @@ pub unsafe extern "C" fn profiler_callback_handler(
                     }
                 }
             } else if cb_data.callbackSite == CUpti_ApiCallbackSite_CUPTI_API_EXIT {
-                // Handle kernel launch completion - decode profiler data and set end timestamp
-                if instrumented {
-                    if let Ok(mut state) = GLOBAL_STATE.lock() {
-                        let ctx_id = unsafe { profiler::get_context_id(ctx) };
-                        if let Some(data) = state.context_data.get_mut(&ctx_id) {
+                // Handle kernel launch completion - decode profiler data and set end timestamp.
+                // Only pop/stop/decode if this kernel was actually profiled (non-zero mask).
+                if let Ok(mut state) = GLOBAL_STATE.lock() {
+                    let ctx_id = unsafe { profiler::get_context_id(ctx) };
+                    if let Some(data) = state.context_data.get_mut(&ctx_id) {
+                        let was_profiled = data
+                            .kernel_launches
+                            .last()
+                            .map(|l| l.profiled_instances != 0)
+                            .unwrap_or(false);
+                        if was_profiled {
                             if let Some(rp) = &mut data.range_profiler {
                                 // Pop the range and stop profiling
                                 let _ = rp.pop_range();
@@ -372,11 +425,11 @@ pub unsafe extern "C" fn profiler_callback_handler(
                                 let _ =
                                     rp.initialize_counter_data_image(&mut data.counter_data_image);
                             }
-                            // Set end timestamp on the current kernel launch
-                            if let Some(last_launch) = data.kernel_launches.last_mut() {
-                                if last_launch.end == 0 {
-                                    last_launch.end = trace_time_ns();
-                                }
+                        }
+                        // Set end timestamp on the current kernel launch
+                        if let Some(last_launch) = data.kernel_launches.last_mut() {
+                            if last_launch.end == 0 {
+                                last_launch.end = trace_time_ns();
                             }
                         }
                     }

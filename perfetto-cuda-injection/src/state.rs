@@ -61,10 +61,10 @@ pub struct KernelLaunch {
     pub start: u64,
     /// Trace timestamp captured after range profiler pop completes all passes (when counters enabled).
     pub end: u64,
-    /// Whether this launch was profiled by the range profiler (counters were enabled).
-    /// When true, `start`/`end` are valid CPU-side timestamps to use for renderstage events.
-    /// When false, activity timestamps from CUPTI activity records should be used instead.
-    pub profiled: bool,
+    /// Bitmask of data source instance IDs that requested counters for this kernel.
+    /// Non-zero means the range profiler was active and `start`/`end` are valid
+    /// CPU-side timestamps. Zero means activity timestamps should be used instead.
+    pub profiled_instances: u8,
     /// Pre-computed cache mode from `CU_FUNC_ATTRIBUTE_CACHE_MODE_CA`.
     pub cache_mode: i32,
     /// Pre-computed max active blocks per SM from `cuOccupancyMaxActiveBlocksPerMultiprocessor`.

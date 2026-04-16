@@ -68,6 +68,8 @@ pub struct KernelDispatch {
     pub cu_count: u32,
     /// Maximum shader engine clock frequency (MHz).
     pub max_engine_clk_fcompute: u32,
+    /// rocprofiler internal correlation ID linking this dispatch to its API call.
+    pub correlation_id: u64,
 }
 #[derive(Debug, Clone)]
 pub struct MemcopyActivity {
@@ -77,6 +79,8 @@ pub struct MemcopyActivity {
     pub device_index: i32,
     /// Memory copy direction (raw `rocprofiler_memory_copy_operation_t` value).
     pub direction: i32,
+    /// rocprofiler internal correlation ID linking this copy to its API call.
+    pub correlation_id: u64,
 }
 
 /// A captured memory set event.
@@ -85,6 +89,8 @@ pub struct MemsetActivity {
     pub start_ns: u64,
     pub end_ns: u64,
     pub device_index: i32,
+    /// rocprofiler internal correlation ID linking this memset to its API call.
+    pub correlation_id: u64,
 }
 
 /// Snapshot of buffer lengths taken when a Perfetto consumer starts.

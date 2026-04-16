@@ -23,8 +23,8 @@ use metrics::parse_metrics;
 use perfetto_gpu_compute_injection::config::Config;
 use perfetto_gpu_compute_injection::injection_log;
 use perfetto_gpu_compute_injection::tracing::{
-    get_counter_config, get_counters_data_source, get_next_event_id, get_renderstages_data_source,
-    register_backend, trace_time_ns, GpuBackend,
+    get_counter_config, get_counters_data_source, get_renderstages_data_source, register_backend,
+    trace_time_ns, GpuBackend,
 };
 use perfetto_sdk::{
     data_source::{StopGuard, TraceContext},
@@ -397,6 +397,7 @@ impl GpuBackend for CuptiBackend {
                 activity_context_id: u32,
                 activity_stream_id: u32,
                 stage_iid: u64,
+                correlation_id: u32,
             }
 
             impl state::GpuActivity for PendingEvent {
@@ -423,6 +424,9 @@ impl GpuBackend for CuptiBackend {
                 }
                 fn stage_iid(&self) -> u64 {
                     self.stage_iid
+                }
+                fn correlation_id(&self) -> u32 {
+                    self.correlation_id
                 }
                 fn emit_extra_data(
                     &self,
@@ -688,6 +692,7 @@ impl GpuBackend for CuptiBackend {
                                 activity_context_id: activity.context_id,
                                 activity_stream_id: activity.stream_id,
                                 stage_iid: state::KERNEL_STAGE_IID,
+                                correlation_id: activity.correlation_id,
                             });
                     }
                     let mc_start = start_offsets
@@ -724,6 +729,7 @@ impl GpuBackend for CuptiBackend {
                                 activity_context_id: activity.context_id,
                                 activity_stream_id: activity.stream_id,
                                 stage_iid: state::MEMCPY_STAGE_IID,
+                                correlation_id: activity.correlation_id,
                             });
                     }
                     let ms_start = start_offsets
@@ -760,6 +766,7 @@ impl GpuBackend for CuptiBackend {
                                 activity_context_id: activity.context_id,
                                 activity_stream_id: activity.stream_id,
                                 stage_iid: state::MEMSET_STAGE_IID,
+                                correlation_id: activity.correlation_id,
                             });
                     }
                 }
@@ -990,7 +997,7 @@ fn emit_render_stage_event<T: GpuActivity>(
             .set_timestamp_clock_id(BuiltinClock::BuiltinClockBoottime.into())
             .set_gpu_render_stage_event(|event: &mut GpuRenderStageEvent| {
                 event
-                    .set_event_id(get_next_event_id())
+                    .set_event_id(activity.correlation_id() as u64)
                     .set_duration(duration_ns)
                     .set_gpu_id(gpu_id)
                     .set_hw_queue_iid(hw_queue_iid)

@@ -19,7 +19,8 @@ use libc::c_void;
 use perfetto_gpu_compute_injection::tracing::{is_instrumented_enabled, trace_time_ns};
 use perfetto_gpu_compute_injection::{injection_fatal, injection_log};
 use perfetto_sdk::track_event::{
-    EventContext, TrackEventTimestamp, TrackEventTrack, TrackEventType,
+    EventContext, TrackEventProtoField, TrackEventProtoFields, TrackEventTimestamp,
+    TrackEventTrack, TrackEventType,
 };
 use std::time::Duration;
 use std::{ffi::CStr, ffi::CString, panic, ptr};
@@ -94,6 +95,7 @@ pub unsafe extern "C" fn buffer_completed(
                             stream_id: k.streamId,
                             channel_id: k.channelID,
                             channel_type: k.channelType,
+                            correlation_id: k.correlationId,
                         });
                     }
                 } else if r.kind == CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_MEMCPY {
@@ -110,6 +112,7 @@ pub unsafe extern "C" fn buffer_completed(
                             stream_id: m.streamId,
                             channel_id: m.channelID,
                             channel_type: m.channelType,
+                            correlation_id: m.correlationId,
                         });
                     }
                 } else if r.kind == CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_MEMSET {
@@ -127,6 +130,7 @@ pub unsafe extern "C" fn buffer_completed(
                             stream_id: m.streamId,
                             channel_id: m.channelID,
                             channel_type: m.channelType,
+                            correlation_id: m.correlationId,
                         });
                     }
                 } else if r.kind == CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_RUNTIME
@@ -181,10 +185,22 @@ pub unsafe extern "C" fn buffer_completed(
                             => _thread_fields_named, _thread_fields_unnamed, _track_fields, thread_track
                         );
 
-                        // SliceBegin
+                        // SliceBegin — attach GpuCorrelation linking this API call
+                        // to the corresponding render stage event via correlationId.
+                        let correlation_fields = [TrackEventProtoField::VarInt(
+                            1, // render_stage_submission_event_ids
+                            a.correlationId as u64,
+                        )];
+                        let gpu_correlation_fields = [TrackEventProtoField::Nested(
+                            3000, // gpu_correlation
+                            &correlation_fields,
+                        )];
                         let mut ctx = EventContext::default();
                         ctx.set_timestamp(TrackEventTimestamp::Boot(Duration::from_nanos(a.start)));
                         ctx.set_proto_track(&thread_track);
+                        ctx.set_proto_fields(&TrackEventProtoFields {
+                            fields: &gpu_correlation_fields,
+                        });
                         ctx.add_debug_arg(
                             "correlation_id",
                             perfetto_sdk::track_event::TrackEventDebugArg::Uint64(

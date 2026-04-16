@@ -1009,6 +1009,9 @@ fn emit_interned_counter_descriptors(
                                 );
                             }
                         }
+                        cd.set_supports_instrumented_sampling(true);
+                        cd.set_supports_counter_names(true);
+                        cd.set_supports_counter_name_globs(true);
                     });
                 });
             }

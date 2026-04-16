@@ -97,11 +97,52 @@ pub fn parse_metrics(input: &str, defaults: &[&str]) -> Vec<String> {
         .collect()
 }
 
+/// Whether to match against the mangled or demangled kernel name.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ActivityNameFilterNameBase {
+    #[default]
+    MangledKernelName = 0,
+    DemangledKernelName = 1,
+}
+
+/// A glob pattern for filtering which kernel dispatches to profile.
+#[derive(Debug, Clone, Default)]
+pub struct ActivityNameFilter {
+    /// Glob pattern to match against the kernel name.
+    pub name_glob: String,
+    /// Which form of the kernel name to match against.
+    pub name_base: ActivityNameFilterNameBase,
+}
+
+/// Controls which dispatch ranges to profile (skip N, then profile M).
+#[derive(Debug, Clone, Default)]
+pub struct ActivityRange {
+    /// Number of dispatches to skip before profiling.
+    pub skip: u32,
+    /// Number of dispatches to profile after skipping.
+    pub count: u32,
+}
+
+/// Parsed `InstrumentedSamplingConfig` from the Perfetto trace config.
+#[derive(Debug, Clone, Default)]
+pub struct InstrumentedSamplingConfig {
+    /// Glob filters for kernel names. A kernel is profiled only if it
+    /// matches at least one filter (or no filters are set).
+    pub activity_name_filters: Vec<ActivityNameFilter>,
+    /// Include globs matched against NVTX range names. A dispatch is
+    /// profiled only if it occurs within an NVTX range matching at least
+    /// one of these globs (or no include globs are set).
+    pub activity_tx_include_globs: Vec<String>,
+    /// Exclude globs matched against NVTX range names. A dispatch is
+    /// skipped if it occurs within an NVTX range matching any of these.
+    pub activity_tx_exclude_globs: Vec<String>,
+    /// Dispatch ranges for sampling (skip N, profile M, repeat).
+    pub activity_ranges: Vec<ActivityRange>,
+}
+
 /// Parsed `GpuCounterConfig` fields from the Perfetto trace config.
 ///
 /// Populated in the counters data source `on_setup` callback.
-/// Extensible for future fields (e.g., `InstrumentedSamplingConfig`
-/// activity filters, ranges).
 #[derive(Debug, Clone, Default)]
 pub struct CounterConfig {
     /// Whether instrumented (per-kernel) counter sampling is enabled.
@@ -109,6 +150,8 @@ pub struct CounterConfig {
     /// Metric names from the trace config's `counter_names` field.
     /// When non-empty, these override `INJECTION_METRICS` and backend defaults.
     pub counter_names: Vec<String>,
+    /// Configuration for instrumented (per-kernel) counter sampling.
+    pub instrumented_sampling_config: InstrumentedSamplingConfig,
 }
 
 impl Config {

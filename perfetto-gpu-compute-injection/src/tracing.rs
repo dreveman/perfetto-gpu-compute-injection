@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::config::{trace_startup_has, CounterConfig};
+use crate::config::{
+    trace_startup_has, ActivityNameFilter, ActivityNameFilterNameBase, ActivityRange,
+    CounterConfig, InstrumentedSamplingConfig,
+};
 use crate::injection_log;
 use libc::{clock_gettime, timespec};
 use perfetto_sdk::data_source::{
@@ -20,7 +23,12 @@ use perfetto_sdk::data_source::{
 };
 use perfetto_sdk::pb_decoder::{PbDecoder, PbDecoderField};
 use perfetto_sdk_protos_gpu::protos::config::data_source_config::DataSourceConfigExtFieldNumber;
-use perfetto_sdk_protos_gpu::protos::config::gpu::gpu_counter_config::GpuCounterConfigFieldNumber;
+use perfetto_sdk_protos_gpu::protos::config::gpu::gpu_counter_config::{
+    GpuCounterConfigFieldNumber,
+    GpuCounterConfigInstrumentedSamplingConfigActivityNameFilterFieldNumber,
+    GpuCounterConfigInstrumentedSamplingConfigActivityRangeFieldNumber,
+    GpuCounterConfigInstrumentedSamplingConfigFieldNumber,
+};
 use std::sync::{
     atomic::{AtomicU64, AtomicU8, Ordering},
     Condvar, Mutex, OnceLock,
@@ -210,10 +218,33 @@ pub fn get_counters_data_source() -> &'static DataSource<'static> {
                 // Parse GpuCounterConfig from the DataSourceConfig.
                 const GPU_COUNTER_CONFIG_FIELD: u32 =
                     DataSourceConfigExtFieldNumber::GpuCounterConfig as u32;
+                // GpuCounterConfig field numbers.
                 const INSTRUMENTED_SAMPLING_FIELD: u32 =
                     GpuCounterConfigFieldNumber::InstrumentedSampling as u32;
                 const COUNTER_NAMES_FIELD: u32 =
                     GpuCounterConfigFieldNumber::CounterNames as u32;
+                const INSTRUMENTED_SAMPLING_CONFIG_FIELD: u32 =
+                    GpuCounterConfigFieldNumber::InstrumentedSamplingConfig as u32;
+                // InstrumentedSamplingConfig field numbers.
+                const ACTIVITY_NAME_FILTERS_FIELD: u32 =
+                    GpuCounterConfigInstrumentedSamplingConfigFieldNumber::ActivityNameFilters as u32;
+                const ACTIVITY_RANGES_FIELD: u32 =
+                    GpuCounterConfigInstrumentedSamplingConfigFieldNumber::ActivityRanges as u32;
+                const ACTIVITY_TX_INCLUDE_GLOBS_FIELD: u32 =
+                    GpuCounterConfigInstrumentedSamplingConfigFieldNumber::ActivityTxIncludeGlobs as u32;
+                const ACTIVITY_TX_EXCLUDE_GLOBS_FIELD: u32 =
+                    GpuCounterConfigInstrumentedSamplingConfigFieldNumber::ActivityTxExcludeGlobs as u32;
+                // ActivityNameFilter field numbers.
+                const NAME_GLOB_FIELD: u32 =
+                    GpuCounterConfigInstrumentedSamplingConfigActivityNameFilterFieldNumber::NameGlob as u32;
+                const NAME_BASE_FIELD: u32 =
+                    GpuCounterConfigInstrumentedSamplingConfigActivityNameFilterFieldNumber::NameBase as u32;
+                // ActivityRange field numbers.
+                const SKIP_FIELD: u32 =
+                    GpuCounterConfigInstrumentedSamplingConfigActivityRangeFieldNumber::Skip as u32;
+                const COUNT_FIELD: u32 =
+                    GpuCounterConfigInstrumentedSamplingConfigActivityRangeFieldNumber::Count as u32;
+
                 let mut counter_config = CounterConfig::default();
                 for item in PbDecoder::new(config) {
                     if let Ok((
@@ -234,16 +265,94 @@ pub fn get_counters_data_source() -> &'static DataSource<'static> {
                                         counter_config.counter_names.push(name.to_string());
                                     }
                                 }
+                                Ok((
+                                    INSTRUMENTED_SAMPLING_CONFIG_FIELD,
+                                    PbDecoderField::Delimited(isc_bytes),
+                                )) => {
+                                    parse_instrumented_sampling_config(
+                                        isc_bytes,
+                                        &mut counter_config.instrumented_sampling_config,
+                                    );
+                                }
                                 _ => {}
                             }
                         }
                     }
                 }
+
+                fn parse_instrumented_sampling_config(
+                    bytes: &[u8],
+                    config: &mut InstrumentedSamplingConfig,
+                ) {
+                    for item in PbDecoder::new(bytes) {
+                        match item {
+                            Ok((ACTIVITY_NAME_FILTERS_FIELD, PbDecoderField::Delimited(b))) => {
+                                let mut filter = ActivityNameFilter::default();
+                                for f in PbDecoder::new(b) {
+                                    match f {
+                                        Ok((NAME_GLOB_FIELD, PbDecoderField::Delimited(s))) => {
+                                            if let Ok(g) = std::str::from_utf8(s) {
+                                                filter.name_glob = g.to_string();
+                                            }
+                                        }
+                                        Ok((NAME_BASE_FIELD, PbDecoderField::Varint(v))) => {
+                                            filter.name_base = if v == 1 {
+                                                ActivityNameFilterNameBase::DemangledKernelName
+                                            } else {
+                                                ActivityNameFilterNameBase::MangledKernelName
+                                            };
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                config.activity_name_filters.push(filter);
+                            }
+                            Ok((
+                                ACTIVITY_TX_INCLUDE_GLOBS_FIELD,
+                                PbDecoderField::Delimited(b),
+                            )) => {
+                                if let Ok(g) = std::str::from_utf8(b) {
+                                    config.activity_tx_include_globs.push(g.to_string());
+                                }
+                            }
+                            Ok((
+                                ACTIVITY_TX_EXCLUDE_GLOBS_FIELD,
+                                PbDecoderField::Delimited(b),
+                            )) => {
+                                if let Ok(g) = std::str::from_utf8(b) {
+                                    config.activity_tx_exclude_globs.push(g.to_string());
+                                }
+                            }
+                            Ok((ACTIVITY_RANGES_FIELD, PbDecoderField::Delimited(b))) => {
+                                let mut range = ActivityRange::default();
+                                for f in PbDecoder::new(b) {
+                                    match f {
+                                        Ok((SKIP_FIELD, PbDecoderField::Varint(v))) => {
+                                            range.skip = v as u32;
+                                        }
+                                        Ok((COUNT_FIELD, PbDecoderField::Varint(v))) => {
+                                            range.count = v as u32;
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                config.activity_ranges.push(range);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                let isc = &counter_config.instrumented_sampling_config;
                 injection_log!(
-                    "counters data source setup (instance {}): instrumented_sampling={}, counter_names={:?}",
+                    "counters data source setup (instance {}): instrumented_sampling={}, counter_names={:?}, \
+                     name_filters={}, include_globs={}, exclude_globs={}, ranges={}",
                     inst_id,
                     counter_config.instrumented_sampling,
-                    counter_config.counter_names
+                    counter_config.counter_names,
+                    isc.activity_name_filters.len(),
+                    isc.activity_tx_include_globs.len(),
+                    isc.activity_tx_exclude_globs.len(),
+                    isc.activity_ranges.len()
                 );
                 if let Ok(mut configs) = COUNTER_CONFIGS.lock() {
                     if let Some(slot) = configs.get_mut(inst_id as usize) {

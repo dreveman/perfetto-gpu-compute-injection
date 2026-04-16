@@ -100,6 +100,8 @@ struct CollectedCounterEvent {
     timestamp_end: u64,
     gpu_id: i32,
     metrics: Vec<(String, f64)>,
+    /// Bitmask of instance IDs that want counters for this kernel.
+    profiled_instances: u8,
 }
 
 impl GpuBackend for CuptiBackend {
@@ -187,8 +189,11 @@ impl GpuBackend for CuptiBackend {
         if let Ok(mut state) = GLOBAL_STATE.lock() {
             for (_, data) in state.context_data.iter_mut() {
                 data.finalize_profiler(false);
-                if let Some(last_launch) =
-                    data.kernel_launches.iter_mut().rev().find(|l| l.profiled)
+                if let Some(last_launch) = data
+                    .kernel_launches
+                    .iter_mut()
+                    .rev()
+                    .find(|l| l.profiled_instances != 0)
                 {
                     if last_launch.end == 0 {
                         last_launch.end = trace_time_ns();
@@ -290,6 +295,7 @@ impl GpuBackend for CuptiBackend {
                                 .iter()
                                 .map(|m| (m.metric_name.clone(), m.value))
                                 .collect(),
+                            profiled_instances: launch.profiled_instances,
                         });
                     }
                 }
@@ -297,26 +303,32 @@ impl GpuBackend for CuptiBackend {
                 // state (GLOBAL_STATE lock) dropped here
             };
 
-            // Filter metrics to only those requested by this instance's config.
-            // When counter_names is empty (env var fallback), emit all metrics.
-            let collected_events = if let Some(cfg) = get_counter_config(inst_id) {
-                if cfg.counter_names.is_empty() {
-                    collected_events
-                } else {
-                    let requested: HashSet<&str> =
-                        cfg.counter_names.iter().map(|s| s.as_str()).collect();
-                    collected_events
-                        .into_iter()
-                        .map(|mut e| {
+            // Per-instance filtering using the profiled_instances bitmask:
+            // 1. Skip kernels where this instance's bit is not set.
+            // 2. Filter metrics by counter_names (only emit the counters this
+            //    instance requested).
+            let inst_bit = 1u8 << inst_id;
+            let collected_events: Vec<_> = if let Some(cfg) = get_counter_config(inst_id) {
+                let has_counter_filter = !cfg.counter_names.is_empty();
+                let requested: HashSet<&str> =
+                    cfg.counter_names.iter().map(|s| s.as_str()).collect();
+                collected_events
+                    .into_iter()
+                    .filter(|e| e.profiled_instances & inst_bit != 0)
+                    .map(|mut e| {
+                        if has_counter_filter {
                             e.metrics
                                 .retain(|(name, _)| requested.contains(name.as_str()));
-                            e
-                        })
-                        .filter(|e| !e.metrics.is_empty())
-                        .collect()
-                }
+                        }
+                        e
+                    })
+                    .filter(|e| !e.metrics.is_empty())
+                    .collect()
             } else {
                 collected_events
+                    .into_iter()
+                    .filter(|e| e.profiled_instances & inst_bit != 0)
+                    .collect()
             };
 
             // Phase 2: Emit collected events without holding GLOBAL_STATE.
@@ -509,7 +521,7 @@ impl GpuBackend for CuptiBackend {
                         .iter()
                         .zip(data.kernel_activities[ka_start..].iter())
                     {
-                        let (raw_start, raw_end) = if launch.profiled {
+                        let (raw_start, raw_end) = if launch.profiled_instances != 0 {
                             (launch.start, launch.end)
                         } else {
                             (activity.start, activity.end)

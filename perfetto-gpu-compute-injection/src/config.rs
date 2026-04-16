@@ -219,6 +219,32 @@ impl InstrumentedSamplingConfig {
         }
         false
     }
+
+    /// Returns whether a dispatch at the given count should be profiled
+    /// based on `activity_ranges` (skip/count sampling).
+    ///
+    /// If no ranges are configured, returns `true` (profile all).
+    /// Otherwise, ranges are evaluated in sequence: each range skips
+    /// `skip` dispatches then profiles `count` dispatches. After all
+    /// ranges are exhausted, no more dispatches are profiled.
+    pub fn should_profile_at_count(&self, dispatch_count: u64) -> bool {
+        if self.activity_ranges.is_empty() {
+            return true;
+        }
+        let mut offset: u64 = 0;
+        for range in &self.activity_ranges {
+            let skip = range.skip as u64;
+            let count = range.count as u64;
+            if dispatch_count < offset + skip {
+                return false; // in skip window
+            }
+            if dispatch_count < offset + skip + count {
+                return true; // in profile window
+            }
+            offset += skip + count;
+        }
+        false // all ranges exhausted
+    }
 }
 
 /// Parsed `GpuCounterConfig` fields from the Perfetto trace config.
@@ -429,5 +455,78 @@ mod tests {
         ]));
         // No include match.
         assert!(!isc.should_profile_in_nvtx_context(&["inference".to_string()]));
+    }
+
+    #[test]
+    fn test_skip_count_empty_ranges() {
+        let isc = InstrumentedSamplingConfig::default();
+        for i in 0..10 {
+            assert!(isc.should_profile_at_count(i));
+        }
+    }
+
+    #[test]
+    fn test_skip_count_single_range() {
+        let isc = InstrumentedSamplingConfig {
+            activity_ranges: vec![ActivityRange { skip: 2, count: 3 }],
+            ..Default::default()
+        };
+        // skip 0, skip 1, profile 2, profile 3, profile 4, done
+        assert!(!isc.should_profile_at_count(0));
+        assert!(!isc.should_profile_at_count(1));
+        assert!(isc.should_profile_at_count(2));
+        assert!(isc.should_profile_at_count(3));
+        assert!(isc.should_profile_at_count(4));
+        assert!(!isc.should_profile_at_count(5));
+        assert!(!isc.should_profile_at_count(100));
+    }
+
+    #[test]
+    fn test_skip_count_multiple_ranges() {
+        let isc = InstrumentedSamplingConfig {
+            activity_ranges: vec![
+                ActivityRange { skip: 1, count: 2 },
+                ActivityRange { skip: 3, count: 1 },
+            ],
+            ..Default::default()
+        };
+        // Range 1: skip 0, profile 1, profile 2
+        assert!(!isc.should_profile_at_count(0));
+        assert!(isc.should_profile_at_count(1));
+        assert!(isc.should_profile_at_count(2));
+        // Range 2: skip 3, skip 4, skip 5, profile 6
+        assert!(!isc.should_profile_at_count(3));
+        assert!(!isc.should_profile_at_count(4));
+        assert!(!isc.should_profile_at_count(5));
+        assert!(isc.should_profile_at_count(6));
+        // All exhausted
+        assert!(!isc.should_profile_at_count(7));
+    }
+
+    #[test]
+    fn test_skip_count_zero_skip() {
+        let isc = InstrumentedSamplingConfig {
+            activity_ranges: vec![ActivityRange { skip: 0, count: 3 }],
+            ..Default::default()
+        };
+        assert!(isc.should_profile_at_count(0));
+        assert!(isc.should_profile_at_count(1));
+        assert!(isc.should_profile_at_count(2));
+        assert!(!isc.should_profile_at_count(3));
+    }
+
+    #[test]
+    fn test_skip_count_zero_count() {
+        let isc = InstrumentedSamplingConfig {
+            activity_ranges: vec![
+                ActivityRange { skip: 0, count: 0 },
+                ActivityRange { skip: 0, count: 2 },
+            ],
+            ..Default::default()
+        };
+        // First range is empty (skip=0, count=0), goes to second.
+        assert!(isc.should_profile_at_count(0));
+        assert!(isc.should_profile_at_count(1));
+        assert!(!isc.should_profile_at_count(2));
     }
 }

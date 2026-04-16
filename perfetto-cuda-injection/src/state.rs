@@ -444,6 +444,9 @@ pub struct GlobalState {
     pub renderstages_consumers: HashMap<u32, ConsumerStartOffsets>,
     /// thread_id → thread name, captured from /proc when first seen.
     pub thread_names: HashMap<u32, String>,
+    /// Per-instance dispatch counter for activity_ranges skip/count sampling.
+    /// Only counts dispatches that passed name + NVTX filtering.
+    pub dispatch_counters: [u64; 8],
 }
 
 unsafe impl Send for GlobalState {}
@@ -668,5 +671,6 @@ pub static GLOBAL_STATE: Lazy<Mutex<GlobalState>> = Lazy::new(|| {
         counters_consumers: HashMap::new(),
         renderstages_consumers: HashMap::new(),
         thread_names: HashMap::new(),
+        dispatch_counters: [0; 8],
     })
 });

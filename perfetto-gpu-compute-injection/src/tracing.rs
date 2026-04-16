@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::config::trace_startup_has;
+use crate::config::{trace_startup_has, CounterConfig};
 use crate::injection_log;
 use libc::{clock_gettime, timespec};
 use perfetto_sdk::data_source::{
@@ -118,8 +118,8 @@ static COUNTERS_ACTIVE_MASK: AtomicU8 = AtomicU8::new(0);
 /// Non-zero means at least one renderstages consumer is running.
 static RENDERSTAGES_ACTIVE_MASK: AtomicU8 = AtomicU8::new(0);
 
-/// Bitmask of instances whose config had `instrumented_sampling: true` (set in on_setup).
-static INSTRUMENTED_SETUP_MASK: AtomicU8 = AtomicU8::new(0);
+/// Per-instance parsed `GpuCounterConfig` from the trace config (set in on_setup).
+static COUNTER_CONFIGS: Mutex<[Option<CounterConfig>; 8]> = Mutex::new([const { None }; 8]);
 
 /// Bitmask of currently active instances with instrumented sampling enabled.
 /// A subset of `COUNTERS_ACTIVE_MASK` — only instances where the consumer requested
@@ -134,6 +134,14 @@ static RENDERSTAGES_STARTED: (Mutex<bool>, Condvar) = (Mutex::new(false), Condva
 
 static GPU_COUNTERS_DATA_SOURCE: OnceLock<DataSource> = OnceLock::new();
 static GPU_RENDERSTAGES_DATA_SOURCE: OnceLock<DataSource> = OnceLock::new();
+
+/// Returns the `CounterConfig` for a data source instance, if set.
+pub fn get_counter_config(inst_id: u32) -> Option<CounterConfig> {
+    COUNTER_CONFIGS
+        .lock()
+        .ok()
+        .and_then(|configs| configs.get(inst_id as usize).cloned().flatten())
+}
 
 static DATA_SOURCE_NAME_SUFFIX: OnceLock<String> = OnceLock::new();
 static COUNTERS_DATA_SOURCE_NAME: OnceLock<String> = OnceLock::new();
@@ -199,12 +207,14 @@ pub fn get_counters_data_source() -> &'static DataSource<'static> {
             .buffer_exhausted_policy(DataSourceBufferExhaustedPolicy::StallAndAbort)
             .will_notify_on_stop(true)
             .on_setup(move |inst_id, config, _| {
-                // Parse DataSourceConfig for gpu_counter_config, then instrumented_sampling.
+                // Parse GpuCounterConfig from the DataSourceConfig.
                 const GPU_COUNTER_CONFIG_FIELD: u32 =
                     DataSourceConfigExtFieldNumber::GpuCounterConfig as u32;
                 const INSTRUMENTED_SAMPLING_FIELD: u32 =
                     GpuCounterConfigFieldNumber::InstrumentedSampling as u32;
-                let mut instrumented = false;
+                const COUNTER_NAMES_FIELD: u32 =
+                    GpuCounterConfigFieldNumber::CounterNames as u32;
+                let mut counter_config = CounterConfig::default();
                 for item in PbDecoder::new(config) {
                     if let Ok((
                         GPU_COUNTER_CONFIG_FIELD,
@@ -212,24 +222,34 @@ pub fn get_counters_data_source() -> &'static DataSource<'static> {
                     )) = item
                     {
                         for sub_item in PbDecoder::new(gpu_counter_bytes) {
-                            if let Ok((INSTRUMENTED_SAMPLING_FIELD, PbDecoderField::Varint(v))) =
-                                sub_item
-                            {
-                                instrumented = v != 0;
+                            match sub_item {
+                                Ok((INSTRUMENTED_SAMPLING_FIELD, PbDecoderField::Varint(v))) => {
+                                    counter_config.instrumented_sampling = v != 0;
+                                }
+                                Ok((
+                                    COUNTER_NAMES_FIELD,
+                                    PbDecoderField::Delimited(name_bytes),
+                                )) => {
+                                    if let Ok(name) = std::str::from_utf8(name_bytes) {
+                                        counter_config.counter_names.push(name.to_string());
+                                    }
+                                }
+                                _ => {}
                             }
                         }
                     }
                 }
-                if instrumented {
-                    INSTRUMENTED_SETUP_MASK.fetch_or(1 << inst_id, Ordering::SeqCst);
-                } else {
-                    INSTRUMENTED_SETUP_MASK.fetch_and(!(1 << inst_id), Ordering::SeqCst);
-                }
                 injection_log!(
-                    "counters data source setup (instance {}): instrumented_sampling={}",
+                    "counters data source setup (instance {}): instrumented_sampling={}, counter_names={:?}",
                     inst_id,
-                    instrumented
+                    counter_config.instrumented_sampling,
+                    counter_config.counter_names
                 );
+                if let Ok(mut configs) = COUNTER_CONFIGS.lock() {
+                    if let Some(slot) = configs.get_mut(inst_id as usize) {
+                        *slot = Some(counter_config);
+                    }
+                }
             })
             .on_start(move |inst_id, _| {
                 let prev = COUNTERS_ACTIVE_MASK.fetch_or(1 << inst_id, Ordering::SeqCst);
@@ -239,8 +259,9 @@ pub fn get_counters_data_source() -> &'static DataSource<'static> {
                     // Transitioning from no consumers at all: enable base activities.
                     backend().on_first_consumer_start();
                 }
-                let instrumented =
-                    INSTRUMENTED_SETUP_MASK.load(Ordering::SeqCst) & (1 << inst_id) != 0;
+                let instrumented = get_counter_config(inst_id)
+                    .map(|c| c.instrumented_sampling)
+                    .unwrap_or(false);
                 if instrumented {
                     let prev_instr =
                         INSTRUMENTED_ACTIVE_MASK.fetch_or(1 << inst_id, Ordering::SeqCst);
@@ -262,7 +283,11 @@ pub fn get_counters_data_source() -> &'static DataSource<'static> {
                     .fetch_and(!(1 << inst_id), Ordering::SeqCst)
                     & (1 << inst_id)
                     != 0;
-                INSTRUMENTED_SETUP_MASK.fetch_and(!(1 << inst_id), Ordering::SeqCst);
+                if let Ok(mut configs) = COUNTER_CONFIGS.lock() {
+                    if let Some(slot) = configs.get_mut(inst_id as usize) {
+                        *slot = None;
+                    }
+                }
                 if remaining == 0 && is_renderstages_enabled() && was_instrumented {
                     // Last counters consumer stopped while renderstages still runs:
                     // re-enable MEMSET now that there is no Range Profiler conflict.

@@ -37,7 +37,7 @@ use perfetto_sdk::{
 use perfetto_sdk_protos_gpu::protos::{
     common::gpu_counter_descriptor::{
         GpuCounterDescriptor, GpuCounterDescriptorGpuCounterGroup,
-        GpuCounterDescriptorGpuCounterSpec,
+        GpuCounterDescriptorGpuCounterGroupSpec, GpuCounterDescriptorGpuCounterSpec,
     },
     trace::{
         gpu::{
@@ -902,11 +902,24 @@ extern "C" fn end_execution() {
 // Counter descriptor interning helpers
 // ---------------------------------------------------------------------------
 
+/// Hardware block prefix groups for organizing instrumented counters.
+/// Each entry is (metric_name_prefix, display_name).
+const COUNTER_GROUPS: &[(&str, &str)] = &[
+    ("SQ_", "SQ"),
+    ("GRBM_", "GRBM"),
+    ("TA_", "TA"),
+    ("TCP_", "TCP"),
+    ("TCC_", "TCC"),
+];
+
 /// Emit interned counter descriptors for all GPUs in the batch.
 ///
 /// Each GPU gets one `InternedGpuCounterDescriptor` with iid = gpu_id + 1,
 /// containing all counter specs with simple 0-based counter_ids. The gpu_id
 /// on the interned descriptor handles per-GPU track separation.
+///
+/// Counters are organized into hardware block groups based on their metric
+/// name prefix (e.g. `SQ_` → "SQ", `TCC_` → "TCC").
 fn emit_interned_counter_descriptors(
     ctx: &mut TraceContext,
     counter_names: &[String],
@@ -926,6 +939,26 @@ fn emit_interned_counter_descriptors(
                                 spec.set_name(name);
                                 spec.set_groups(GpuCounterDescriptorGpuCounterGroup::Compute);
                             });
+                        }
+                        // Group counters by hardware block prefix.
+                        for (group_id, &(prefix, group_name)) in COUNTER_GROUPS.iter().enumerate() {
+                            let member_ids: Vec<u32> = counter_names
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, name)| name.starts_with(prefix))
+                                .map(|(i, _)| i as u32)
+                                .collect();
+                            if !member_ids.is_empty() {
+                                cd.set_counter_groups(
+                                    |g: &mut GpuCounterDescriptorGpuCounterGroupSpec| {
+                                        g.set_group_id(group_id as u32);
+                                        g.set_name(group_name);
+                                        for &id in &member_ids {
+                                            g.set_counter_ids(id);
+                                        }
+                                    },
+                                );
+                            }
                         }
                     });
                 });

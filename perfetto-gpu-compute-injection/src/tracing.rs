@@ -296,10 +296,10 @@ pub fn get_counters_data_source() -> &'static DataSource<'static> {
                                             }
                                         }
                                         Ok((NAME_BASE_FIELD, PbDecoderField::Varint(v))) => {
-                                            filter.name_base = if v == 1 {
-                                                ActivityNameFilterNameBase::DemangledKernelName
-                                            } else {
-                                                ActivityNameFilterNameBase::MangledKernelName
+                                            filter.name_base = match v {
+                                                1 => ActivityNameFilterNameBase::DemangledKernelName,
+                                                2 => ActivityNameFilterNameBase::FunctionName,
+                                                _ => ActivityNameFilterNameBase::MangledKernelName,
                                             };
                                         }
                                         _ => {}

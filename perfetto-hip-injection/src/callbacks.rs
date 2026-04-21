@@ -409,15 +409,18 @@ pub unsafe extern "C" fn dispatch_counting_callback(
             }
             if need_demangled {
                 let demangled = perfetto_gpu_compute_injection::kernel::demangle_name(&kernel_name);
+                let function_name =
+                    perfetto_gpu_compute_injection::kernel::simplify_name(&demangled);
                 for id in 0..8u32 {
                     if mask & (1 << id) != 0 {
                         continue;
                     }
                     if let Some(cfg) = get_counter_config(id) {
-                        if cfg
-                            .instrumented_sampling_config
-                            .should_profile_kernel(&kernel_name, &demangled)
-                        {
+                        if cfg.instrumented_sampling_config.should_profile_kernel(
+                            &kernel_name,
+                            &demangled,
+                            function_name,
+                        ) {
                             mask |= 1 << id;
                         }
                     }

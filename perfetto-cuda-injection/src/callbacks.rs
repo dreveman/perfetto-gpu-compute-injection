@@ -306,15 +306,18 @@ pub unsafe extern "C" fn profiler_callback_handler(
                     if need_demangled {
                         let demangled =
                             perfetto_gpu_compute_injection::kernel::demangle_name(&mangled);
+                        let function_name =
+                            perfetto_gpu_compute_injection::kernel::simplify_name(&demangled);
                         for &(id, ref cfg) in &configs {
                             if mask & (1 << id) != 0 {
                                 continue;
                             }
                             if let Some(cfg) = cfg {
-                                if cfg
-                                    .instrumented_sampling_config
-                                    .should_profile_kernel(&mangled, &demangled)
-                                {
+                                if cfg.instrumented_sampling_config.should_profile_kernel(
+                                    &mangled,
+                                    &demangled,
+                                    function_name,
+                                ) {
                                     mask |= 1 << id;
                                 }
                             }

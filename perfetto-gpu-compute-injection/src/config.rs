@@ -97,12 +97,13 @@ pub fn parse_metrics(input: &str, defaults: &[&str]) -> Vec<String> {
         .collect()
 }
 
-/// Whether to match against the mangled or demangled kernel name.
+/// Which form of the kernel name to match against.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ActivityNameFilterNameBase {
     #[default]
     MangledKernelName = 0,
     DemangledKernelName = 1,
+    FunctionName = 2,
 }
 
 /// A glob pattern for filtering which kernel dispatches to profile.
@@ -173,7 +174,12 @@ impl InstrumentedSamplingConfig {
     ///
     /// If no filters are configured, all kernels are profiled.
     /// Otherwise, a kernel is profiled if it matches **any** filter's glob pattern.
-    pub fn should_profile_kernel(&self, mangled: &str, demangled: &str) -> bool {
+    pub fn should_profile_kernel(
+        &self,
+        mangled: &str,
+        demangled: &str,
+        function_name: &str,
+    ) -> bool {
         if self.activity_name_filters.is_empty() {
             return true;
         }
@@ -181,6 +187,7 @@ impl InstrumentedSamplingConfig {
             let name = match filter.name_base {
                 ActivityNameFilterNameBase::MangledKernelName => mangled,
                 ActivityNameFilterNameBase::DemangledKernelName => demangled,
+                ActivityNameFilterNameBase::FunctionName => function_name,
             };
             glob_match(&filter.name_glob, name)
         })
@@ -358,7 +365,7 @@ mod tests {
     #[test]
     fn test_should_profile_kernel_empty_filters() {
         let isc = InstrumentedSamplingConfig::default();
-        assert!(isc.should_profile_kernel("_Z3foov", "foo()"));
+        assert!(isc.should_profile_kernel("_Z3foov", "foo()", "foo"));
     }
 
     #[test]
@@ -370,8 +377,8 @@ mod tests {
             }],
             ..Default::default()
         };
-        assert!(isc.should_profile_kernel("_Z3foov", "foo()"));
-        assert!(!isc.should_profile_kernel("_Z3barv", "bar()"));
+        assert!(isc.should_profile_kernel("_Z3foov", "foo()", "foo"));
+        assert!(!isc.should_profile_kernel("_Z3barv", "bar()", "bar"));
     }
 
     #[test]
@@ -383,8 +390,37 @@ mod tests {
             }],
             ..Default::default()
         };
-        assert!(isc.should_profile_kernel("_Z13matmul_kernelv", "matmul_kernel()"));
-        assert!(!isc.should_profile_kernel("_Z13reduce_kernelv", "reduce_kernel()"));
+        assert!(isc.should_profile_kernel(
+            "_Z13matmul_kernelv",
+            "matmul_kernel()",
+            "matmul_kernel"
+        ));
+        assert!(!isc.should_profile_kernel(
+            "_Z13reduce_kernelv",
+            "reduce_kernel()",
+            "reduce_kernel"
+        ));
+    }
+
+    #[test]
+    fn test_should_profile_kernel_function_filter() {
+        let isc = InstrumentedSamplingConfig {
+            activity_name_filters: vec![ActivityNameFilter {
+                name_glob: "matmul*".to_string(),
+                name_base: ActivityNameFilterNameBase::FunctionName,
+            }],
+            ..Default::default()
+        };
+        assert!(isc.should_profile_kernel(
+            "_Z13matmul_kernelIfEvPKT_S2_PS0_iii",
+            "void matmul_kernel<float>(float const*, float const*, float*, int, int, int)",
+            "matmul_kernel"
+        ));
+        assert!(!isc.should_profile_kernel(
+            "_Z13reduce_kernelv",
+            "void reduce_kernel<float, 256>(float const*, float*, int)",
+            "reduce_kernel"
+        ));
     }
 
     #[test]
@@ -402,9 +438,9 @@ mod tests {
             ],
             ..Default::default()
         };
-        assert!(isc.should_profile_kernel("x", "matmul_kernel()"));
-        assert!(isc.should_profile_kernel("x", "reduce_kernel()"));
-        assert!(!isc.should_profile_kernel("x", "softmax_kernel()"));
+        assert!(isc.should_profile_kernel("x", "matmul_kernel()", "matmul_kernel"));
+        assert!(isc.should_profile_kernel("x", "reduce_kernel()", "reduce_kernel"));
+        assert!(!isc.should_profile_kernel("x", "softmax_kernel()", "softmax_kernel"));
     }
 
     #[test]

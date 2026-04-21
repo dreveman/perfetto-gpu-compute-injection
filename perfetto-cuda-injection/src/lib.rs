@@ -617,6 +617,7 @@ impl GpuBackend for CuptiBackend {
                         emit("stream_id", &activity.stream_id.to_string());
                         emit("channel_id", &activity.channel_id.to_string());
                         emit("channel_type", &activity.channel_type.to_string());
+                        emit("api", "CUDA");
                         emit("arch", &format!("CC_{}{}", major, minor));
                         #[allow(nonstandard_style)]
                         match cache_mode as u32 {

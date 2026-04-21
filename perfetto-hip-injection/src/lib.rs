@@ -228,6 +228,7 @@ impl GpuBackend for RocprofilerBackend {
                         ("process_id".to_string(), process_id.to_string()),
                         ("process_name".to_string(), process_name.clone()),
                         ("device_id".to_string(), kd.device_index.to_string()),
+                        ("api".to_string(), "HIP".to_string()),
                         ("arch".to_string(), kd.arch.clone()),
                         ("queue_id".to_string(), kd.queue_handle.to_string()),
                         ("launch__grid_size".to_string(), grid_size.to_string()),

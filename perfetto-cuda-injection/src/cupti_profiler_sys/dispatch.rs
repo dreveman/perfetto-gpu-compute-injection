@@ -65,14 +65,19 @@ fn get_cuda_handle() -> *mut c_void {
 }
 
 /// Returns a handle to `libcupti.so`, loading it on demand.
+///
+/// Tries versioned names first (newest to oldest) to avoid picking up
+/// a stale unversioned `libcupti.so` symlink that points to an old
+/// CUDA toolkit version.
 fn get_cupti_handle() -> *mut c_void {
     *CUPTI_HANDLE.get_or_init(|| {
-        let handle = unsafe { dlopen(c"libcupti.so".as_ptr(), RTLD_LAZY) };
-        if !handle.is_null() {
-            return handle as usize;
-        }
-        // Try versioned names.
-        for name in [c"libcupti.so.13".as_ptr(), c"libcupti.so.12".as_ptr()] {
+        // Try versioned names first (newest to oldest) so we get the
+        // CUPTI that matches the running CUDA driver.
+        for name in [
+            c"libcupti.so.13".as_ptr(),
+            c"libcupti.so.12".as_ptr(),
+            c"libcupti.so".as_ptr(),
+        ] {
             let handle = unsafe { dlopen(name, RTLD_LAZY) };
             if !handle.is_null() {
                 return handle as usize;

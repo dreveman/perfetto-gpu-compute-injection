@@ -180,8 +180,7 @@ impl GpuBackend for CuptiBackend {
         // delivers all pending records via the buffer_completed callback).
         static FLUSH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         if let Ok(_guard) = FLUSH_LOCK.try_lock() {
-            let _ =
-                profiler::activity_flush_all(CUpti_ActivityFlag_CUPTI_ACTIVITY_FLAG_FLUSH_FORCED);
+            let _ = profiler::activity_flush_all(0);
         }
     }
 
@@ -232,9 +231,7 @@ impl GpuBackend for CuptiBackend {
                 let _ = profiler::activity_disable(CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_MEMSET);
                 let _ = profiler::activity_disable(CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_RUNTIME);
                 let _ = profiler::activity_disable(CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_DRIVER);
-                let _ = profiler::activity_flush_all(
-                    CUpti_ActivityFlag_CUPTI_ACTIVITY_FLAG_FLUSH_FORCED,
-                );
+                let _ = profiler::activity_flush_all(0);
 
                 self.finalize_range_profiler();
             });
@@ -507,25 +504,25 @@ impl GpuBackend for CuptiBackend {
                     std::collections::HashMap::new();
 
                 for (ctx_id, data) in state.context_data.iter() {
-                    let launch_start = start_offsets
-                        .kernel_launches
-                        .get(ctx_id)
-                        .copied()
-                        .unwrap_or(0);
                     let ka_start = start_offsets
                         .kernel_activities
                         .get(ctx_id)
                         .copied()
                         .unwrap_or(0);
-                    for (launch, activity) in data.kernel_launches[launch_start..]
+                    let launch_map: std::collections::HashMap<u32, &state::KernelLaunch> = data
+                        .kernel_launches
                         .iter()
-                        .zip(data.kernel_activities[ka_start..].iter())
-                    {
-                        let (raw_start, raw_end) = if launch.profiled_instances != 0 {
-                            (launch.start, launch.end)
-                        } else {
-                            (activity.start, activity.end)
-                        };
+                        .map(|l| (l.correlation_id, l))
+                        .collect();
+                    for activity in data.kernel_activities[ka_start..].iter() {
+                        let launch = launch_map.get(&activity.correlation_id);
+                        let (raw_start, raw_end) =
+                            if launch.is_some_and(|l| l.profiled_instances != 0) {
+                                let l = launch.unwrap();
+                                (l.start, l.end)
+                            } else {
+                                (activity.start, activity.end)
+                            };
                         // CUPTI returns start=0/end=0 when timestamp collection
                         // failed for an activity. It can also return end < start
                         // for partially-completed or corrupted records. Skip
@@ -553,8 +550,8 @@ impl GpuBackend for CuptiBackend {
                         let block_size =
                             activity.block_size.0 * activity.block_size.1 * activity.block_size.2;
                         let thread_count = grid_size * block_size;
-                        let cache_mode = launch.cache_mode;
-                        let max_active_blocks = launch.max_active_blocks_per_sm;
+                        let cache_mode = launch.map_or(0, |l| l.cache_mode);
+                        let max_active_blocks = launch.map_or(0, |l| l.max_active_blocks_per_sm);
                         let waves_per_multiprocessor = if data.num_sms > 0 && max_active_blocks > 0
                         {
                             grid_size as f64 / (data.num_sms * max_active_blocks) as f64

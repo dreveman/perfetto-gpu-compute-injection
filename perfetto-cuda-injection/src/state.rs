@@ -69,6 +69,8 @@ pub struct KernelLaunch {
     pub cache_mode: i32,
     /// Pre-computed max active blocks per SM from `cuOccupancyMaxActiveBlocksPerMultiprocessor`.
     pub max_active_blocks_per_sm: i32,
+    /// CUPTI correlation ID linking this launch to its activity record.
+    pub correlation_id: u32,
 }
 
 /// Detailed activity information for a kernel execution.
@@ -456,26 +458,21 @@ impl GlobalState {
     /// actually consumed by the zip, then drain the prefix that all consumers
     /// have consumed.
     pub fn advance_and_drain_renderstage_events(&mut self) {
-        // Advance consumer offsets. kernel_launches and kernel_activities are
-        // consumed via zip, so both must advance by the same amount:
-        // min(kl_available, ka_available). Memcpy and memset are independent.
+        // Advance consumer offsets. kernel_activities drive iteration;
+        // kernel_launches are looked up by correlation ID so they
+        // advance independently.
         for offsets in self.renderstages_consumers.values_mut() {
             for (&ctx_id, data) in self.context_data.iter() {
-                let kl_off = offsets.kernel_launches.get(&ctx_id).copied().unwrap_or(0);
-                let ka_off = offsets.kernel_activities.get(&ctx_id).copied().unwrap_or(0);
-                let kl_avail = data.kernel_launches.len().saturating_sub(kl_off);
-                let ka_avail = data.kernel_activities.len().saturating_sub(ka_off);
-                let consumed = kl_avail.min(ka_avail);
                 offsets
                     .kernel_launches
                     .entry(ctx_id)
-                    .and_modify(|o| *o = kl_off + consumed)
-                    .or_insert(kl_off + consumed);
+                    .and_modify(|o| *o = data.kernel_launches.len())
+                    .or_insert(data.kernel_launches.len());
                 offsets
                     .kernel_activities
                     .entry(ctx_id)
-                    .and_modify(|o| *o = ka_off + consumed)
-                    .or_insert(ka_off + consumed);
+                    .and_modify(|o| *o = data.kernel_activities.len())
+                    .or_insert(data.kernel_activities.len());
                 offsets
                     .memcpy_activities
                     .entry(ctx_id)

@@ -37,7 +37,7 @@ use perfetto_sdk::{
         },
     },
     track_event::TrackEvent,
-    track_event_categories, track_event_set_category_callback,
+    track_event_categories,
 };
 use perfetto_sdk_protos_gpu::protos::{
     common::gpu_counter_descriptor::{
@@ -91,6 +91,9 @@ use cuda_te_ns as perfetto_te_ns;
 
 /// 3-state teardown guard: 0=not started, 1=in progress, 2=done.
 static CUPTI_TEARDOWN_STATE: AtomicU8 = AtomicU8::new(0);
+
+use std::sync::atomic::AtomicU64;
+static KERNEL_STAGES_EMITTED: AtomicU64 = AtomicU64::new(0);
 
 struct CuptiBackend;
 
@@ -229,9 +232,9 @@ impl GpuBackend for CuptiBackend {
                 );
                 let _ = profiler::activity_disable(CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_MEMCPY);
                 let _ = profiler::activity_disable(CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_MEMSET);
-                let _ = profiler::activity_disable(CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_RUNTIME);
-                let _ = profiler::activity_disable(CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_DRIVER);
-                let _ = profiler::activity_flush_all(0);
+                let _ = profiler::activity_flush_all(
+                    CUpti_ActivityFlag_CUPTI_ACTIVITY_FLAG_FLUSH_FORCED,
+                );
 
                 self.finalize_range_profiler();
             });
@@ -514,6 +517,16 @@ impl GpuBackend for CuptiBackend {
                         .iter()
                         .map(|l| (l.correlation_id, l))
                         .collect();
+                    let ka_available = data.kernel_activities.len() - ka_start;
+                    if ka_available > 0 {
+                        injection_log!(
+                            "emit ctx {}: ka_start={}, available={}, total={}",
+                            ctx_id,
+                            ka_start,
+                            ka_available,
+                            data.kernel_activities.len()
+                        );
+                    }
                     for activity in data.kernel_activities[ka_start..].iter() {
                         let launch = launch_map.get(&activity.correlation_id);
                         let (raw_start, raw_end) =
@@ -822,6 +835,9 @@ impl GpuBackend for CuptiBackend {
                     return;
                 }
                 for event in &all_events {
+                    if event.stage_iid == KERNEL_STAGE_IID {
+                        KERNEL_STAGES_EMITTED.fetch_add(1, Ordering::Relaxed);
+                    }
                     let timestamp = event.start;
                     let duration_ns = event.end.saturating_sub(event.start);
                     ctx.with_incremental_state(|ctx: &mut TraceContext, inc_state| {
@@ -1095,6 +1111,29 @@ extern "C" fn end_execution() {
         for inst_id in renderstage_ids {
             nvidia.emit_renderstage_events_for_instance(inst_id, None);
         }
+        let stages = KERNEL_STAGES_EMITTED.load(Ordering::Relaxed);
+        let launches = callbacks::KERNEL_LAUNCH_EVENTS_EMITTED.load(Ordering::Relaxed);
+        let launches_ex = callbacks::KERNEL_LAUNCH_EX_EVENTS.load(Ordering::Relaxed);
+        let mut total_activities = 0u64;
+        if let Ok(state) = GLOBAL_STATE.lock() {
+            for data in state.context_data.values() {
+                total_activities += data.kernel_activities.len() as u64;
+            }
+        }
+        eprintln!(
+            "==INJECTION== STATS: cuLaunchKernel={}, cuLaunchKernelEx={}, \
+             kernel_activities={} (CUPTI), render_stages_emitted={}",
+            launches, launches_ex, total_activities, stages
+        );
+        if total_activities > stages {
+            eprintln!(
+                "==INJECTION== WARNING: {} kernel activities delivered by CUPTI but only {} \
+                 render stage events emitted ({} missing)",
+                total_activities,
+                stages,
+                total_activities - stages
+            );
+        }
     });
 }
 
@@ -1108,12 +1147,20 @@ fn register_profiler_callbacks() -> Result<CUpti_SubscriberHandle, CUptiResult> 
     let subscriber =
         unsafe { profiler::subscribe(Some(profiler_callback_handler), ptr::null_mut()) }?;
 
+    // Enable entire RUNTIME and DRIVER API domains so we can emit
+    // track events directly from callbacks for all API calls.
     unsafe {
-        profiler::enable_callback(
+        profiler::enable_domain(
+            1,
+            subscriber,
+            CUpti_CallbackDomain_CUPTI_CB_DOMAIN_RUNTIME_API,
+        )
+    }?;
+    unsafe {
+        profiler::enable_domain(
             1,
             subscriber,
             CUpti_CallbackDomain_CUPTI_CB_DOMAIN_DRIVER_API,
-            CUpti_driver_api_trace_cbid_enum_CUPTI_DRIVER_TRACE_CBID_cuLaunchKernel,
         )
     }?;
     unsafe {
@@ -1134,14 +1181,6 @@ fn register_profiler_callbacks() -> Result<CUpti_SubscriberHandle, CUptiResult> 
     }?;
     unsafe { profiler::enable_domain(1, subscriber, CUpti_CallbackDomain_CUPTI_CB_DOMAIN_STATE) }?;
     unsafe { profiler::enable_domain(1, subscriber, CUpti_CallbackDomain_CUPTI_CB_DOMAIN_NVTX) }?;
-    unsafe {
-        profiler::enable_callback(
-            1,
-            subscriber,
-            CUpti_CallbackDomain_CUPTI_CB_DOMAIN_RUNTIME_API,
-            CUpti_runtime_api_trace_cbid_enum_CUPTI_RUNTIME_TRACE_CBID_cudaDeviceReset_v3020,
-        )
-    }?;
     unsafe {
         profiler::activity_register_callbacks(Some(buffer_requested), Some(buffer_completed))
     }?;
@@ -1189,22 +1228,6 @@ pub extern "C" fn InitializeInjection() -> i32 {
         // Initialize track event categories for API call tracing
         TrackEvent::init();
         let _ = perfetto_te_ns::register();
-
-        // Enable/disable CUPTI activity kinds when categories are toggled
-        track_event_set_category_callback!("cudart", |_inst_id, enabled, _changed| {
-            if enabled {
-                let _ = profiler::activity_enable(CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_RUNTIME);
-            } else {
-                let _ = profiler::activity_disable(CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_RUNTIME);
-            }
-        });
-        track_event_set_category_callback!("cuda", |_inst_id, enabled, _changed| {
-            if enabled {
-                let _ = profiler::activity_enable(CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_DRIVER);
-            } else {
-                let _ = profiler::activity_disable(CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_DRIVER);
-            }
-        });
 
         if let Ok(mut state) = GLOBAL_STATE.lock() {
             if !state.injection_initialized {

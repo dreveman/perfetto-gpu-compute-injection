@@ -21,15 +21,19 @@ use perfetto_gpu_compute_injection::tracing::{
 };
 use perfetto_gpu_compute_injection::{injection_fatal, injection_log};
 use perfetto_sdk::track_event::{
-    EventContext, TrackEventProtoField, TrackEventProtoFields, TrackEventTimestamp,
-    TrackEventTrack, TrackEventType,
+    EventContext, TrackEventProtoField, TrackEventProtoFields, TrackEventTimestamp, TrackEventType,
 };
 use std::cell::RefCell;
 use std::time::Duration;
 use std::{ffi::CStr, ffi::CString, panic, ptr};
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 /// Buffer size for activity records (8 MB).
 const BUF_SIZE: usize = 8 * 1024 * 1024;
+
+pub static KERNEL_LAUNCH_EVENTS_EMITTED: AtomicU64 = AtomicU64::new(0);
+pub static KERNEL_LAUNCH_EX_EVENTS: AtomicU64 = AtomicU64::new(0);
 /// Alignment for activity buffers (8 bytes).
 const ALIGN_SIZE: usize = 8;
 
@@ -84,7 +88,6 @@ pub unsafe extern "C" fn buffer_completed(
     let _ = panic::catch_unwind(|| {
         if let Ok(mut state) = GLOBAL_STATE.lock() {
             let mut record: *mut CUpti_Activity = ptr::null_mut();
-            let mut api_events_emitted: u64 = 0;
             while unsafe { profiler::activity_get_next_record(buffer, valid_size, &mut record) }
                 .is_ok()
             {
@@ -146,91 +149,7 @@ pub unsafe extern "C" fn buffer_completed(
                             correlation_id: m.correlationId,
                         });
                     }
-                } else if r.kind == CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_RUNTIME
-                    || r.kind == CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_DRIVER
-                {
-                    let a = &*(record as *const CUpti_ActivityAPI);
-
-                    // Capture thread name on first occurrence of each thread_id.
-                    let tid = a.threadId;
-                    if tid != 0 {
-                        perfetto_gpu_compute_injection::config::capture_thread_name(
-                            &mut state.thread_names,
-                            tid,
-                        );
-                    }
-
-                    // Determine category based on activity kind.
-                    let (domain, category_index) =
-                        if r.kind == CUpti_ActivityKind_CUPTI_ACTIVITY_KIND_RUNTIME {
-                            (
-                                CUpti_CallbackDomain_CUPTI_CB_DOMAIN_RUNTIME_API,
-                                perfetto_te_ns::category_index("cudart"),
-                            )
-                        } else {
-                            (
-                                CUpti_CallbackDomain_CUPTI_CB_DOMAIN_DRIVER_API,
-                                perfetto_te_ns::category_index("cuda"),
-                            )
-                        };
-
-                    if perfetto_te_ns::is_category_enabled(category_index) {
-                        let full_name = profiler::get_callback_name(domain, a.cbid);
-                        let base_name = match full_name.rfind("_v") {
-                            Some(pos)
-                                if full_name[pos + 2..].chars().all(|c| c.is_ascii_digit()) =>
-                            {
-                                &full_name[..pos]
-                            }
-                            _ => full_name.as_str(),
-                        };
-                        let c_name = CString::new(base_name)
-                            .unwrap_or_else(|_| CString::new("unknown").unwrap());
-                        let name_ptr = c_name.as_ptr();
-
-                        let process_uuid = TrackEventTrack::process_track_uuid();
-                        let tname = state.thread_names.get(&tid);
-                        perfetto_gpu_compute_injection::build_thread_track!(
-                            process_uuid: process_uuid,
-                            process_id: a.processId as u64,
-                            thread_id: tid as u64,
-                            thread_name: tname.map(|s| s.as_str()),
-                            => _thread_fields_named, _thread_fields_unnamed, _track_fields, thread_track
-                        );
-
-                        // SliceBegin — attach GpuCorrelation linking this API call
-                        // to the corresponding render stage event via correlationId.
-                        let correlation_fields = [TrackEventProtoField::VarInt(
-                            1, // render_stage_submission_event_ids
-                            a.correlationId as u64,
-                        )];
-                        let gpu_correlation_fields = [TrackEventProtoField::Nested(
-                            3000, // gpu_correlation
-                            &correlation_fields,
-                        )];
-                        let mut ctx = EventContext::default();
-                        ctx.set_timestamp(TrackEventTimestamp::Boot(Duration::from_nanos(a.start)));
-                        ctx.set_proto_track(&thread_track);
-                        ctx.set_proto_fields(&TrackEventProtoFields {
-                            fields: &gpu_correlation_fields,
-                        });
-                        perfetto_te_ns::emit(
-                            category_index,
-                            TrackEventType::SliceBegin(name_ptr),
-                            &mut ctx,
-                        );
-
-                        // SliceEnd
-                        let mut ctx = EventContext::default();
-                        ctx.set_timestamp(TrackEventTimestamp::Boot(Duration::from_nanos(a.end)));
-                        ctx.set_proto_track(&thread_track);
-                        perfetto_te_ns::emit(category_index, TrackEventType::SliceEnd, &mut ctx);
-                        api_events_emitted += 1;
-                    }
                 }
-            }
-            if api_events_emitted > 0 {
-                injection_log!("flushed {} API track events", api_events_emitted);
             }
         }
         libc::free(buffer as *mut c_void);
@@ -257,6 +176,70 @@ pub unsafe extern "C" fn profiler_callback_handler(
         let res = profiler::get_last_error();
         if res != CUptiResult_CUPTI_SUCCESS {
             return;
+        }
+        // Emit track events for all RUNTIME and DRIVER API calls.
+        if domain == CUpti_CallbackDomain_CUPTI_CB_DOMAIN_RUNTIME_API
+            || domain == CUpti_CallbackDomain_CUPTI_CB_DOMAIN_DRIVER_API
+        {
+            let cb_data = &*(cbdata as *const CUpti_CallbackData);
+            let (callback_domain, category_index) =
+                if domain == CUpti_CallbackDomain_CUPTI_CB_DOMAIN_RUNTIME_API {
+                    (
+                        CUpti_CallbackDomain_CUPTI_CB_DOMAIN_RUNTIME_API,
+                        perfetto_te_ns::category_index("cudart"),
+                    )
+                } else {
+                    (
+                        CUpti_CallbackDomain_CUPTI_CB_DOMAIN_DRIVER_API,
+                        perfetto_te_ns::category_index("cuda"),
+                    )
+                };
+            if perfetto_te_ns::is_category_enabled(category_index) {
+                let full_name = profiler::get_callback_name(callback_domain, cbid);
+                let base_name = match full_name.rfind("_v") {
+                    Some(pos) if full_name[pos + 2..].chars().all(|c| c.is_ascii_digit()) => {
+                        &full_name[..pos]
+                    }
+                    _ => full_name.as_str(),
+                };
+                let c_name =
+                    CString::new(base_name).unwrap_or_else(|_| CString::new("unknown").unwrap());
+                let name_ptr = c_name.as_ptr();
+                let is_kernel_launch =
+                    domain == CUpti_CallbackDomain_CUPTI_CB_DOMAIN_DRIVER_API
+                        && (cbid
+                            == CUpti_driver_api_trace_cbid_enum_CUPTI_DRIVER_TRACE_CBID_cuLaunchKernel
+                            || cbid
+                                == CUpti_driver_api_trace_cbid_enum_CUPTI_DRIVER_TRACE_CBID_cuLaunchKernelEx);
+                let correlation_fields = [TrackEventProtoField::VarInt(
+                    1,
+                    cb_data.correlationId as u64,
+                )];
+                let gpu_correlation_fields =
+                    [TrackEventProtoField::Nested(3000, &correlation_fields)];
+                if cb_data.callbackSite == CUpti_ApiCallbackSite_CUPTI_API_ENTER {
+                    let mut ctx = EventContext::default();
+                    ctx.set_timestamp(TrackEventTimestamp::Boot(Duration::from_nanos(
+                        trace_time_ns(),
+                    )));
+                    if is_kernel_launch {
+                        ctx.set_proto_fields(&TrackEventProtoFields {
+                            fields: &gpu_correlation_fields,
+                        });
+                    }
+                    perfetto_te_ns::emit(
+                        category_index,
+                        TrackEventType::SliceBegin(name_ptr),
+                        &mut ctx,
+                    );
+                } else if cb_data.callbackSite == CUpti_ApiCallbackSite_CUPTI_API_EXIT {
+                    let mut ctx = EventContext::default();
+                    ctx.set_timestamp(TrackEventTimestamp::Boot(Duration::from_nanos(
+                        trace_time_ns(),
+                    )));
+                    perfetto_te_ns::emit(category_index, TrackEventType::SliceEnd, &mut ctx);
+                }
+            }
         }
         let instrumented = is_instrumented_enabled();
         if domain == CUpti_CallbackDomain_CUPTI_CB_DOMAIN_DRIVER_API
@@ -452,6 +435,7 @@ pub unsafe extern "C" fn profiler_callback_handler(
                                 max_active_blocks_per_sm,
                                 correlation_id: cb_data.correlationId,
                             });
+                            KERNEL_LAUNCH_EVENTS_EMITTED.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                 }
@@ -493,6 +477,13 @@ pub unsafe extern "C" fn profiler_callback_handler(
                         }
                     }
                 }
+            }
+        } else if domain == CUpti_CallbackDomain_CUPTI_CB_DOMAIN_DRIVER_API
+            && cbid == CUpti_driver_api_trace_cbid_enum_CUPTI_DRIVER_TRACE_CBID_cuLaunchKernelEx
+        {
+            let cb_data = &*(cbdata as *const CUpti_CallbackData);
+            if cb_data.callbackSite == CUpti_ApiCallbackSite_CUPTI_API_ENTER {
+                KERNEL_LAUNCH_EX_EVENTS.fetch_add(1, Ordering::Relaxed);
             }
         } else if domain == CUpti_CallbackDomain_CUPTI_CB_DOMAIN_RESOURCE {
             if cbid == CUpti_CallbackIdResource_CUPTI_CBID_RESOURCE_CONTEXT_CREATED {

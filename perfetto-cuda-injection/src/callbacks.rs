@@ -458,10 +458,11 @@ pub unsafe extern "C" fn profiler_callback_handler(
                             data.kernel_launches.push(KernelLaunch {
                                 function: params.f,
                                 start,
-                                end: 0, // Will be set in API_EXIT when profiler completes
+                                end: 0,
                                 profiled_instances,
                                 cache_mode,
                                 max_active_blocks_per_sm,
+                                correlation_id: cb_data.correlationId,
                             });
                         }
                     }

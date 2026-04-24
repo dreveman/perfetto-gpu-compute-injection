@@ -176,13 +176,13 @@ pub unsafe extern "C" fn buffer_completed(
 
                     if perfetto_te_ns::is_category_enabled(category_index) {
                         let full_name = profiler::get_callback_name(domain, a.cbid);
-                        let (base_name, version) = match full_name.rfind("_v") {
+                        let base_name = match full_name.rfind("_v") {
                             Some(pos)
                                 if full_name[pos + 2..].chars().all(|c| c.is_ascii_digit()) =>
                             {
-                                (&full_name[..pos], Some(&full_name[pos + 2..]))
+                                &full_name[..pos]
                             }
-                            _ => (full_name.as_str(), None),
+                            _ => full_name.as_str(),
                         };
                         let c_name = CString::new(base_name)
                             .unwrap_or_else(|_| CString::new("unknown").unwrap());
@@ -214,18 +214,6 @@ pub unsafe extern "C" fn buffer_completed(
                         ctx.set_proto_fields(&TrackEventProtoFields {
                             fields: &gpu_correlation_fields,
                         });
-                        ctx.add_debug_arg(
-                            "correlation_id",
-                            perfetto_sdk::track_event::TrackEventDebugArg::Uint64(
-                                a.correlationId as u64,
-                            ),
-                        );
-                        if let Some(ver) = version {
-                            ctx.add_debug_arg(
-                                "version",
-                                perfetto_sdk::track_event::TrackEventDebugArg::String(ver),
-                            );
-                        }
                         perfetto_te_ns::emit(
                             category_index,
                             TrackEventType::SliceBegin(name_ptr),

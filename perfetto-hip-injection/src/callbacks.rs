@@ -25,6 +25,9 @@ use perfetto_sdk::track_event::{
     EventContext, TrackEventProtoField, TrackEventProtoFields, TrackEventTimestamp,
     TrackEventTrack, TrackEventType,
 };
+use perfetto_sdk_protos_gpu::protos::trace::gpu::gpu_track_event::{
+    GpuApi, GpuCorrelationFieldNumber, TrackEventExtFieldNumber,
+};
 use std::ffi::CStr;
 use std::ffi::CString;
 use std::panic;
@@ -228,22 +231,29 @@ pub unsafe extern "C" fn buffer_callback(
                     );
 
                     // SliceBegin — attach GpuCorrelation linking this API call
-                    // to the corresponding render stage event via correlationId.
+                    // to the corresponding render stage event via correlationId,
+                    // and tag with the HIP GPU API.
                     let correlation_fields = [TrackEventProtoField::VarInt(
-                        1, // render_stage_submission_event_ids
+                        GpuCorrelationFieldNumber::RenderStageSubmissionEventIds as u32,
                         rec.correlation_id.internal,
                     )];
-                    let gpu_correlation_fields = [TrackEventProtoField::Nested(
-                        3000, // gpu_correlation
-                        &correlation_fields,
-                    )];
+                    let gpu_fields = [
+                        TrackEventProtoField::Nested(
+                            TrackEventExtFieldNumber::GpuCorrelation as u32,
+                            &correlation_fields,
+                        ),
+                        TrackEventProtoField::VarInt(
+                            TrackEventExtFieldNumber::GpuApi as u32,
+                            GpuApi::GpuApiHip as u64,
+                        ),
+                    ];
                     let mut ctx = EventContext::default();
                     ctx.set_timestamp(TrackEventTimestamp::Boot(Duration::from_nanos(
                         rec.start_timestamp,
                     )));
                     ctx.set_proto_track(&thread_track);
                     ctx.set_proto_fields(&TrackEventProtoFields {
-                        fields: &gpu_correlation_fields,
+                        fields: &gpu_fields,
                     });
                     ctx.add_debug_arg(
                         "correlation_id",

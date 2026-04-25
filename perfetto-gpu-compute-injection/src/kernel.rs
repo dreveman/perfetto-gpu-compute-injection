@@ -33,46 +33,127 @@ pub fn demangle_name(mangled: &str) -> String {
 /// the namespace prefix (including the trailing `::`) is 8 characters
 /// or fewer.
 ///
+/// Handles edge cases:
+///   - `(anonymous namespace)::` — parens at namespace depth
+///   - `operator<<`, `operator()`, `operator>` — operator delimiters
+///   - `{lambda(...)#1}` — braces with nested parens
+///   - Function pointer template args `void (*)(int)` — parens inside `<>`
+///
 /// Examples:
 ///   "void foo::bar<int>(float*, int)" -> "foo::bar"
 ///   "at::native::vectorized_elementwise_kernel<4, ...>(...)" -> "vectorized_elementwise_kernel"
 ///   "simple_kernel" -> "simple_kernel"
+///   "(anonymous namespace)::my_kernel(int)" -> "my_kernel"
 pub fn simplify_name(demangled: &str) -> &str {
     let s = demangled.trim();
+    let bytes = s.as_bytes();
 
     // Pass 1: find name_start by locating the last top-level space
-    // (not inside angle brackets) before the first top-level `(`.
-    let mut depth: u32 = 0;
+    // before the first top-level argument `(`. Track angle-bracket,
+    // paren, and brace depth to handle nested delimiters.
+    let mut angle_depth: u32 = 0;
+    let mut paren_depth: u32 = 0;
+    let mut brace_depth: u32 = 0;
     let mut last_space: usize = 0;
+    let mut i = 0;
 
-    for (i, c) in s.char_indices() {
+    while i < bytes.len() {
+        let c = bytes[i];
+        // Skip "(anonymous namespace)" — it's a namespace component,
+        // not an argument list.
+        if c == b'(' && angle_depth == 0 && brace_depth == 0 && paren_depth == 0 {
+            if s[i..].starts_with("(anonymous namespace)") {
+                i += "(anonymous namespace)".len();
+                continue;
+            }
+            break;
+        }
+        // Skip operator symbols that contain delimiters.
+        if s[i..].starts_with("operator") {
+            let op_start = i + "operator".len();
+            if let Some(&op_c) = bytes.get(op_start) {
+                let skip_len = match op_c {
+                    b'(' if bytes.get(op_start + 1) == Some(&b')') => 2,
+                    b'<' if bytes.get(op_start + 1) == Some(&b'<') => 2,
+                    b'<' => 1,
+                    b'>' if bytes.get(op_start + 1) == Some(&b'>') => 2,
+                    b'>' => 1,
+                    b'!' if bytes.get(op_start + 1) == Some(&b'=') => 2,
+                    b'=' if bytes.get(op_start + 1) == Some(&b'=') => 2,
+                    b'=' => 1,
+                    _ => 0,
+                };
+                if skip_len > 0 {
+                    i = op_start + skip_len;
+                    continue;
+                }
+            }
+        }
         match c {
-            '<' => depth += 1,
-            '>' if depth > 0 => depth -= 1,
-            '(' if depth == 0 => break,
-            ' ' if depth == 0 => last_space = i + 1,
+            b'<' => angle_depth += 1,
+            b'>' if angle_depth > 0 => angle_depth -= 1,
+            b'{' => brace_depth += 1,
+            b'}' if brace_depth > 0 => brace_depth -= 1,
+            b'(' if angle_depth > 0 || brace_depth > 0 => paren_depth += 1,
+            b')' if paren_depth > 0 => paren_depth -= 1,
+            b' ' if angle_depth == 0 && paren_depth == 0 && brace_depth == 0 => {
+                last_space = i + 1;
+            }
             _ => {}
         }
+        i += 1;
     }
 
-    // Pass 2: from name_start, find the first `<` or `(` — that's
-    // where the function name ends.
+    // Pass 2: from name_start, find the first top-level `<` or `(`
+    // (not inside operator names or anonymous namespaces).
     let rest = &s[last_space..];
-    let name_len = rest.find(['<', '(']).unwrap_or(rest.len());
-    let qualified = &s[last_space..last_space + name_len];
+    let rest_bytes = rest.as_bytes();
+    let mut name_end = rest.len();
+    let mut j = 0;
+    while j < rest_bytes.len() {
+        if rest[j..].starts_with("(anonymous namespace)") {
+            j += "(anonymous namespace)".len();
+            continue;
+        }
+        if rest[j..].starts_with("operator") {
+            let op_start = j + "operator".len();
+            if let Some(&op_c) = rest_bytes.get(op_start) {
+                let skip_len = match op_c {
+                    b'(' if rest_bytes.get(op_start + 1) == Some(&b')') => 2,
+                    b'<' if rest_bytes.get(op_start + 1) == Some(&b'<') => 2,
+                    b'<' => 1,
+                    b'>' if rest_bytes.get(op_start + 1) == Some(&b'>') => 2,
+                    b'>' => 1,
+                    b'!' if rest_bytes.get(op_start + 1) == Some(&b'=') => 2,
+                    b'=' if rest_bytes.get(op_start + 1) == Some(&b'=') => 2,
+                    b'=' => 1,
+                    _ => 0,
+                };
+                if skip_len > 0 {
+                    name_end = op_start + skip_len;
+                    break;
+                }
+            }
+        }
+        match rest_bytes[j] {
+            b'<' | b'(' => {
+                name_end = j;
+                break;
+            }
+            _ => j += 1,
+        }
+    }
+    let qualified = &s[last_space..last_space + name_end];
 
     // Pass 3: drop leading namespace components until the namespace
-    // prefix (including the final "::") is 8 characters or fewer.
+    // prefix (including the trailing `::`) is 8 characters or fewer.
     let mut result = qualified;
     while let Some(pos) = result.find("::") {
-        // Check total namespace prefix length including the trailing "::".
         if let Some(last_sep) = result.rfind("::") {
-            // last_sep + 2 = length of prefix through the final "::"
             if last_sep + 2 <= 8 {
                 break;
             }
         }
-        // Drop this namespace component (prefix + "::")
         if pos + 2 <= result.len() {
             result = &result[pos + 2..];
         } else {
@@ -165,6 +246,54 @@ mod tests {
     fn short_namespace_kept() {
         // prefix "foo::" (5 <= 8), kept
         assert_eq!(simplify_name("foo::bar"), "foo::bar");
+    }
+
+    #[test]
+    fn anonymous_namespace() {
+        assert_eq!(
+            simplify_name("(anonymous namespace)::my_kernel(int)"),
+            "my_kernel"
+        );
+    }
+
+    #[test]
+    fn anonymous_namespace_nested() {
+        assert_eq!(
+            simplify_name("void at::native::(anonymous namespace)::batch_norm_kernel(float*)"),
+            "batch_norm_kernel"
+        );
+    }
+
+    #[test]
+    fn operator_shift() {
+        assert_eq!(
+            simplify_name("void foo::operator<<(std::ostream&, int)"),
+            "foo::operator<<"
+        );
+    }
+
+    #[test]
+    fn operator_call() {
+        assert_eq!(
+            simplify_name("void foo::operator()(int, float)"),
+            "foo::operator()"
+        );
+    }
+
+    #[test]
+    fn operator_greater() {
+        assert_eq!(
+            simplify_name("bool foo::operator>(const foo&)"),
+            "foo::operator>"
+        );
+    }
+
+    #[test]
+    fn func_ptr_template_arg() {
+        assert_eq!(
+            simplify_name("void kernel<void (*)(int)>(float*)"),
+            "kernel"
+        );
     }
 
     #[test]

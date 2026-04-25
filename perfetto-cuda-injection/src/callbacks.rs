@@ -35,6 +35,10 @@ const ALIGN_SIZE: usize = 8;
 thread_local! {
     /// Per-thread NVTX range name stack, maintained by push/pop callbacks.
     static NVTX_RANGE_STACK: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    /// Nesting depth for our own callback handler. When > 0, API calls
+    /// are from the injection library itself (e.g. cuDeviceGetAttribute
+    /// during kernel launch processing) and should not emit track events.
+    static CALLBACK_DEPTH: RefCell<u32> = const { RefCell::new(0) };
 }
 
 /// Returns a snapshot of the current thread's NVTX range stack.
@@ -172,9 +176,12 @@ pub unsafe extern "C" fn profiler_callback_handler(
         if res != CUptiResult_CUPTI_SUCCESS {
             return;
         }
-        // Emit track events for all RUNTIME and DRIVER API calls.
-        if domain == CUpti_CallbackDomain_CUPTI_CB_DOMAIN_RUNTIME_API
-            || domain == CUpti_CallbackDomain_CUPTI_CB_DOMAIN_DRIVER_API
+        // Emit track events for all RUNTIME and DRIVER API calls,
+        // unless this is an internal call from the injection library.
+        let depth = CALLBACK_DEPTH.with(|d| *d.borrow());
+        if depth == 0
+            && (domain == CUpti_CallbackDomain_CUPTI_CB_DOMAIN_RUNTIME_API
+                || domain == CUpti_CallbackDomain_CUPTI_CB_DOMAIN_DRIVER_API)
         {
             let cb_data = &*(cbdata as *const CUpti_CallbackData);
             let (callback_domain, category_index) =
@@ -236,6 +243,8 @@ pub unsafe extern "C" fn profiler_callback_handler(
                 }
             }
         }
+        // Suppress track events for any CUPTI calls made by our handler.
+        CALLBACK_DEPTH.with(|d| *d.borrow_mut() += 1);
         let instrumented = is_instrumented_enabled();
         if domain == CUpti_CallbackDomain_CUPTI_CB_DOMAIN_DRIVER_API
             && cbid == CUpti_driver_api_trace_cbid_enum_CUPTI_DRIVER_TRACE_CBID_cuLaunchKernel
@@ -630,5 +639,6 @@ pub unsafe extern "C" fn profiler_callback_handler(
                 });
             }
         }
+        CALLBACK_DEPTH.with(|d| *d.borrow_mut() -= 1);
     });
 }

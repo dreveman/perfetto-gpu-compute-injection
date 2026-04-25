@@ -441,9 +441,9 @@ dependencies = [
 
 [[package]]
 name = "perfetto-sdk-protos-gpu"
-version = "0.3.5"
+version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ab27d4ab4397b629ec23cc121d885372f202a812aa75e000b1f0d8e718ca1845"
+checksum = "dfd7512821c6692b5aad1ebf57a642863e47a45db0ada6b4afbda68103eccdd3"
 dependencies = [
  "paste",
  "perfetto-sdk",

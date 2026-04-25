@@ -458,21 +458,12 @@ impl GlobalState {
     /// actually consumed by the zip, then drain the prefix that all consumers
     /// have consumed.
     pub fn advance_and_drain_renderstage_events(&mut self) {
-        // Advance consumer offsets. kernel_activities drive iteration;
-        // kernel_launches are looked up by correlation ID so they
-        // advance independently.
+        // Consumer offsets are advanced inline during emit (while
+        // holding the lock) to avoid the race with buffer_completed.
+        // This function only handles memcpy/memset advancement and
+        // draining.
         for offsets in self.renderstages_consumers.values_mut() {
             for (&ctx_id, data) in self.context_data.iter() {
-                offsets
-                    .kernel_launches
-                    .entry(ctx_id)
-                    .and_modify(|o| *o = data.kernel_launches.len())
-                    .or_insert(data.kernel_launches.len());
-                offsets
-                    .kernel_activities
-                    .entry(ctx_id)
-                    .and_modify(|o| *o = data.kernel_activities.len())
-                    .or_insert(data.kernel_activities.len());
                 offsets
                     .memcpy_activities
                     .entry(ctx_id)

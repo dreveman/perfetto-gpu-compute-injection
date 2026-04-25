@@ -92,9 +92,6 @@ use cuda_te_ns as perfetto_te_ns;
 /// 3-state teardown guard: 0=not started, 1=in progress, 2=done.
 static CUPTI_TEARDOWN_STATE: AtomicU8 = AtomicU8::new(0);
 
-use std::sync::atomic::AtomicU64;
-static KERNEL_STAGES_EMITTED: AtomicU64 = AtomicU64::new(0);
-
 struct CuptiBackend;
 
 /// Collected counter event data for emission outside of GLOBAL_STATE lock.
@@ -517,16 +514,6 @@ impl GpuBackend for CuptiBackend {
                         .iter()
                         .map(|l| (l.correlation_id, l))
                         .collect();
-                    let ka_available = data.kernel_activities.len() - ka_start;
-                    if ka_available > 0 {
-                        injection_log!(
-                            "emit ctx {}: ka_start={}, available={}, total={}",
-                            ctx_id,
-                            ka_start,
-                            ka_available,
-                            data.kernel_activities.len()
-                        );
-                    }
                     for activity in data.kernel_activities[ka_start..].iter() {
                         let launch = launch_map.get(&activity.correlation_id);
                         let (raw_start, raw_end) =
@@ -536,23 +523,7 @@ impl GpuBackend for CuptiBackend {
                             } else {
                                 (activity.start, activity.end)
                             };
-                        // CUPTI returns start=0/end=0 when timestamp collection
-                        // failed for an activity. It can also return end < start
-                        // for partially-completed or corrupted records. Skip
-                        // these to avoid emitting render stage events with
-                        // invalid timestamps.
-                        // TODO: investigate root cause. This tends to happen
-                        // during large bursts (1000s of kernels/memsets in quick
-                        // succession), suggesting a CUPTI activity buffer
-                        // overflow or race condition in timestamp collection.
                         if raw_start == 0 || raw_end < raw_start {
-                            injection_log!(
-                                "WARNING: kernel activity with invalid timestamps \
-                                 (start={}, end={}), skipping: {}",
-                                raw_start,
-                                raw_end,
-                                activity.kernel_name
-                            );
                             continue;
                         }
                         let demangled = perfetto_gpu_compute_injection::kernel::demangle_name(
@@ -823,6 +794,35 @@ impl GpuBackend for CuptiBackend {
                     .collect();
                 all_events.sort_by_key(|e| e.start);
 
+                // Advance consumer offsets NOW (while holding the lock)
+                // to exactly what we consumed. This prevents the race
+                // where advance_and_drain sets offsets to a length that
+                // includes activities added by buffer_completed between
+                // emit and drain.
+                if is_flush {
+                    let lengths: Vec<(u32, usize, usize, usize, usize)> = state
+                        .context_data
+                        .iter()
+                        .map(|(&ctx_id, data)| {
+                            (
+                                ctx_id,
+                                data.kernel_launches.len(),
+                                data.kernel_activities.len(),
+                                data.memcpy_activities.len(),
+                                data.memset_activities.len(),
+                            )
+                        })
+                        .collect();
+                    if let Some(offsets) = state.renderstages_consumers.get_mut(&inst_id) {
+                        for (ctx_id, kl, ka, mc, ms) in &lengths {
+                            offsets.kernel_launches.insert(*ctx_id, *kl);
+                            offsets.kernel_activities.insert(*ctx_id, *ka);
+                            offsets.memcpy_activities.insert(*ctx_id, *mc);
+                            offsets.memset_activities.insert(*ctx_id, *ms);
+                        }
+                    }
+                }
+
                 (all_events, channels, contexts, updated_prev_ends, is_flush)
                 // state (GLOBAL_STATE lock) dropped here
             };
@@ -835,9 +835,6 @@ impl GpuBackend for CuptiBackend {
                     return;
                 }
                 for event in &all_events {
-                    if event.stage_iid == KERNEL_STAGE_IID {
-                        KERNEL_STAGES_EMITTED.fetch_add(1, Ordering::Relaxed);
-                    }
                     let timestamp = event.start;
                     let duration_ns = event.end.saturating_sub(event.start);
                     ctx.with_incremental_state(|ctx: &mut TraceContext, inc_state| {
@@ -1110,29 +1107,6 @@ extern "C" fn end_execution() {
         }
         for inst_id in renderstage_ids {
             nvidia.emit_renderstage_events_for_instance(inst_id, None);
-        }
-        let stages = KERNEL_STAGES_EMITTED.load(Ordering::Relaxed);
-        let launches = callbacks::KERNEL_LAUNCH_EVENTS_EMITTED.load(Ordering::Relaxed);
-        let launches_ex = callbacks::KERNEL_LAUNCH_EX_EVENTS.load(Ordering::Relaxed);
-        let mut total_activities = 0u64;
-        if let Ok(state) = GLOBAL_STATE.lock() {
-            for data in state.context_data.values() {
-                total_activities += data.kernel_activities.len() as u64;
-            }
-        }
-        eprintln!(
-            "==INJECTION== STATS: cuLaunchKernel={}, cuLaunchKernelEx={}, \
-             kernel_activities={} (CUPTI), render_stages_emitted={}",
-            launches, launches_ex, total_activities, stages
-        );
-        if total_activities > stages {
-            eprintln!(
-                "==INJECTION== WARNING: {} kernel activities delivered by CUPTI but only {} \
-                 render stage events emitted ({} missing)",
-                total_activities,
-                stages,
-                total_activities - stages
-            );
         }
     });
 }

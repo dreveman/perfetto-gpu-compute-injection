@@ -23,6 +23,9 @@ use perfetto_gpu_compute_injection::{injection_fatal, injection_log};
 use perfetto_sdk::track_event::{
     EventContext, TrackEventProtoField, TrackEventProtoFields, TrackEventTimestamp, TrackEventType,
 };
+use perfetto_sdk_protos_gpu::protos::trace::gpu::gpu_track_event::{
+    GpuApi, GpuCorrelationFieldNumber, TrackEventExtFieldNumber,
+};
 use std::cell::RefCell;
 use std::time::Duration;
 use std::{ffi::CStr, ffi::CString, panic, ptr};
@@ -214,21 +217,35 @@ pub unsafe extern "C" fn profiler_callback_handler(
                             || cbid
                                 == CUpti_driver_api_trace_cbid_enum_CUPTI_DRIVER_TRACE_CBID_cuLaunchKernelEx);
                 let correlation_fields = [TrackEventProtoField::VarInt(
-                    1,
+                    GpuCorrelationFieldNumber::RenderStageSubmissionEventIds as u32,
                     cb_data.correlationId as u64,
                 )];
-                let gpu_correlation_fields =
-                    [TrackEventProtoField::Nested(3000, &correlation_fields)];
+                let gpu_correlation_and_api_fields = [
+                    TrackEventProtoField::Nested(
+                        TrackEventExtFieldNumber::GpuCorrelation as u32,
+                        &correlation_fields,
+                    ),
+                    TrackEventProtoField::VarInt(
+                        TrackEventExtFieldNumber::GpuApi as u32,
+                        GpuApi::GpuApiCuda as u64,
+                    ),
+                ];
+                let gpu_api_only_fields = [TrackEventProtoField::VarInt(
+                    TrackEventExtFieldNumber::GpuApi as u32,
+                    GpuApi::GpuApiCuda as u64,
+                )];
                 if cb_data.callbackSite == CUpti_ApiCallbackSite_CUPTI_API_ENTER {
                     let mut ctx = EventContext::default();
                     ctx.set_timestamp(TrackEventTimestamp::Boot(Duration::from_nanos(
                         trace_time_ns(),
                     )));
-                    if is_kernel_launch {
-                        ctx.set_proto_fields(&TrackEventProtoFields {
-                            fields: &gpu_correlation_fields,
-                        });
-                    }
+                    ctx.set_proto_fields(&TrackEventProtoFields {
+                        fields: if is_kernel_launch {
+                            &gpu_correlation_and_api_fields
+                        } else {
+                            &gpu_api_only_fields
+                        },
+                    });
                     perfetto_te_ns::emit(
                         category_index,
                         TrackEventType::SliceBegin(name_ptr),

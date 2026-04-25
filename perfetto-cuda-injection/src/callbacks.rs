@@ -27,13 +27,8 @@ use std::cell::RefCell;
 use std::time::Duration;
 use std::{ffi::CStr, ffi::CString, panic, ptr};
 
-use std::sync::atomic::{AtomicU64, Ordering};
-
 /// Buffer size for activity records (8 MB).
 const BUF_SIZE: usize = 8 * 1024 * 1024;
-
-pub static KERNEL_LAUNCH_EVENTS_EMITTED: AtomicU64 = AtomicU64::new(0);
-pub static KERNEL_LAUNCH_EX_EVENTS: AtomicU64 = AtomicU64::new(0);
 /// Alignment for activity buffers (8 bytes).
 const ALIGN_SIZE: usize = 8;
 
@@ -435,7 +430,6 @@ pub unsafe extern "C" fn profiler_callback_handler(
                                 max_active_blocks_per_sm,
                                 correlation_id: cb_data.correlationId,
                             });
-                            KERNEL_LAUNCH_EVENTS_EMITTED.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                 }
@@ -481,10 +475,7 @@ pub unsafe extern "C" fn profiler_callback_handler(
         } else if domain == CUpti_CallbackDomain_CUPTI_CB_DOMAIN_DRIVER_API
             && cbid == CUpti_driver_api_trace_cbid_enum_CUPTI_DRIVER_TRACE_CBID_cuLaunchKernelEx
         {
-            let cb_data = &*(cbdata as *const CUpti_CallbackData);
-            if cb_data.callbackSite == CUpti_ApiCallbackSite_CUPTI_API_ENTER {
-                KERNEL_LAUNCH_EX_EVENTS.fetch_add(1, Ordering::Relaxed);
-            }
+            // cuLaunchKernelEx handled by generic track event emission above.
         } else if domain == CUpti_CallbackDomain_CUPTI_CB_DOMAIN_RESOURCE {
             if cbid == CUpti_CallbackIdResource_CUPTI_CBID_RESOURCE_CONTEXT_CREATED {
                 let res_data = &*(cbdata as *const CUpti_ResourceData);

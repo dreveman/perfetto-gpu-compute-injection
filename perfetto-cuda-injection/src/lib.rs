@@ -779,8 +779,8 @@ impl GpuBackend for CuptiBackend {
                         if event.start < prev_end {
                             event.start = prev_end;
                         }
-                        if event.end < event.start {
-                            event.end = event.start;
+                        if event.end <= event.start {
+                            event.end = event.start + 1;
                         }
                         prev_end = event.end;
                     }

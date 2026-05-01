@@ -14,24 +14,154 @@
 
 //! rocprofiler-sdk callback handlers for AMD GPU tracing.
 
-use crate::perfetto_te_ns;
 use crate::rocprofiler_sys::*;
 use crate::state::{
     AgentInfo, CounterResult, KernelDispatch, MemcopyActivity, MemsetActivity, GLOBAL_STATE,
 };
 use perfetto_gpu_compute_injection::injection_log;
-use perfetto_gpu_compute_injection::tracing::get_counter_config;
-use perfetto_sdk::track_event::{
-    EventContext, TrackEventProtoField, TrackEventProtoFields, TrackEventTimestamp,
-    TrackEventTrack, TrackEventType,
+use perfetto_gpu_compute_injection::tracing::{
+    get_counter_config, get_track_event_data_source, is_cuda_events_enabled,
+    is_cuda_events_enabled_for, is_tx_events_enabled_for, process_track_uuid, TrackEventIncrState,
 };
+use perfetto_sdk::data_source::TraceContext;
+use perfetto_sdk::protos::trace::interned_data::interned_data::InternedData;
+use perfetto_sdk::protos::trace::trace_packet::{TracePacket, TracePacketSequenceFlags};
+use perfetto_sdk::protos::trace::track_event::track_event::EventCategory;
+use perfetto_sdk::protos::trace::track_event::track_event::EventName;
+use perfetto_sdk::protos::trace::track_event::track_event::TrackEvent as TrackEventProto;
+use perfetto_sdk::protos::trace::track_event::track_event::TrackEventType;
 use perfetto_sdk_protos_gpu::protos::trace::gpu::gpu_track_event::{
-    GpuApi, GpuCorrelationFieldNumber, TrackEventExtFieldNumber,
+    GpuApi, GpuCorrelation, TrackEventExt as GpuTrackEventExt,
 };
 use std::ffi::CStr;
-use std::ffi::CString;
 use std::panic;
-use std::time::Duration;
+
+const HIP_CATEGORY_IID: u64 = 1;
+const TX_CATEGORY_IID: u64 = 2;
+
+fn track_event_name_iid(name: &str) -> u64 {
+    let mut h: u64 = 5381;
+    for b in name.bytes() {
+        h = h.wrapping_mul(33).wrapping_add(b as u64);
+    }
+    h
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_track_event_with_interning(
+    ctx: &mut TraceContext<TrackEventIncrState>,
+    state: &mut TrackEventIncrState,
+    ts: u64,
+    track_uuid: u64,
+    category_iid: u64,
+    _category_name: &str,
+    event_type: TrackEventType,
+    name: Option<&str>,
+    gpu_correlation: Option<u64>,
+) {
+    let inst_id = ctx.instance_index();
+    let enabled = if category_iid == HIP_CATEGORY_IID {
+        is_cuda_events_enabled_for(inst_id)
+    } else {
+        is_tx_events_enabled_for(inst_id)
+    };
+    if !enabled {
+        return;
+    }
+    let name_iid = name.map(track_event_name_iid);
+    let new_name = name_iid.is_some_and(|iid| !state.interned_names.contains(&iid));
+    let need_state_clear = std::mem::replace(&mut state.was_cleared, false);
+
+    if need_state_clear || new_name {
+        ctx.add_packet(|packet: &mut TracePacket| {
+            if need_state_clear {
+                packet.set_sequence_flags(
+                    TracePacketSequenceFlags::SeqIncrementalStateCleared as u32,
+                );
+            }
+            packet.set_interned_data(|interned_data: &mut InternedData| {
+                interned_data.set_event_categories(|ec: &mut EventCategory| {
+                    ec.set_iid(HIP_CATEGORY_IID);
+                    ec.set_name("hip");
+                });
+                interned_data.set_event_categories(|ec: &mut EventCategory| {
+                    ec.set_iid(TX_CATEGORY_IID);
+                    ec.set_name("tx");
+                });
+                if let (Some(n), Some(iid)) = (name, name_iid) {
+                    interned_data.set_event_names(|en: &mut EventName| {
+                        en.set_iid(iid);
+                        en.set_name(n);
+                    });
+                }
+            });
+        });
+        if let Some(iid) = name_iid {
+            state.interned_names.insert(iid);
+        }
+    }
+
+    ctx.add_packet(|packet: &mut TracePacket| {
+        packet.set_timestamp(ts);
+        packet.set_sequence_flags(TracePacketSequenceFlags::SeqNeedsIncrementalState as u32);
+        packet.set_track_event(|te: &mut TrackEventProto| {
+            te.set_type(event_type);
+            te.set_track_uuid(track_uuid);
+            te.set_category_iids(category_iid);
+            if let Some(iid) = name_iid {
+                te.set_name_iid(iid);
+            }
+            if category_iid == HIP_CATEGORY_IID {
+                GpuTrackEventExt::set_gpu_api(te, GpuApi::GpuApiHip);
+            }
+            if let Some(corr_id) = gpu_correlation {
+                GpuTrackEventExt::set_gpu_correlation(te, |gc: &mut GpuCorrelation| {
+                    gc.set_render_stage_submission_event_ids(corr_id);
+                });
+            }
+        });
+    });
+}
+
+/// Collected API event data for deferred emission outside of GLOBAL_STATE lock.
+struct CollectedApiEvent {
+    start_ns: u64,
+    end_ns: u64,
+    track_uuid: u64,
+    tid: u64,
+    name: String,
+    correlation: Option<u64>,
+}
+
+fn ensure_track_descriptor(
+    ctx: &mut TraceContext<TrackEventIncrState>,
+    state: &mut TrackEventIncrState,
+    track_uuid: u64,
+    tid: u64,
+) {
+    use perfetto_gpu_compute_injection::tracing::emit_track_descriptor;
+
+    if state.track_descriptor_emitted {
+        return;
+    }
+    state.track_descriptor_emitted = true;
+
+    let pid = std::process::id() as i32;
+    let proc_uuid = process_track_uuid();
+
+    ctx.add_packet(|packet: &mut TracePacket| {
+        emit_track_descriptor(packet, proc_uuid, None, Some(pid), None);
+    });
+    ctx.add_packet(|packet: &mut TracePacket| {
+        emit_track_descriptor(
+            packet,
+            track_uuid,
+            Some(proc_uuid),
+            None,
+            Some((pid, tid as i32)),
+        );
+    });
+}
 
 /// Buffer callback: called by rocprofiler's internal thread when the buffer is
 /// flushed (at watermark or explicitly). Processes kernel dispatch and memory
@@ -61,7 +191,7 @@ pub unsafe extern "C" fn buffer_callback(
             Err(_) => return,
         };
 
-        let mut api_events_emitted: u64 = 0;
+        let mut api_events: Vec<CollectedApiEvent> = Vec::new();
 
         for &header_ptr in header_slice {
             if header_ptr.is_null() {
@@ -190,96 +320,101 @@ pub unsafe extern "C" fn buffer_callback(
                     continue;
                 }
 
+                if !is_cuda_events_enabled() {
+                    continue;
+                }
+
                 let tid = rec.thread_id;
                 perfetto_gpu_compute_injection::config::capture_thread_name(
                     &mut state.thread_names,
                     tid,
                 );
 
-                let category_index = perfetto_te_ns::category_index("hip");
-                if perfetto_te_ns::is_category_enabled(category_index) {
-                    // Resolve operation name via rocprofiler.
-                    let op_name = {
-                        let mut name_ptr: *const std::os::raw::c_char = std::ptr::null();
-                        let mut name_len: usize = 0;
-                        let status = rocprofiler_query_buffer_tracing_kind_operation_name(
-                            rec.kind,
-                            rec.operation,
-                            &mut name_ptr,
-                            &mut name_len,
-                        );
-                        if status == ROCPROFILER_STATUS_SUCCESS && !name_ptr.is_null() {
-                            CStr::from_ptr(name_ptr).to_string_lossy().into_owned()
-                        } else {
-                            format!("hip_op_{}", rec.operation)
-                        }
-                    };
-
-                    let c_name = CString::new(op_name.as_str())
-                        .unwrap_or_else(|_| CString::new("unknown").unwrap());
-                    let name_ptr = c_name.as_ptr();
-
-                    let process_uuid = TrackEventTrack::process_track_uuid();
-                    let process_id = libc::getpid() as u64;
-                    let thread_name = state.thread_names.get(&tid);
-                    perfetto_gpu_compute_injection::build_thread_track!(
-                        process_uuid: process_uuid,
-                        process_id: process_id,
-                        thread_id: tid,
-                        thread_name: thread_name.map(|s| s.as_str()),
-                        => _thread_fields_named, _thread_fields_unnamed, _track_fields, thread_track
+                // Resolve operation name via rocprofiler.
+                let op_name = {
+                    let mut name_ptr: *const std::os::raw::c_char = std::ptr::null();
+                    let mut name_len: usize = 0;
+                    let status = rocprofiler_query_buffer_tracing_kind_operation_name(
+                        rec.kind,
+                        rec.operation,
+                        &mut name_ptr,
+                        &mut name_len,
                     );
+                    if status == ROCPROFILER_STATUS_SUCCESS && !name_ptr.is_null() {
+                        CStr::from_ptr(name_ptr).to_string_lossy().into_owned()
+                    } else {
+                        format!("hip_op_{}", rec.operation)
+                    }
+                };
 
-                    // SliceBegin — attach GpuCorrelation linking this API call
-                    // to the corresponding render stage event via correlationId,
-                    // and tag with the HIP GPU API.
-                    let correlation_fields = [TrackEventProtoField::VarInt(
-                        GpuCorrelationFieldNumber::RenderStageSubmissionEventIds as u32,
-                        rec.correlation_id.internal,
-                    )];
-                    let gpu_fields = [
-                        TrackEventProtoField::Nested(
-                            TrackEventExtFieldNumber::GpuCorrelation as u32,
-                            &correlation_fields,
-                        ),
-                        TrackEventProtoField::VarInt(
-                            TrackEventExtFieldNumber::GpuApi as u32,
-                            GpuApi::GpuApiHip as u64,
-                        ),
-                    ];
-                    let mut ctx = EventContext::default();
-                    ctx.set_timestamp(TrackEventTimestamp::Boot(Duration::from_nanos(
-                        rec.start_timestamp,
-                    )));
-                    ctx.set_proto_track(&thread_track);
-                    ctx.set_proto_fields(&TrackEventProtoFields {
-                        fields: &gpu_fields,
-                    });
-                    ctx.add_debug_arg(
-                        "correlation_id",
-                        perfetto_sdk::track_event::TrackEventDebugArg::Uint64(
-                            rec.correlation_id.internal,
-                        ),
-                    );
-                    perfetto_te_ns::emit(
-                        category_index,
-                        TrackEventType::SliceBegin(name_ptr),
-                        &mut ctx,
-                    );
+                // Determine if this API call produces GPU work (for GpuCorrelation).
+                let produces_gpu_work = op_name.starts_with("hipLaunchKernel")
+                    || op_name.starts_with("hipMemcpy")
+                    || op_name.starts_with("hipMemset");
+                let correlation = if produces_gpu_work {
+                    Some(rec.correlation_id.internal)
+                } else {
+                    None
+                };
 
-                    // SliceEnd
-                    let mut ctx = EventContext::default();
-                    ctx.set_timestamp(TrackEventTimestamp::Boot(Duration::from_nanos(
-                        rec.end_timestamp,
-                    )));
-                    ctx.set_proto_track(&thread_track);
-                    perfetto_te_ns::emit(category_index, TrackEventType::SliceEnd, &mut ctx);
-                    api_events_emitted += 1;
-                }
+                // Compute thread track UUID from tid.
+                let track_uuid = {
+                    let mut h: u64 = 0xcbf29ce484222325;
+                    let pid_bytes = (std::process::id() as u64).to_le_bytes();
+                    let tid_bytes = tid.to_le_bytes();
+                    for b in pid_bytes.iter().chain(tid_bytes.iter()) {
+                        h ^= *b as u64;
+                        h = h.wrapping_mul(0x100000001b3);
+                    }
+                    h
+                };
+
+                // Collect API event for deferred emission after lock release.
+                api_events.push(CollectedApiEvent {
+                    start_ns: rec.start_timestamp,
+                    end_ns: rec.end_timestamp,
+                    track_uuid,
+                    tid,
+                    name: op_name,
+                    correlation,
+                });
             }
         }
-        if api_events_emitted > 0 {
-            injection_log!("flushed {} API track events", api_events_emitted);
+        // Drop the lock before emitting track events.
+        drop(state);
+
+        // Emit collected HIP API track events without holding GLOBAL_STATE.
+        if !api_events.is_empty() {
+            get_track_event_data_source().trace(|ctx| {
+                ctx.with_incremental_state(|ctx, state| {
+                    for event in &api_events {
+                        ensure_track_descriptor(ctx, state, event.track_uuid, event.tid);
+                        emit_track_event_with_interning(
+                            ctx,
+                            state,
+                            event.start_ns,
+                            event.track_uuid,
+                            HIP_CATEGORY_IID,
+                            "hip",
+                            TrackEventType::TypeSliceBegin,
+                            Some(&event.name),
+                            event.correlation,
+                        );
+                        emit_track_event_with_interning(
+                            ctx,
+                            state,
+                            event.end_ns,
+                            event.track_uuid,
+                            HIP_CATEGORY_IID,
+                            "hip",
+                            TrackEventType::TypeSliceEnd,
+                            None,
+                            None,
+                        );
+                    }
+                });
+            });
+            injection_log!("flushed {} API track events", api_events.len());
         }
     });
 }

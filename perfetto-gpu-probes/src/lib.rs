@@ -15,7 +15,7 @@
 //! Perfetto GPU Probes — global GPU counter polling service.
 //!
 //! This crate provides a standalone Perfetto producer that polls GPU metrics
-//! (frequency, etc.) and emits them as ftrace event packets. It supports
+//! (frequency, memory) and emits them as trace packets. It supports
 //! NVIDIA GPUs via NVML and AMD GPUs via sysfs. Both backends register
 //! independently, gated on hardware availability.
 

@@ -19,9 +19,13 @@ use crate::config::{
 use crate::injection_log;
 use libc::{clock_gettime, timespec};
 use perfetto_sdk::data_source::{
-    DataSource, DataSourceArgsBuilder, DataSourceBufferExhaustedPolicy, StopGuard,
+    Clear, DataSource, DataSourceArgsBuilder, DataSourceBufferExhaustedPolicy, StopGuard,
 };
 use perfetto_sdk::pb_decoder::{PbDecoder, PbDecoderField};
+use perfetto_sdk::protos::trace::trace_packet::TracePacket;
+use perfetto_sdk::protos::trace::track_event::process_descriptor::ProcessDescriptor;
+use perfetto_sdk::protos::trace::track_event::thread_descriptor::ThreadDescriptor;
+use perfetto_sdk::protos::trace::track_event::track_descriptor::TrackDescriptor;
 use perfetto_sdk_protos_gpu::protos::config::data_source_config::DataSourceConfigExtFieldNumber;
 use perfetto_sdk_protos_gpu::protos::config::gpu::gpu_counter_config::{
     GpuCounterConfigFieldNumber,
@@ -29,6 +33,7 @@ use perfetto_sdk_protos_gpu::protos::config::gpu::gpu_counter_config::{
     GpuCounterConfigInstrumentedSamplingConfigActivityRangeFieldNumber,
     GpuCounterConfigInstrumentedSamplingConfigFieldNumber,
 };
+use std::collections::HashSet;
 use std::sync::{
     atomic::{AtomicU64, AtomicU8, Ordering},
     Condvar, Mutex, OnceLock,
@@ -39,6 +44,32 @@ use std::time::Duration;
 use libc::CLOCK_BOOTTIME as TRACE_TIME_CLOCK;
 #[cfg(target_os = "macos")]
 use libc::CLOCK_MONOTONIC as TRACE_TIME_CLOCK;
+
+/// Incremental state for the gpu.track_event data source.
+/// Tracks interned event names per sequence to avoid re-emitting.
+pub struct TrackEventIncrState {
+    pub was_cleared: bool,
+    pub interned_names: HashSet<u64>,
+    pub track_descriptor_emitted: bool,
+}
+
+impl Default for TrackEventIncrState {
+    fn default() -> Self {
+        Self {
+            was_cleared: true,
+            interned_names: HashSet::new(),
+            track_descriptor_emitted: false,
+        }
+    }
+}
+
+impl Clear for TrackEventIncrState {
+    fn clear(&mut self) {
+        self.was_cleared = true;
+        self.interned_names.clear();
+        // Don't reset track_descriptor_emitted — descriptors persist.
+    }
+}
 
 // ---------------------------------------------------------------------------
 // GpuBackend trait
@@ -142,6 +173,13 @@ static RENDERSTAGES_STARTED: (Mutex<bool>, Condvar) = (Mutex::new(false), Condva
 
 static GPU_COUNTERS_DATA_SOURCE: OnceLock<DataSource> = OnceLock::new();
 static GPU_RENDERSTAGES_DATA_SOURCE: OnceLock<DataSource> = OnceLock::new();
+static GPU_TRACK_EVENT_DATA_SOURCE: OnceLock<DataSource<'static, TrackEventIncrState>> =
+    OnceLock::new();
+static TRACK_EVENT_STARTED: (Mutex<bool>, Condvar) = (Mutex::new(false), Condvar::new());
+/// Bitmask of instances with CUDA API track events enabled.
+static CUDA_EVENTS_MASK: AtomicU8 = AtomicU8::new(0);
+/// Bitmask of instances with NVTX (tx) track events enabled.
+static TX_EVENTS_MASK: AtomicU8 = AtomicU8::new(0);
 
 /// Returns the `CounterConfig` for a data source instance, if set.
 pub fn get_counter_config(inst_id: u32) -> Option<CounterConfig> {
@@ -535,6 +573,143 @@ pub fn is_instrumented_enabled() -> bool {
 /// Returns true if at least one renderstages data source consumer is currently active.
 pub fn is_renderstages_enabled() -> bool {
     RENDERSTAGES_ACTIVE_MASK.load(Ordering::SeqCst) != 0
+}
+
+const TRACK_DESCRIPTOR_FIELD_ID: u32 = 60;
+
+/// Returns true if at least one instance has CUDA API track events enabled.
+pub fn is_cuda_events_enabled() -> bool {
+    CUDA_EVENTS_MASK.load(Ordering::Relaxed) != 0
+}
+
+/// Returns true if CUDA API track events are enabled for a specific instance.
+pub fn is_cuda_events_enabled_for(inst_id: u32) -> bool {
+    CUDA_EVENTS_MASK.load(Ordering::Relaxed) & (1 << inst_id) != 0
+}
+
+/// Returns true if at least one instance has NVTX (tx) track events enabled.
+pub fn is_tx_events_enabled() -> bool {
+    TX_EVENTS_MASK.load(Ordering::Relaxed) != 0
+}
+
+/// Returns true if NVTX (tx) track events are enabled for a specific instance.
+pub fn is_tx_events_enabled_for(inst_id: u32) -> bool {
+    TX_EVENTS_MASK.load(Ordering::Relaxed) & (1 << inst_id) != 0
+}
+
+/// Returns the `gpu.track_event` data source, creating and registering it on first access.
+///
+/// Parses `track_event_config.enabled_categories` to determine which
+/// categories are active: "cuda" for API calls, "tx" for NVTX ranges,
+/// "*" for all.
+pub fn get_track_event_data_source() -> &'static DataSource<'static, TrackEventIncrState> {
+    GPU_TRACK_EVENT_DATA_SOURCE.get_or_init(|| {
+        let data_source_args = DataSourceArgsBuilder::new()
+            .handles_incremental_state_clear(true)
+            .on_setup(move |inst_id, config: &[u8], _args| {
+                const TRACK_EVENT_CONFIG_ID: u32 = 113;
+                const ENABLED_CATEGORIES_ID: u32 = 2;
+
+                let mut categories: Vec<String> = Vec::new();
+                for item in PbDecoder::new(config) {
+                    if let Ok((TRACK_EVENT_CONFIG_ID, PbDecoderField::Delimited(data))) = &item {
+                        for inner in PbDecoder::new(data) {
+                            if let Ok((ENABLED_CATEGORIES_ID, PbDecoderField::Delimited(cat))) =
+                                &inner
+                            {
+                                if let Ok(s) = std::str::from_utf8(cat) {
+                                    categories.push(s.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let enable_all = categories.iter().any(|c| c == "*");
+                if enable_all || categories.iter().any(|c| c == "cuda") {
+                    CUDA_EVENTS_MASK.fetch_or(1 << inst_id, Ordering::SeqCst);
+                }
+                if enable_all || categories.iter().any(|c| c == "tx") {
+                    TX_EVENTS_MASK.fetch_or(1 << inst_id, Ordering::SeqCst);
+                }
+            })
+            .on_start(move |_inst_id, _| {
+                injection_log!("gpu.track_event data source started");
+                let (lock, cvar) = &TRACK_EVENT_STARTED;
+                *lock.lock().expect("mutex poisoned") = true;
+                cvar.notify_all();
+            })
+            .on_stop(move |inst_id, _| {
+                CUDA_EVENTS_MASK.fetch_and(!(1 << inst_id), Ordering::SeqCst);
+                TX_EVENTS_MASK.fetch_and(!(1 << inst_id), Ordering::SeqCst);
+            });
+        let mut data_source = DataSource::new_with_incremental_state_type();
+        data_source
+            .register("gpu.track_event", data_source_args.build())
+            .expect("failed to register gpu.track_event data source");
+
+        if trace_startup_has("gpu.track_event") {
+            wait_for_start(&TRACK_EVENT_STARTED, "gpu.track_event");
+        }
+
+        data_source
+    })
+}
+
+/// Emit a track descriptor into a TracePacket.
+pub fn emit_track_descriptor(
+    packet: &mut TracePacket,
+    uuid: u64,
+    parent_uuid: Option<u64>,
+    process_pid: Option<i32>,
+    thread: Option<(i32, i32)>,
+) {
+    packet.msg.append_nested(TRACK_DESCRIPTOR_FIELD_ID, |msg| {
+        let mut td = TrackDescriptor { msg };
+        td.set_uuid(uuid);
+        if let Some(parent) = parent_uuid {
+            td.set_parent_uuid(parent);
+        }
+        if let Some(pid) = process_pid {
+            td.set_process(|pd: &mut ProcessDescriptor| {
+                pd.set_pid(pid);
+            });
+        }
+        if let Some((pid, tid)) = thread {
+            td.set_thread(|thd: &mut ThreadDescriptor| {
+                thd.set_pid(pid);
+                thd.set_tid(tid);
+            });
+        }
+    });
+}
+
+/// Returns the process track UUID matching the built-in TrackEvent API.
+///
+/// Must be called after `TrackEvent::init()`.
+pub fn process_track_uuid() -> u64 {
+    perfetto_sdk::track_event::TrackEventTrack::process_track_uuid()
+}
+
+/// Returns the current thread ID in a platform-independent way.
+pub fn current_tid() -> u32 {
+    #[cfg(target_os = "linux")]
+    {
+        unsafe { libc::syscall(libc::SYS_gettid) as u32 }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let mut tid: u64 = 0;
+        unsafe { libc::pthread_threadid_np(0, &mut tid) };
+        tid as u32
+    }
+}
+
+/// Returns the thread track UUID for the current thread, matching the
+/// built-in TrackEvent API convention: `tid ^ process_uuid`.
+pub fn thread_track_uuid() -> u64 {
+    let tid = current_tid() as u64;
+    tid ^ process_track_uuid()
 }
 
 /// Returns the current timestamp in nanoseconds from the trace clock.

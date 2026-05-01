@@ -19,8 +19,8 @@ mod state;
 
 use perfetto_gpu_compute_injection::injection_log;
 use perfetto_gpu_compute_injection::tracing::{
-    get_counter_config, get_counters_data_source, get_renderstages_data_source, register_backend,
-    GpuBackend,
+    get_counter_config, get_counters_data_source, get_renderstages_data_source,
+    get_track_event_data_source, register_backend, GpuBackend,
 };
 use perfetto_sdk::{
     data_source::{StopGuard, TraceContext},
@@ -29,11 +29,12 @@ use perfetto_sdk::{
         trace::{
             interned_data::interned_data::InternedData,
             trace_packet::{TracePacket, TracePacketSequenceFlags},
+            track_event::track_event::EventName,
         },
     },
     track_event::TrackEvent,
-    track_event_categories,
 };
+use perfetto_sdk_protos_gpu::protos::trace::gpu::gpu_interned_data::InternedDataExt as _;
 use perfetto_sdk_protos_gpu::protos::{
     common::gpu_counter_descriptor::{
         GpuCounterDescriptor, GpuCounterDescriptorGpuCounterGroup,
@@ -45,8 +46,9 @@ use perfetto_sdk_protos_gpu::protos::{
                 GpuCounterEvent, GpuCounterEventGpuCounter, InternedGpuCounterDescriptor,
             },
             gpu_render_stage_event::{
-                GpuRenderStageEvent, GpuRenderStageEventExtraData,
-                InternedGpuRenderStageSpecification,
+                GpuRenderStageEvent, GpuRenderStageEventComputeKernelLaunch,
+                GpuRenderStageEventDim3, GpuRenderStageEventExtraComputeArg,
+                InternedComputeArgName, InternedComputeKernel, InternedGpuRenderStageSpecification,
                 InternedGpuRenderStageSpecificationRenderStageCategory, InternedGraphicsContext,
                 InternedGraphicsContextApi,
             },
@@ -59,23 +61,14 @@ use rocprofiler_sys::*;
 use state::{ConsumerStartOffsets, CounterConsumerStartOffsets, GLOBAL_STATE};
 use std::{collections::HashSet, panic};
 
-// ---------------------------------------------------------------------------
-// Track event categories for HIP API call tracing
-// ---------------------------------------------------------------------------
-
-track_event_categories! {
-    pub mod hip_te_ns {
-        ( "hip", "HIP Runtime API calls", [ "api" ] ),
-    }
-}
-use hip_te_ns as perfetto_te_ns;
-
 // IID for the HIP Compute stage specification.
 const AMD_KERNEL_STAGE_IID: u64 = 1;
 const AMD_MEMCPY_STAGE_IID: u64 = 2;
 const AMD_MEMSET_STAGE_IID: u64 = 3;
-// Queue IID base offset to avoid collision with stage IIDs.
-const AMD_HW_QUEUE_IID_OFFSET: u64 = 1000;
+/// Offset for hw_queue IIDs to avoid collisions with stage IIDs
+/// (AMD_KERNEL_STAGE_IID, AMD_MEMCPY_STAGE_IID, AMD_MEMSET_STAGE_IID) since both
+/// share the same InternedGpuRenderStageSpecification namespace.
+const AMD_HW_QUEUE_IID_OFFSET: u64 = 8;
 
 // ---------------------------------------------------------------------------
 // RocprofilerBackend implementation
@@ -155,19 +148,43 @@ impl GpuBackend for RocprofilerBackend {
             let (process_id, process_name) =
                 perfetto_gpu_compute_injection::config::get_process_info();
 
-            // Phase 1: Collect all event data under GLOBAL_STATE lock, then release.
-            struct PendingRenderStageEvent {
+            // PendingEvent holds all data needed to emit a render stage event.
+            struct PendingEvent {
                 start_ns: u64,
                 end_ns: u64,
                 gpu_id: i32,
                 hw_queue_iid: u64,
                 stage_iid: u64,
                 name: String,
-                extra_fields: Vec<(String, String)>,
+                name_iid: u64,
                 correlation_id: u64,
+                // Structured compute kernel fields (kernel events only).
+                kernel_iid: Option<u64>,
+                kernel_mangled_name: Option<String>,
+                kernel_demangled_name: Option<String>,
+                kernel_arch: Option<String>,
+                launch_grid: Option<(u32, u32, u32)>,
+                launch_block: Option<(u32, u32, u32)>,
+                launch_args: Vec<(u64, KernelArgValue)>,
             }
 
-            let (events, queues) = {
+            impl RenderStageEvent for PendingEvent {
+                fn correlation_id(&self) -> u64 {
+                    self.correlation_id
+                }
+                fn gpu_id(&self) -> i32 {
+                    self.gpu_id
+                }
+                fn hw_queue_iid(&self) -> u64 {
+                    self.hw_queue_iid
+                }
+                fn stage_iid(&self) -> u64 {
+                    self.stage_iid
+                }
+            }
+
+            // Phase 1: Collect all event data under GLOBAL_STATE lock, then release.
+            let (all_events, queues) = {
                 let mut state = match GLOBAL_STATE.lock() {
                     Ok(s) => s,
                     Err(_) => return,
@@ -193,7 +210,7 @@ impl GpuBackend for RocprofilerBackend {
                     queues.insert(kd.queue_handle);
                 }
 
-                let mut events: Vec<PendingRenderStageEvent> = Vec::new();
+                let mut events: Vec<PendingEvent> = Vec::new();
 
                 // Kernel dispatch events.
                 for kd in state.kernel_dispatches[kd_start..].iter() {
@@ -222,52 +239,46 @@ impl GpuBackend for RocprofilerBackend {
                     let hw_queue_iid = (kd.queue_handle & 0xFFFF) + AMD_HW_QUEUE_IID_OFFSET;
                     // max_engine_clk_fcompute is in MHz.
                     let clock_freq_hz = kd.max_engine_clk_fcompute as f64 * 1_000_000.0;
-                    let extra_fields: Vec<(String, String)> = vec![
-                        ("kernel_name".to_string(), kd.kernel_name.clone()),
-                        ("kernel_demangled_name".to_string(), demangled.clone()),
-                        ("process_id".to_string(), process_id.to_string()),
-                        ("process_name".to_string(), process_name.clone()),
-                        ("device_id".to_string(), kd.device_index.to_string()),
-                        ("api".to_string(), "HIP".to_string()),
-                        ("arch".to_string(), kd.arch.clone()),
-                        ("queue_id".to_string(), kd.queue_handle.to_string()),
-                        ("launch__grid_size".to_string(), grid_size.to_string()),
-                        ("launch__grid_size_x".to_string(), grid_x.to_string()),
-                        ("launch__grid_size_y".to_string(), grid_y.to_string()),
-                        ("launch__grid_size_z".to_string(), grid_z.to_string()),
-                        ("launch__block_size".to_string(), workgroup_size.to_string()),
+
+                    // Build structured compute kernel launch args.
+                    let launch_args: Vec<(u64, KernelArgValue)> = vec![
                         (
-                            "launch__block_size_x".to_string(),
-                            kd.workgroup.0.to_string(),
+                            arg_iid("workgroup_size"),
+                            KernelArgValue::Uint(workgroup_size as u64),
+                        ),
+                        (arg_iid("grid_size"), KernelArgValue::Uint(grid_size as u64)),
+                        (
+                            arg_iid("thread_count"),
+                            KernelArgValue::Uint(thread_count as u64),
                         ),
                         (
-                            "launch__block_size_y".to_string(),
-                            kd.workgroup.1.to_string(),
+                            arg_iid("waves_per_multiprocessor"),
+                            KernelArgValue::Double(waves_per_cu),
                         ),
                         (
-                            "launch__block_size_z".to_string(),
-                            kd.workgroup.2.to_string(),
-                        ),
-                        ("launch__thread_count".to_string(), thread_count.to_string()),
-                        (
-                            "launch__waves_per_multiprocessor".to_string(),
-                            format!("{:.2}", waves_per_cu),
-                        ),
-                        (
-                            "GRBM_GUI_ACTIVE_avr_per_second".to_string(),
-                            format!("{:.0}", clock_freq_hz),
+                            arg_iid("GRBM_GUI_ACTIVE_avr_per_second"),
+                            KernelArgValue::Double(clock_freq_hz),
                         ),
                     ];
-                    events.push(PendingRenderStageEvent {
+
+                    let simplified_name =
+                        perfetto_gpu_compute_injection::kernel::simplify_name(&demangled);
+                    events.push(PendingEvent {
                         start_ns: kd.start_ns,
                         end_ns: kd.end_ns,
                         gpu_id: kd.device_index,
                         hw_queue_iid,
                         stage_iid: AMD_KERNEL_STAGE_IID,
-                        name: perfetto_gpu_compute_injection::kernel::simplify_name(&demangled)
-                            .to_string(),
-                        extra_fields,
+                        name: simplified_name.to_string(),
+                        name_iid: kernel_name_iid(simplified_name),
                         correlation_id: kd.correlation_id,
+                        kernel_iid: Some(kernel_name_iid(&kd.kernel_name)),
+                        kernel_mangled_name: Some(kd.kernel_name.clone()),
+                        kernel_demangled_name: Some(demangled.clone()),
+                        kernel_arch: Some(kd.arch.clone()),
+                        launch_grid: Some((grid_x, grid_y, grid_z)),
+                        launch_block: Some((kd.workgroup.0, kd.workgroup.1, kd.workgroup.2)),
+                        launch_args,
                     });
                 }
 
@@ -280,41 +291,43 @@ impl GpuBackend for RocprofilerBackend {
                         4 => "Memcpy DtoD",
                         _ => "Memcpy",
                     };
-                    let extra_fields: Vec<(String, String)> = vec![
-                        ("process_id".to_string(), process_id.to_string()),
-                        ("process_name".to_string(), process_name.clone()),
-                        ("device_id".to_string(), mc.device_index.to_string()),
-                        ("size_bytes".to_string(), mc.bytes.to_string()),
-                        ("direction".to_string(), mc.direction.to_string()),
-                    ];
-                    events.push(PendingRenderStageEvent {
+                    events.push(PendingEvent {
                         start_ns: mc.start_ns,
                         end_ns: mc.end_ns,
                         gpu_id: mc.device_index,
                         hw_queue_iid: AMD_HW_QUEUE_IID_OFFSET,
                         stage_iid: AMD_MEMCPY_STAGE_IID,
                         name: memcpy_name.to_string(),
-                        extra_fields,
+                        name_iid: kernel_name_iid(memcpy_name),
                         correlation_id: mc.correlation_id,
+                        kernel_iid: None,
+                        kernel_mangled_name: None,
+                        kernel_demangled_name: None,
+                        kernel_arch: None,
+                        launch_grid: None,
+                        launch_block: None,
+                        launch_args: Vec::new(),
                     });
                 }
 
                 // Memory set events.
                 for ms in state.memsets[ms_start..].iter() {
-                    let extra_fields: Vec<(String, String)> = vec![
-                        ("process_id".to_string(), process_id.to_string()),
-                        ("process_name".to_string(), process_name.clone()),
-                        ("device_id".to_string(), ms.device_index.to_string()),
-                    ];
-                    events.push(PendingRenderStageEvent {
+                    events.push(PendingEvent {
                         start_ns: ms.start_ns,
                         end_ns: ms.end_ns,
                         gpu_id: ms.device_index,
                         hw_queue_iid: AMD_HW_QUEUE_IID_OFFSET,
                         stage_iid: AMD_MEMSET_STAGE_IID,
                         name: "Memset".to_string(),
-                        extra_fields,
+                        name_iid: kernel_name_iid("Memset"),
                         correlation_id: ms.correlation_id,
+                        kernel_iid: None,
+                        kernel_mangled_name: None,
+                        kernel_demangled_name: None,
+                        kernel_arch: None,
+                        launch_grid: None,
+                        launch_block: None,
+                        launch_args: Vec::new(),
                     });
                 }
 
@@ -331,112 +344,74 @@ impl GpuBackend for RocprofilerBackend {
 
             // Phase 2: Emit collected events without holding GLOBAL_STATE.
             // This prevents deadlock with buffer_callback which also needs GLOBAL_STATE.
+
+            // Collect unique event names and kernels for interning.
+            let mut unique_event_names: Vec<(u64, String)> = Vec::new();
+            {
+                let mut seen_name_iids: HashSet<u64> = HashSet::new();
+                for event in &all_events {
+                    if seen_name_iids.insert(event.name_iid) {
+                        unique_event_names.push((event.name_iid, event.name.clone()));
+                    }
+                }
+            }
+            let mut unique_kernels: Vec<UniqueKernel> = Vec::new();
+            {
+                let mut seen_kernel_iids: HashSet<u64> = HashSet::new();
+                for event in &all_events {
+                    if let Some(kiid) = event.kernel_iid {
+                        if seen_kernel_iids.insert(kiid) {
+                            unique_kernels.push(UniqueKernel {
+                                iid: kiid,
+                                mangled_name: event.kernel_mangled_name.clone().unwrap_or_default(),
+                                demangled_name: event
+                                    .kernel_demangled_name
+                                    .clone()
+                                    .unwrap_or_default(),
+                                arch: event.kernel_arch.clone().unwrap_or_default(),
+                                process_name: process_name.clone(),
+                                process_id: process_id as u64,
+                            });
+                        }
+                    }
+                }
+            }
+
             let mut stop_guard_opt = stop_guard;
             get_renderstages_data_source().trace(|ctx: &mut TraceContext| {
                 if ctx.instance_index() != inst_id {
                     return;
                 }
-
-                ctx.with_incremental_state(|ctx: &mut TraceContext, inc_state| {
-                    let was_cleared =
-                        std::mem::replace(&mut inc_state.was_cleared, false);
-
-                    if was_cleared {
-                        ctx.add_packet(|packet: &mut TracePacket| {
-                            packet.set_sequence_flags(
-                                TracePacketSequenceFlags::SeqIncrementalStateCleared as u32,
-                            );
-                            packet.set_interned_data(|interned: &mut InternedData| {
-                                interned.set_graphics_contexts(
-                                    |gctx: &mut InternedGraphicsContext| {
-                                        gctx.set_iid(1);
-                                        gctx.set_pid(process_id);
-                                        gctx.set_api(InternedGraphicsContextApi::Hip);
-                                    },
-                                );
-                                for (idx, &queue_handle) in queues.iter().enumerate() {
-                                    let iid =
-                                        (queue_handle & 0xFFFF) + AMD_HW_QUEUE_IID_OFFSET;
-                                    interned.set_gpu_specifications(
-                                        |spec: &mut InternedGpuRenderStageSpecification| {
-                                            spec.set_iid(iid);
-                                            spec.set_name(format!(
-                                                "Queue #{}",
-                                                idx + 1
-                                            ));
-                                            spec.set_category(
-                                                InternedGpuRenderStageSpecificationRenderStageCategory::Compute,
-                                            );
-                                        },
-                                    );
-                                }
-                                interned.set_gpu_specifications(
-                                    |spec: &mut InternedGpuRenderStageSpecification| {
-                                        spec.set_iid(AMD_KERNEL_STAGE_IID);
-                                        spec.set_name("Kernel");
-                                        spec.set_description("HIP Kernel");
-                                        spec.set_category(
-                                            InternedGpuRenderStageSpecificationRenderStageCategory::Compute,
-                                        );
-                                    },
-                                );
-                                interned.set_gpu_specifications(
-                                    |spec: &mut InternedGpuRenderStageSpecification| {
-                                        spec.set_iid(AMD_MEMCPY_STAGE_IID);
-                                        spec.set_name("MemoryTransfer");
-                                        spec.set_description("HIP Memory Transfer");
-                                        spec.set_category(
-                                            InternedGpuRenderStageSpecificationRenderStageCategory::Other,
-                                        );
-                                    },
-                                );
-                                interned.set_gpu_specifications(
-                                    |spec: &mut InternedGpuRenderStageSpecification| {
-                                        spec.set_iid(AMD_MEMSET_STAGE_IID);
-                                        spec.set_name("MemorySet");
-                                        spec.set_description("HIP Memory Set");
-                                        spec.set_category(
-                                            InternedGpuRenderStageSpecificationRenderStageCategory::Other,
-                                        );
-                                    },
-                                );
-                            });
-                        });
-                    }
-
-                    for event in &events {
-                        let duration_ns = event.end_ns.saturating_sub(event.start_ns);
-                        ctx.add_packet(|packet: &mut TracePacket| {
-                            packet
-                                .set_timestamp(event.start_ns)
-                                .set_timestamp_clock_id(
-                                    BuiltinClock::BuiltinClockBoottime.into(),
-                                )
-                                .set_gpu_render_stage_event(
-                                    |re: &mut GpuRenderStageEvent| {
-                                        re.set_event_id(event.correlation_id)
-                                            .set_duration(duration_ns)
-                                            .set_gpu_id(event.gpu_id)
-                                            .set_hw_queue_iid(event.hw_queue_iid)
-                                            .set_stage_iid(event.stage_iid)
-                                            .set_context(1)
-                                            .set_name(&event.name);
-                                        for (name, value) in &event.extra_fields {
-                                            re.set_extra_data(
-                                                |ed: &mut GpuRenderStageEventExtraData| {
-                                                    ed.set_name(name);
-                                                    ed.set_value(value);
-                                                },
-                                            );
-                                        }
-                                    },
-                                );
-                        });
-                    }
-                });
-
-                let mut sg = Some(stop_guard_opt.take());
-                ctx.flush(move || drop(sg.take()));
+                for event in &all_events {
+                    let timestamp = event.start_ns;
+                    let duration_ns = event.end_ns.saturating_sub(event.start_ns);
+                    ctx.with_incremental_state(|ctx: &mut TraceContext, inc_state| {
+                        let was_cleared = std::mem::replace(&mut inc_state.was_cleared, false);
+                        let rs_ctx = RenderStageContext {
+                            queues: &queues,
+                            process_id,
+                            unique_kernels: &unique_kernels,
+                            unique_event_names: &unique_event_names,
+                        };
+                        emit_render_stage_event(
+                            ctx,
+                            event,
+                            timestamp,
+                            duration_ns,
+                            was_cleared,
+                            &rs_ctx,
+                            event.name_iid,
+                            event.kernel_iid,
+                            event.launch_grid,
+                            event.launch_block,
+                            &event.launch_args,
+                        );
+                    });
+                }
+                if let Some(sg) = stop_guard_opt.take() {
+                    let mut sg = Some(Some(sg));
+                    ctx.flush(move || drop(sg.take()));
+                }
             });
             drop(stop_guard_opt);
         });
@@ -970,6 +945,241 @@ fn emit_interned_counter_descriptors(
 }
 
 // ---------------------------------------------------------------------------
+// Compute kernel structured proto constants and helpers
+// ---------------------------------------------------------------------------
+
+const COMPUTE_ARG_NAMES: &[(u64, &str)] = &[
+    (1, "workgroup_size"),
+    (2, "grid_size"),
+    (3, "thread_count"),
+    (4, "shared_mem_dynamic"),
+    (5, "waves_per_multiprocessor"),
+    (6, "occupancy_limit_blocks"),
+    (7, "occupancy_limit_registers"),
+    (8, "occupancy_limit_shared_mem"),
+    (9, "occupancy_limit_warps"),
+    (10, "sm__maximum_warps_per_active_cycle_pct"),
+    (11, "sm__maximum_warps_avg_per_active_cycle"),
+    (12, "process_name"),
+    (13, "process_id"),
+    (14, "registers_per_thread"),
+    (15, "shared_mem_static"),
+    (16, "func_cache_config"),
+    (17, "GRBM_GUI_ACTIVE_avr_per_second"),
+    (19, "shared_mem_config_size"),
+    (20, "shared_mem_driver"),
+];
+
+fn arg_iid(name: &str) -> u64 {
+    COMPUTE_ARG_NAMES
+        .iter()
+        .find(|(_, n)| *n == name)
+        .unwrap_or_else(|| panic!("unknown compute arg name: {name}"))
+        .0
+}
+
+/// Simple hash of kernel name to produce a stable IID for InternedComputeKernel.
+fn kernel_name_iid(name: &str) -> u64 {
+    let mut h: u64 = 5381;
+    for b in name.bytes() {
+        h = h.wrapping_mul(33).wrapping_add(b as u64);
+    }
+    // Avoid 0 (reserved) by ensuring non-zero
+    if h == 0 {
+        1
+    } else {
+        h
+    }
+}
+
+enum KernelArgValue {
+    Uint(u64),
+    Double(f64),
+    #[allow(dead_code)]
+    Str(String),
+}
+
+fn set_kernel_arg_string(kernel: &mut InternedComputeKernel, name: &str, value: &str) {
+    kernel.set_args(|arg: &mut GpuRenderStageEventExtraComputeArg| {
+        arg.set_name_iid(arg_iid(name));
+        arg.set_string_value(value);
+    });
+}
+
+fn set_kernel_arg_uint(kernel: &mut InternedComputeKernel, name: &str, value: u64) {
+    kernel.set_args(|arg: &mut GpuRenderStageEventExtraComputeArg| {
+        arg.set_name_iid(arg_iid(name));
+        arg.set_uint_value(value);
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Render stage helpers
+// ---------------------------------------------------------------------------
+
+/// Information about a unique kernel for interning.
+struct UniqueKernel {
+    iid: u64,
+    mangled_name: String,
+    demangled_name: String,
+    arch: String,
+    process_name: String,
+    process_id: u64,
+}
+
+fn emit_interned_specifications(
+    packet: &mut TracePacket,
+    queues: &std::collections::HashSet<u64>,
+    process_id: i32,
+    unique_kernels: &[UniqueKernel],
+    unique_event_names: &[(u64, String)],
+) {
+    packet.set_sequence_flags(TracePacketSequenceFlags::SeqIncrementalStateCleared as u32);
+    packet.set_interned_data(|interned: &mut InternedData| {
+        interned.set_graphics_contexts(|gctx: &mut InternedGraphicsContext| {
+            gctx.set_iid(1);
+            gctx.set_pid(process_id);
+            gctx.set_api(InternedGraphicsContextApi::Hip);
+        });
+        for (idx, &queue_handle) in queues.iter().enumerate() {
+            let iid = (queue_handle & 0xFFFF) + AMD_HW_QUEUE_IID_OFFSET;
+            interned.set_gpu_specifications(|spec: &mut InternedGpuRenderStageSpecification| {
+                spec.set_iid(iid);
+                spec.set_name(format!("Queue #{}", idx + 1));
+                spec.set_category(InternedGpuRenderStageSpecificationRenderStageCategory::Compute);
+            });
+        }
+        interned.set_gpu_specifications(|spec: &mut InternedGpuRenderStageSpecification| {
+            spec.set_iid(AMD_KERNEL_STAGE_IID);
+            spec.set_name("Kernel");
+            spec.set_category(InternedGpuRenderStageSpecificationRenderStageCategory::Compute);
+        });
+        interned.set_gpu_specifications(|spec: &mut InternedGpuRenderStageSpecification| {
+            spec.set_iid(AMD_MEMCPY_STAGE_IID);
+            spec.set_name("MemoryTransfer");
+            spec.set_category(InternedGpuRenderStageSpecificationRenderStageCategory::Other);
+        });
+        interned.set_gpu_specifications(|spec: &mut InternedGpuRenderStageSpecification| {
+            spec.set_iid(AMD_MEMSET_STAGE_IID);
+            spec.set_name("MemorySet");
+            spec.set_category(InternedGpuRenderStageSpecificationRenderStageCategory::Other);
+        });
+        for &(iid, name) in COMPUTE_ARG_NAMES {
+            interned.set_compute_arg_names(|an: &mut InternedComputeArgName| {
+                an.set_iid(iid);
+                an.set_name(name);
+            });
+        }
+        for (iid, name) in unique_event_names {
+            interned.set_event_names(|en: &mut EventName| {
+                en.set_iid(*iid);
+                en.set_name(name);
+            });
+        }
+        for kernel in unique_kernels {
+            interned.set_compute_kernels(|ck: &mut InternedComputeKernel| {
+                ck.set_iid(kernel.iid);
+                ck.set_name(&kernel.mangled_name);
+                ck.set_demangled_name(&kernel.demangled_name);
+                ck.set_arch(&kernel.arch);
+                set_kernel_arg_string(ck, "process_name", &kernel.process_name);
+                set_kernel_arg_uint(ck, "process_id", kernel.process_id);
+            });
+        }
+    });
+}
+
+struct RenderStageContext<'a> {
+    queues: &'a std::collections::HashSet<u64>,
+    process_id: i32,
+    unique_kernels: &'a [UniqueKernel],
+    unique_event_names: &'a [(u64, String)],
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_render_stage_event(
+    ctx: &mut TraceContext,
+    event: &impl RenderStageEvent,
+    timestamp: u64,
+    duration_ns: u64,
+    emit_interned: bool,
+    rs_ctx: &RenderStageContext,
+    name_iid: u64,
+    kernel_iid: Option<u64>,
+    launch_grid: Option<(u32, u32, u32)>,
+    launch_block: Option<(u32, u32, u32)>,
+    launch_args: &[(u64, KernelArgValue)],
+) {
+    ctx.add_packet(|packet: &mut TracePacket| {
+        packet
+            .set_timestamp(timestamp)
+            .set_timestamp_clock_id(BuiltinClock::BuiltinClockBoottime.into())
+            .set_gpu_render_stage_event(|re: &mut GpuRenderStageEvent| {
+                re.set_event_id(event.correlation_id())
+                    .set_duration(duration_ns)
+                    .set_gpu_id(event.gpu_id())
+                    .set_hw_queue_iid(event.hw_queue_iid())
+                    .set_stage_iid(event.stage_iid())
+                    .set_context(1)
+                    .set_name_iid(name_iid);
+                if let Some(kiid) = kernel_iid {
+                    // Structured compute kernel event.
+                    re.set_kernel_iid(kiid);
+                    re.set_launch(|launch: &mut GpuRenderStageEventComputeKernelLaunch| {
+                        if let Some((gx, gy, gz)) = launch_grid {
+                            launch.set_grid_size(|d: &mut GpuRenderStageEventDim3| {
+                                d.set_x(gx);
+                                d.set_y(gy);
+                                d.set_z(gz);
+                            });
+                        }
+                        if let Some((bx, by, bz)) = launch_block {
+                            launch.set_workgroup_size(|d: &mut GpuRenderStageEventDim3| {
+                                d.set_x(bx);
+                                d.set_y(by);
+                                d.set_z(bz);
+                            });
+                        }
+                        for (name_iid, value) in launch_args {
+                            launch.set_args(|arg: &mut GpuRenderStageEventExtraComputeArg| {
+                                arg.set_name_iid(*name_iid);
+                                match value {
+                                    KernelArgValue::Uint(v) => {
+                                        arg.set_uint_value(*v);
+                                    }
+                                    KernelArgValue::Double(v) => {
+                                        arg.set_double_value(*v);
+                                    }
+                                    KernelArgValue::Str(v) => {
+                                        arg.set_string_value(v);
+                                    }
+                                }
+                            });
+                        }
+                    });
+                }
+            });
+        if emit_interned {
+            emit_interned_specifications(
+                packet,
+                rs_ctx.queues,
+                rs_ctx.process_id,
+                rs_ctx.unique_kernels,
+                rs_ctx.unique_event_names,
+            );
+        }
+    });
+}
+
+/// Trait for render stage event data access.
+trait RenderStageEvent {
+    fn correlation_id(&self) -> u64;
+    fn gpu_id(&self) -> i32;
+    fn hw_queue_iid(&self) -> u64;
+    fn stage_iid(&self) -> u64;
+}
+
+// ---------------------------------------------------------------------------
 // AMD rocprofiler initialization helpers
 // ---------------------------------------------------------------------------
 
@@ -1157,14 +1367,10 @@ pub extern "C" fn rocprofiler_configure(
             // Initialize Perfetto producer and register data sources.
             let producer_args = ProducerInitArgsBuilder::new().backends(Backends::SYSTEM);
             Producer::init(producer_args.build());
+            TrackEvent::init();
             let _ = get_renderstages_data_source();
             let _ = get_counters_data_source();
-
-            // Initialize track event categories for HIP API call tracing.
-            // HIP API buffer tracing is configured in initialize_rocprofiler();
-            // the category callback only controls whether events are emitted.
-            TrackEvent::init();
-            let _ = perfetto_te_ns::register();
+            let _ = get_track_event_data_source();
 
             unsafe { libc::atexit(end_execution) };
 

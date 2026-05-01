@@ -13,22 +13,27 @@
 // limitations under the License.
 
 use crate::cupti_profiler::{self as profiler, *};
-use crate::perfetto_te_ns;
 use crate::state::{KernelActivity, KernelLaunch, MemcpyActivity, MemsetActivity, GLOBAL_STATE};
 use libc::c_void;
 use perfetto_gpu_compute_injection::tracing::{
-    get_counter_config, is_instrumented_enabled, trace_time_ns,
+    get_counter_config, get_track_event_data_source, is_cuda_events_enabled,
+    is_cuda_events_enabled_for, is_instrumented_enabled, is_tx_events_enabled,
+    is_tx_events_enabled_for, process_track_uuid, thread_track_uuid, trace_time_ns,
+    TrackEventIncrState,
 };
 use perfetto_gpu_compute_injection::{injection_fatal, injection_log};
-use perfetto_sdk::track_event::{
-    EventContext, TrackEventProtoField, TrackEventProtoFields, TrackEventTimestamp, TrackEventType,
-};
+use perfetto_sdk::data_source::TraceContext;
+use perfetto_sdk::protos::trace::interned_data::interned_data::InternedData;
+use perfetto_sdk::protos::trace::trace_packet::{TracePacket, TracePacketSequenceFlags};
+use perfetto_sdk::protos::trace::track_event::track_event::EventCategory;
+use perfetto_sdk::protos::trace::track_event::track_event::EventName;
+use perfetto_sdk::protos::trace::track_event::track_event::TrackEvent as TrackEventProto;
+use perfetto_sdk::protos::trace::track_event::track_event::TrackEventType;
 use perfetto_sdk_protos_gpu::protos::trace::gpu::gpu_track_event::{
-    GpuApi, GpuCorrelationFieldNumber, TrackEventExtFieldNumber,
+    GpuApi, GpuCorrelation, TrackEventExt as GpuTrackEventExt,
 };
 use std::cell::RefCell;
-use std::time::Duration;
-use std::{ffi::CStr, ffi::CString, panic, ptr};
+use std::{ffi::CStr, panic, ptr};
 
 /// Buffer size for activity records (8 MB).
 const BUF_SIZE: usize = 8 * 1024 * 1024;
@@ -42,6 +47,138 @@ thread_local! {
     /// are from the injection library itself (e.g. cuDeviceGetAttribute
     /// during kernel launch processing) and should not emit track events.
     static CALLBACK_DEPTH: RefCell<u32> = const { RefCell::new(0) };
+    /// Nesting depth for runtime API calls. When > 0, driver API callbacks
+    /// are nested inside a runtime API call and their track events should be
+    /// suppressed to avoid duplicate slices.
+    static RUNTIME_API_DEPTH: RefCell<u32> = const { RefCell::new(0) };
+    /// Deferred runtime API track event. Populated on RUNTIME_API ENTER,
+    /// emitted on RUNTIME_API EXIT with the driver API's correlation ID.
+    static DEFERRED_EVENT: RefCell<Option<DeferredTrackEvent>> = const { RefCell::new(None) };
+}
+
+struct DeferredTrackEvent {
+    ts: u64,
+    track_uuid: u64,
+    name: String,
+    correlation: Option<u64>,
+}
+
+const CUDA_CATEGORY_IID: u64 = 1;
+const TX_CATEGORY_IID: u64 = 2;
+
+fn is_gpu_work_cbid(cbid: CUpti_CallbackId) -> bool {
+    let name = profiler::get_callback_name(CUpti_CallbackDomain_CUPTI_CB_DOMAIN_DRIVER_API, cbid);
+    name.starts_with("cuLaunchKernel")
+        || name.starts_with("cuMemcpy")
+        || name.starts_with("cuMemset")
+}
+
+fn track_event_name_iid(name: &str) -> u64 {
+    let mut h: u64 = 5381;
+    for b in name.bytes() {
+        h = h.wrapping_mul(33).wrapping_add(b as u64);
+    }
+    h
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_track_event_with_interning(
+    ctx: &mut TraceContext<TrackEventIncrState>,
+    state: &mut TrackEventIncrState,
+    ts: u64,
+    track_uuid: u64,
+    category_iid: u64,
+    _category_name: &str,
+    event_type: TrackEventType,
+    name: Option<&str>,
+    gpu_correlation: Option<u64>,
+) {
+    let inst_id = ctx.instance_index();
+    let enabled = if category_iid == CUDA_CATEGORY_IID {
+        is_cuda_events_enabled_for(inst_id)
+    } else {
+        is_tx_events_enabled_for(inst_id)
+    };
+    if !enabled {
+        return;
+    }
+    let name_iid = name.map(track_event_name_iid);
+    let new_name = name_iid.is_some_and(|iid| !state.interned_names.contains(&iid));
+    let need_state_clear = std::mem::replace(&mut state.was_cleared, false);
+
+    if need_state_clear || new_name {
+        ctx.add_packet(|packet: &mut TracePacket| {
+            if need_state_clear {
+                packet.set_sequence_flags(
+                    TracePacketSequenceFlags::SeqIncrementalStateCleared as u32,
+                );
+            }
+            packet.set_interned_data(|interned_data: &mut InternedData| {
+                interned_data.set_event_categories(|ec: &mut EventCategory| {
+                    ec.set_iid(CUDA_CATEGORY_IID);
+                    ec.set_name("cuda");
+                });
+                interned_data.set_event_categories(|ec: &mut EventCategory| {
+                    ec.set_iid(TX_CATEGORY_IID);
+                    ec.set_name("tx");
+                });
+                if let (Some(n), Some(iid)) = (name, name_iid) {
+                    interned_data.set_event_names(|en: &mut EventName| {
+                        en.set_iid(iid);
+                        en.set_name(n);
+                    });
+                }
+            });
+        });
+        if let Some(iid) = name_iid {
+            state.interned_names.insert(iid);
+        }
+    }
+
+    ctx.add_packet(|packet: &mut TracePacket| {
+        packet.set_timestamp(ts);
+        packet.set_sequence_flags(TracePacketSequenceFlags::SeqNeedsIncrementalState as u32);
+        packet.set_track_event(|te: &mut TrackEventProto| {
+            te.set_type(event_type);
+            te.set_track_uuid(track_uuid);
+            te.set_category_iids(category_iid);
+            if let Some(iid) = name_iid {
+                te.set_name_iid(iid);
+            }
+            if category_iid == CUDA_CATEGORY_IID {
+                GpuTrackEventExt::set_gpu_api(te, GpuApi::GpuApiCuda);
+            }
+            if let Some(corr_id) = gpu_correlation {
+                GpuTrackEventExt::set_gpu_correlation(te, |gc: &mut GpuCorrelation| {
+                    gc.set_render_stage_submission_event_ids(corr_id);
+                });
+            }
+        });
+    });
+}
+
+fn ensure_track_descriptor(
+    ctx: &mut TraceContext<TrackEventIncrState>,
+    state: &mut TrackEventIncrState,
+    track_uuid: u64,
+) {
+    use perfetto_gpu_compute_injection::tracing::emit_track_descriptor;
+
+    if state.track_descriptor_emitted {
+        return;
+    }
+    state.track_descriptor_emitted = true;
+
+    let pid = std::process::id() as i32;
+    let tid = perfetto_gpu_compute_injection::tracing::current_tid() as i32;
+    let proc_uuid = process_track_uuid();
+
+    ctx.add_packet(|packet: &mut TracePacket| {
+        emit_track_descriptor(packet, proc_uuid, None, Some(pid), None);
+    });
+    ctx.add_packet(|packet: &mut TracePacket| {
+        emit_track_descriptor(packet, track_uuid, Some(proc_uuid), None, Some((pid, tid)));
+    });
 }
 
 /// Returns a snapshot of the current thread's NVTX range stack.
@@ -179,88 +316,158 @@ pub unsafe extern "C" fn profiler_callback_handler(
         if res != CUptiResult_CUPTI_SUCCESS {
             return;
         }
-        // Emit track events for all RUNTIME and DRIVER API calls,
-        // unless this is an internal call from the injection library.
+        // Emit track events for RUNTIME and DRIVER API calls.
+        // When a runtime API call (e.g. cudaLaunchKernel) internally calls
+        // a driver API (e.g. cuLaunchKernel), we emit only the outermost
+        // (runtime) event and transfer the driver API's correlation ID to it.
         let depth = CALLBACK_DEPTH.with(|d| *d.borrow());
         if depth == 0
+            && is_cuda_events_enabled()
             && (domain == CUpti_CallbackDomain_CUPTI_CB_DOMAIN_RUNTIME_API
                 || domain == CUpti_CallbackDomain_CUPTI_CB_DOMAIN_DRIVER_API)
         {
             let cb_data = &*(cbdata as *const CUpti_CallbackData);
-            let (callback_domain, category_index) =
-                if domain == CUpti_CallbackDomain_CUPTI_CB_DOMAIN_RUNTIME_API {
-                    (
-                        CUpti_CallbackDomain_CUPTI_CB_DOMAIN_RUNTIME_API,
-                        perfetto_te_ns::category_index("cudart"),
-                    )
-                } else {
-                    (
-                        CUpti_CallbackDomain_CUPTI_CB_DOMAIN_DRIVER_API,
-                        perfetto_te_ns::category_index("cuda"),
-                    )
-                };
-            if perfetto_te_ns::is_category_enabled(category_index) {
-                let full_name = profiler::get_callback_name(callback_domain, cbid);
+            let is_runtime = domain == CUpti_CallbackDomain_CUPTI_CB_DOMAIN_RUNTIME_API;
+            let is_driver = domain == CUpti_CallbackDomain_CUPTI_CB_DOMAIN_DRIVER_API;
+            let runtime_depth = RUNTIME_API_DEPTH.with(|d| *d.borrow());
+
+            if is_runtime {
+                let ts = trace_time_ns();
+                let track_uuid = thread_track_uuid();
+
+                let full_name = profiler::get_callback_name(
+                    CUpti_CallbackDomain_CUPTI_CB_DOMAIN_RUNTIME_API,
+                    cbid,
+                );
                 let base_name = match full_name.rfind("_v") {
                     Some(pos) if full_name[pos + 2..].chars().all(|c| c.is_ascii_digit()) => {
                         &full_name[..pos]
                     }
                     _ => full_name.as_str(),
                 };
-                let c_name =
-                    CString::new(base_name).unwrap_or_else(|_| CString::new("unknown").unwrap());
-                let name_ptr = c_name.as_ptr();
-                let is_kernel_launch =
-                    domain == CUpti_CallbackDomain_CUPTI_CB_DOMAIN_DRIVER_API
-                        && (cbid
-                            == CUpti_driver_api_trace_cbid_enum_CUPTI_DRIVER_TRACE_CBID_cuLaunchKernel
-                            || cbid
-                                == CUpti_driver_api_trace_cbid_enum_CUPTI_DRIVER_TRACE_CBID_cuLaunchKernelEx);
-                let correlation_fields = [TrackEventProtoField::VarInt(
-                    GpuCorrelationFieldNumber::RenderStageSubmissionEventIds as u32,
-                    cb_data.correlationId as u64,
-                )];
-                let gpu_correlation_and_api_fields = [
-                    TrackEventProtoField::Nested(
-                        TrackEventExtFieldNumber::GpuCorrelation as u32,
-                        &correlation_fields,
-                    ),
-                    TrackEventProtoField::VarInt(
-                        TrackEventExtFieldNumber::GpuApi as u32,
-                        GpuApi::GpuApiCuda as u64,
-                    ),
-                ];
-                let gpu_api_only_fields = [TrackEventProtoField::VarInt(
-                    TrackEventExtFieldNumber::GpuApi as u32,
-                    GpuApi::GpuApiCuda as u64,
-                )];
+
                 if cb_data.callbackSite == CUpti_ApiCallbackSite_CUPTI_API_ENTER {
-                    let mut ctx = EventContext::default();
-                    ctx.set_timestamp(TrackEventTimestamp::Boot(Duration::from_nanos(
-                        trace_time_ns(),
-                    )));
-                    ctx.set_proto_fields(&TrackEventProtoFields {
-                        fields: if is_kernel_launch {
-                            &gpu_correlation_and_api_fields
-                        } else {
-                            &gpu_api_only_fields
-                        },
+                    RUNTIME_API_DEPTH.with(|d| *d.borrow_mut() += 1);
+                    DEFERRED_EVENT.with(|d| {
+                        *d.borrow_mut() = Some(DeferredTrackEvent {
+                            ts,
+                            track_uuid,
+                            name: base_name.to_string(),
+                            correlation: None,
+                        });
                     });
-                    perfetto_te_ns::emit(
-                        category_index,
-                        TrackEventType::SliceBegin(name_ptr),
-                        &mut ctx,
-                    );
                 } else if cb_data.callbackSite == CUpti_ApiCallbackSite_CUPTI_API_EXIT {
-                    let mut ctx = EventContext::default();
-                    ctx.set_timestamp(TrackEventTimestamp::Boot(Duration::from_nanos(
-                        trace_time_ns(),
-                    )));
-                    perfetto_te_ns::emit(category_index, TrackEventType::SliceEnd, &mut ctx);
+                    let current_depth = RUNTIME_API_DEPTH.with(|d| *d.borrow());
+                    if current_depth > 0 {
+                        RUNTIME_API_DEPTH.with(|d| *d.borrow_mut() -= 1);
+                    }
+                    let deferred = DEFERRED_EVENT.with(|d| d.borrow_mut().take());
+                    if let Some(ev) = deferred {
+                        get_track_event_data_source().trace(|ctx| {
+                            ctx.with_incremental_state(|ctx, state| {
+                                ensure_track_descriptor(ctx, state, ev.track_uuid);
+                                emit_track_event_with_interning(
+                                    ctx,
+                                    state,
+                                    ev.ts,
+                                    ev.track_uuid,
+                                    CUDA_CATEGORY_IID,
+                                    "cuda",
+                                    TrackEventType::TypeSliceBegin,
+                                    Some(&ev.name),
+                                    ev.correlation,
+                                );
+                                emit_track_event_with_interning(
+                                    ctx,
+                                    state,
+                                    ts,
+                                    ev.track_uuid,
+                                    CUDA_CATEGORY_IID,
+                                    "cuda",
+                                    TrackEventType::TypeSliceEnd,
+                                    None,
+                                    None,
+                                );
+                            });
+                        });
+                    }
+                }
+            } else if is_driver && runtime_depth == 0 {
+                // Direct driver API call (not nested inside runtime API).
+                let produces_render_stage = is_gpu_work_cbid(cbid);
+                let ts = trace_time_ns();
+                let track_uuid = thread_track_uuid();
+
+                let full_name = profiler::get_callback_name(
+                    CUpti_CallbackDomain_CUPTI_CB_DOMAIN_DRIVER_API,
+                    cbid,
+                );
+                let base_name = match full_name.rfind("_v") {
+                    Some(pos) if full_name[pos + 2..].chars().all(|c| c.is_ascii_digit()) => {
+                        &full_name[..pos]
+                    }
+                    _ => full_name.as_str(),
+                };
+                let correlation = if produces_render_stage {
+                    Some(cb_data.correlationId as u64)
+                } else {
+                    None
+                };
+
+                if cb_data.callbackSite == CUpti_ApiCallbackSite_CUPTI_API_ENTER {
+                    get_track_event_data_source().trace(|ctx| {
+                        ctx.with_incremental_state(|ctx, state| {
+                            ensure_track_descriptor(ctx, state, track_uuid);
+                            emit_track_event_with_interning(
+                                ctx,
+                                state,
+                                ts,
+                                track_uuid,
+                                CUDA_CATEGORY_IID,
+                                "cuda",
+                                TrackEventType::TypeSliceBegin,
+                                Some(base_name),
+                                correlation,
+                            );
+                        });
+                    });
+                } else if cb_data.callbackSite == CUpti_ApiCallbackSite_CUPTI_API_EXIT {
+                    get_track_event_data_source().trace(|ctx| {
+                        ctx.with_incremental_state(|ctx, state| {
+                            ensure_track_descriptor(ctx, state, track_uuid);
+                            emit_track_event_with_interning(
+                                ctx,
+                                state,
+                                ts,
+                                track_uuid,
+                                CUDA_CATEGORY_IID,
+                                "cuda",
+                                TrackEventType::TypeSliceEnd,
+                                None,
+                                None,
+                            );
+                        });
+                    });
+                }
+            } else if is_driver && runtime_depth > 0 {
+                // Nested driver API call — capture correlation for the
+                // deferred runtime API event, but only for calls that
+                // produce GPU render stage events (kernel launches, memcpy,
+                // memset). Other driver API calls (e.g. cuCtxSynchronize)
+                // don't have matching render stage events.
+                let produces_render_stage = is_gpu_work_cbid(cbid);
+                if produces_render_stage
+                    && cb_data.callbackSite == CUpti_ApiCallbackSite_CUPTI_API_ENTER
+                {
+                    DEFERRED_EVENT.with(|d| {
+                        if let Some(ev) = d.borrow_mut().as_mut() {
+                            ev.correlation = Some(cb_data.correlationId as u64);
+                        }
+                    });
                 }
             }
         }
-        // Suppress track events for any CUPTI calls made by our handler.
+        // Suppress internal CUPTI calls from the injection library.
         CALLBACK_DEPTH.with(|d| *d.borrow_mut() += 1);
         let instrumented = is_instrumented_enabled();
         if domain == CUpti_CallbackDomain_CUPTI_CB_DOMAIN_DRIVER_API
@@ -641,19 +848,59 @@ pub unsafe extern "C" fn profiler_callback_handler(
                 let _ = profiler::activity_flush_all(0);
             }
         } else if domain == CUpti_CallbackDomain_CUPTI_CB_DOMAIN_NVTX {
-            // Track NVTX range push/pop for activity_tx_include/exclude_globs filtering.
+            // Track NVTX range push/pop for activity_tx_include/exclude_globs filtering
+            // and emit track events when the tx category is enabled.
             if cbid == CUpti_nvtx_api_trace_cbid_CUPTI_CBID_NVTX_nvtxRangePushA {
                 let nvtx_data = &*(cbdata as *const CUpti_NvtxData);
-                // For nvtxRangePushA, functionParams points to const char**
                 let msg_ptr = *(nvtx_data.functionParams as *const *const std::os::raw::c_char);
                 if !msg_ptr.is_null() {
                     let name = CStr::from_ptr(msg_ptr).to_string_lossy().to_string();
+                    if is_tx_events_enabled() {
+                        let ts = trace_time_ns();
+                        let track_uuid = thread_track_uuid();
+                        get_track_event_data_source().trace(|ctx| {
+                            ctx.with_incremental_state(|ctx, state| {
+                                ensure_track_descriptor(ctx, state, track_uuid);
+                                emit_track_event_with_interning(
+                                    ctx,
+                                    state,
+                                    ts,
+                                    track_uuid,
+                                    TX_CATEGORY_IID,
+                                    "tx",
+                                    TrackEventType::TypeSliceBegin,
+                                    Some(&name),
+                                    None,
+                                );
+                            });
+                        });
+                    }
                     NVTX_RANGE_STACK.with(|stack| stack.borrow_mut().push(name));
                 }
             } else if cbid == CUpti_nvtx_api_trace_cbid_CUPTI_CBID_NVTX_nvtxRangePop {
                 NVTX_RANGE_STACK.with(|stack| {
                     stack.borrow_mut().pop();
                 });
+                if is_tx_events_enabled() {
+                    let ts = trace_time_ns();
+                    let track_uuid = thread_track_uuid();
+                    get_track_event_data_source().trace(|ctx| {
+                        ctx.with_incremental_state(|ctx, state| {
+                            ensure_track_descriptor(ctx, state, track_uuid);
+                            emit_track_event_with_interning(
+                                ctx,
+                                state,
+                                ts,
+                                track_uuid,
+                                TX_CATEGORY_IID,
+                                "tx",
+                                TrackEventType::TypeSliceEnd,
+                                None,
+                                None,
+                            );
+                        });
+                    });
+                }
             }
         }
         CALLBACK_DEPTH.with(|d| *d.borrow_mut() -= 1);

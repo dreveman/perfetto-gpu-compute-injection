@@ -23,8 +23,8 @@ use metrics::parse_metrics;
 use perfetto_gpu_compute_injection::config::Config;
 use perfetto_gpu_compute_injection::injection_log;
 use perfetto_gpu_compute_injection::tracing::{
-    get_counter_config, get_counters_data_source, get_renderstages_data_source, register_backend,
-    trace_time_ns, GpuBackend,
+    get_counter_config, get_counters_data_source, get_renderstages_data_source,
+    get_track_event_data_source, register_backend, trace_time_ns, GpuBackend,
 };
 use perfetto_sdk::{
     data_source::{StopGuard, TraceContext},
@@ -34,11 +34,12 @@ use perfetto_sdk::{
         trace::{
             interned_data::interned_data::InternedData,
             trace_packet::{TracePacket, TracePacketSequenceFlags},
+            track_event::track_event::EventName,
         },
     },
     track_event::TrackEvent,
-    track_event_categories,
 };
+use perfetto_sdk_protos_gpu::protos::trace::gpu::gpu_interned_data::InternedDataExt as _;
 use perfetto_sdk_protos_gpu::protos::{
     common::gpu_counter_descriptor::{
         GpuCounterDescriptor, GpuCounterDescriptorGpuCounterGroup,
@@ -50,8 +51,9 @@ use perfetto_sdk_protos_gpu::protos::{
                 GpuCounterEvent, GpuCounterEventGpuCounter, InternedGpuCounterDescriptor,
             },
             gpu_render_stage_event::{
-                GpuRenderStageEvent, GpuRenderStageEventExtraData,
-                InternedGpuRenderStageSpecification,
+                GpuRenderStageEvent, GpuRenderStageEventComputeKernelLaunch,
+                GpuRenderStageEventDim3, GpuRenderStageEventExtraComputeArg,
+                InternedComputeArgName, InternedComputeKernel, InternedGpuRenderStageSpecification,
                 InternedGpuRenderStageSpecificationRenderStageCategory, InternedGraphicsContext,
                 InternedGraphicsContextApi,
             },
@@ -72,18 +74,6 @@ use std::{
 
 use cupti_profiler as profiler;
 use cupti_profiler::bindings::*;
-
-// ---------------------------------------------------------------------------
-// Track event categories for CUDA API call tracing
-// ---------------------------------------------------------------------------
-
-track_event_categories! {
-    pub mod cuda_te_ns {
-        ( "cudart", "CUDA Runtime API calls", [ "api" ] ),
-        ( "cuda", "CUDA Driver API calls", [ "api" ] ),
-    }
-}
-use cuda_te_ns as perfetto_te_ns;
 
 // ---------------------------------------------------------------------------
 // CuptiBackend implementation
@@ -399,7 +389,7 @@ impl GpuBackend for CuptiBackend {
                 start: u64,
                 end: u64,
                 name: String,
-                extra_data: Vec<(String, String)>,
+                name_iid: u64,
                 channel_id: u32,
                 channel_type: u32,
                 activity_device_id: u32,
@@ -407,6 +397,18 @@ impl GpuBackend for CuptiBackend {
                 activity_stream_id: u32,
                 stage_iid: u64,
                 correlation_id: u32,
+                // Structured compute kernel fields (kernel events only).
+                kernel_iid: Option<u64>,
+                kernel_mangled_name: Option<String>,
+                kernel_demangled_name: Option<String>,
+                kernel_arch: Option<String>,
+                kernel_registers_per_thread: Option<u64>,
+                kernel_shared_mem_static: Option<u64>,
+                kernel_func_cache_config: Option<String>,
+                kernel_shared_mem_config_size: Option<u64>,
+                launch_grid: Option<(u32, u32, u32)>,
+                launch_block: Option<(u32, u32, u32)>,
+                launch_args: Vec<(u64, KernelArgValue)>,
             }
 
             impl state::GpuActivity for PendingEvent {
@@ -436,13 +438,6 @@ impl GpuBackend for CuptiBackend {
                 }
                 fn correlation_id(&self) -> u32 {
                     self.correlation_id
-                }
-                fn emit_extra_data(
-                    &self,
-                    _process_id: i32,
-                    _process_name: &str,
-                    _emit: &mut dyn FnMut(&str, &str),
-                ) {
                 }
             }
 
@@ -585,100 +580,75 @@ impl GpuBackend for CuptiBackend {
                             16
                         };
 
-                        let mut extra_data_vec: Vec<(String, String)> = Vec::new();
-                        let emit = &mut |name: &str, value: &str| {
-                            extra_data_vec.push((name.to_string(), value.to_string()));
-                        };
-                        emit("kernel_name", &activity.kernel_name);
-                        emit("kernel_demangled_name", &demangled);
-                        emit("process_id", &process_id.to_string());
-                        emit("process_name", &process_name);
-                        emit("device_id", &activity.device_id.to_string());
-                        emit("context_id", &activity.context_id.to_string());
-                        emit("stream_id", &activity.stream_id.to_string());
-                        emit("channel_id", &activity.channel_id.to_string());
-                        emit("channel_type", &activity.channel_type.to_string());
-                        emit("api", "CUDA");
-                        emit("arch", &format!("CC_{}{}", major, minor));
+                        // Build structured compute kernel fields.
+                        let arch = format!("CC_{}{}", major, minor);
                         #[allow(nonstandard_style)]
-                        match cache_mode as u32 {
-                            CUfunc_cache_enum_CU_FUNC_CACHE_PREFER_NONE => {
-                                emit("launch__func_cache_config", "CachePreferNone")
-                            }
-                            CUfunc_cache_enum_CU_FUNC_CACHE_PREFER_SHARED => {
-                                emit("launch__func_cache_config", "CachePreferShared")
-                            }
-                            CUfunc_cache_enum_CU_FUNC_CACHE_PREFER_L1 => {
-                                emit("launch__func_cache_config", "CachePreferL1")
-                            }
-                            CUfunc_cache_enum_CU_FUNC_CACHE_PREFER_EQUAL => {
-                                emit("launch__func_cache_config", "CachePreferEqual")
-                            }
-                            _ => emit("launch__func_cache_config", "n/a"),
-                        }
-                        emit(
-                            "launch__waves_per_multiprocessor",
-                            &waves_per_multiprocessor.to_string(),
-                        );
-                        emit("launch__grid_size", &grid_size.to_string());
-                        emit("launch__grid_size_x", &activity.grid_size.0.to_string());
-                        emit("launch__grid_size_y", &activity.grid_size.1.to_string());
-                        emit("launch__grid_size_z", &activity.grid_size.2.to_string());
-                        emit("launch__block_size", &block_size.to_string());
-                        emit("launch__block_size_x", &activity.block_size.0.to_string());
-                        emit("launch__block_size_y", &activity.block_size.1.to_string());
-                        emit("launch__block_size_z", &activity.block_size.2.to_string());
-                        emit("launch__thread_count", &thread_count.to_string());
-                        emit(
-                            "launch__registers_per_thread",
-                            &activity.registers_per_thread.to_string(),
-                        );
-                        emit("launch__shared_mem_config_size", "49152");
-                        emit(
-                            "launch__shared_mem_per_block_driver",
-                            &smem_per_block.to_string(),
-                        );
-                        emit(
-                            "launch__shared_mem_per_block_dynamic",
-                            &activity.dynamic_shared_memory.to_string(),
-                        );
-                        emit(
-                            "launch__shared_mem_per_block_static",
-                            &activity.static_shared_memory.to_string(),
-                        );
-                        emit(
-                            "launch__occupancy_limit_shared_mem",
-                            &occupancy_limit_shared_mem.to_string(),
-                        );
-                        emit(
-                            "launch__occupancy_limit_warps",
-                            &occupancy_limit_warps.to_string(),
-                        );
-                        emit("launch__occupancy_limit_blocks", &max_blocks_sm.to_string());
-                        emit(
-                            "launch__occupancy_limit_registers",
-                            &occupancy_limit_registers.to_string(),
-                        );
-                        emit(
-                            "sm__maximum_warps_avg_per_active_cycle",
-                            &max_active_warps.to_string(),
-                        );
-                        emit(
-                            "sm__maximum_warps_per_active_cycle_pct",
-                            &max_active_warps_pct.to_string(),
-                        );
+                        let func_cache_config_str = match cache_mode as u32 {
+                            CUfunc_cache_enum_CU_FUNC_CACHE_PREFER_NONE => "CachePreferNone",
+                            CUfunc_cache_enum_CU_FUNC_CACHE_PREFER_SHARED => "CachePreferShared",
+                            CUfunc_cache_enum_CU_FUNC_CACHE_PREFER_L1 => "CachePreferL1",
+                            CUfunc_cache_enum_CU_FUNC_CACHE_PREFER_EQUAL => "CachePreferEqual",
+                            _ => "n/a",
+                        };
 
+                        let launch_args: Vec<(u64, KernelArgValue)> = vec![
+                            (
+                                arg_iid("workgroup_size"),
+                                KernelArgValue::Uint(block_size as u64),
+                            ),
+                            (arg_iid("grid_size"), KernelArgValue::Uint(grid_size as u64)),
+                            (
+                                arg_iid("thread_count"),
+                                KernelArgValue::Uint(thread_count as u64),
+                            ),
+                            (
+                                arg_iid("shared_mem_dynamic"),
+                                KernelArgValue::Uint(activity.dynamic_shared_memory as u64),
+                            ),
+                            (
+                                arg_iid("waves_per_multiprocessor"),
+                                KernelArgValue::Double(waves_per_multiprocessor),
+                            ),
+                            (
+                                arg_iid("occupancy_limit_blocks"),
+                                KernelArgValue::Uint(max_blocks_sm as u64),
+                            ),
+                            (
+                                arg_iid("occupancy_limit_registers"),
+                                KernelArgValue::Uint(occupancy_limit_registers as u64),
+                            ),
+                            (
+                                arg_iid("occupancy_limit_shared_mem"),
+                                KernelArgValue::Uint(occupancy_limit_shared_mem as u64),
+                            ),
+                            (
+                                arg_iid("occupancy_limit_warps"),
+                                KernelArgValue::Uint(occupancy_limit_warps as u64),
+                            ),
+                            (
+                                arg_iid("sm__maximum_warps_per_active_cycle_pct"),
+                                KernelArgValue::Double(max_active_warps_pct),
+                            ),
+                            (
+                                arg_iid("sm__maximum_warps_avg_per_active_cycle"),
+                                KernelArgValue::Uint(max_active_warps as u64),
+                            ),
+                            (
+                                arg_iid("shared_mem_driver"),
+                                KernelArgValue::Uint(smem_per_block as u64),
+                            ),
+                        ];
+
+                        let simplified_name =
+                            perfetto_gpu_compute_injection::kernel::simplify_name(&demangled);
                         channel_events
                             .entry((activity.channel_id, activity.channel_type))
                             .or_default()
                             .push(PendingEvent {
                                 start: raw_start,
                                 end: raw_end,
-                                name: perfetto_gpu_compute_injection::kernel::simplify_name(
-                                    &demangled,
-                                )
-                                .to_string(),
-                                extra_data: extra_data_vec,
+                                name: simplified_name.to_string(),
+                                name_iid: kernel_name_iid(simplified_name),
                                 channel_id: activity.channel_id,
                                 channel_type: activity.channel_type,
                                 activity_device_id: activity.device_id,
@@ -686,6 +656,29 @@ impl GpuBackend for CuptiBackend {
                                 activity_stream_id: activity.stream_id,
                                 stage_iid: state::KERNEL_STAGE_IID,
                                 correlation_id: activity.correlation_id,
+                                kernel_iid: Some(kernel_name_iid(&activity.kernel_name)),
+                                kernel_mangled_name: Some(activity.kernel_name.clone()),
+                                kernel_demangled_name: Some(demangled.clone()),
+                                kernel_arch: Some(arch),
+                                kernel_registers_per_thread: Some(
+                                    activity.registers_per_thread as u64,
+                                ),
+                                kernel_shared_mem_static: Some(
+                                    activity.static_shared_memory as u64,
+                                ),
+                                kernel_func_cache_config: Some(func_cache_config_str.to_string()),
+                                kernel_shared_mem_config_size: Some(49152),
+                                launch_grid: Some((
+                                    activity.grid_size.0 as u32,
+                                    activity.grid_size.1 as u32,
+                                    activity.grid_size.2 as u32,
+                                )),
+                                launch_block: Some((
+                                    activity.block_size.0 as u32,
+                                    activity.block_size.1 as u32,
+                                    activity.block_size.2 as u32,
+                                )),
+                                launch_args,
                             });
                     }
                     let mc_start = start_offsets
@@ -704,18 +697,15 @@ impl GpuBackend for CuptiBackend {
                             );
                             continue;
                         }
-                        let mut extra_data_vec: Vec<(String, String)> = Vec::new();
-                        activity.emit_extra_data(process_id, &process_name, &mut |name, value| {
-                            extra_data_vec.push((name.to_string(), value.to_string()));
-                        });
+                        let memcpy_name = format!("Memcpy {}", activity.direction_string());
                         channel_events
                             .entry((activity.channel_id, activity.channel_type))
                             .or_default()
                             .push(PendingEvent {
                                 start: activity.start,
                                 end: activity.end,
-                                name: format!("Memcpy {}", activity.direction_string()),
-                                extra_data: extra_data_vec,
+                                name: memcpy_name.clone(),
+                                name_iid: kernel_name_iid(&memcpy_name),
                                 channel_id: activity.channel_id,
                                 channel_type: activity.channel_type,
                                 activity_device_id: activity.device_id,
@@ -723,6 +713,17 @@ impl GpuBackend for CuptiBackend {
                                 activity_stream_id: activity.stream_id,
                                 stage_iid: state::MEMCPY_STAGE_IID,
                                 correlation_id: activity.correlation_id,
+                                kernel_iid: None,
+                                kernel_mangled_name: None,
+                                kernel_demangled_name: None,
+                                kernel_arch: None,
+                                kernel_registers_per_thread: None,
+                                kernel_shared_mem_static: None,
+                                kernel_func_cache_config: None,
+                                kernel_shared_mem_config_size: None,
+                                launch_grid: None,
+                                launch_block: None,
+                                launch_args: Vec::new(),
                             });
                     }
                     let ms_start = start_offsets
@@ -741,10 +742,6 @@ impl GpuBackend for CuptiBackend {
                             );
                             continue;
                         }
-                        let mut extra_data_vec: Vec<(String, String)> = Vec::new();
-                        activity.emit_extra_data(process_id, &process_name, &mut |name, value| {
-                            extra_data_vec.push((name.to_string(), value.to_string()));
-                        });
                         channel_events
                             .entry((activity.channel_id, activity.channel_type))
                             .or_default()
@@ -752,7 +749,7 @@ impl GpuBackend for CuptiBackend {
                                 start: activity.start,
                                 end: activity.end,
                                 name: "Memset".to_string(),
-                                extra_data: extra_data_vec,
+                                name_iid: kernel_name_iid("Memset"),
                                 channel_id: activity.channel_id,
                                 channel_type: activity.channel_type,
                                 activity_device_id: activity.device_id,
@@ -760,6 +757,17 @@ impl GpuBackend for CuptiBackend {
                                 activity_stream_id: activity.stream_id,
                                 stage_iid: state::MEMSET_STAGE_IID,
                                 correlation_id: activity.correlation_id,
+                                kernel_iid: None,
+                                kernel_mangled_name: None,
+                                kernel_demangled_name: None,
+                                kernel_arch: None,
+                                kernel_registers_per_thread: None,
+                                kernel_shared_mem_static: None,
+                                kernel_func_cache_config: None,
+                                kernel_shared_mem_config_size: None,
+                                launch_grid: None,
+                                launch_block: None,
+                                launch_args: Vec::new(),
                             });
                     }
                 }
@@ -829,6 +837,50 @@ impl GpuBackend for CuptiBackend {
 
             // Phase 2: Emit collected events without holding GLOBAL_STATE.
             // This prevents deadlock with buffer_completed callback.
+
+            // Collect unique event names and kernels for interning.
+            let mut unique_event_names: Vec<(u64, String)> = Vec::new();
+            {
+                let mut seen_name_iids: HashSet<u64> = HashSet::new();
+                for event in &all_events {
+                    if seen_name_iids.insert(event.name_iid) {
+                        unique_event_names.push((event.name_iid, event.name.clone()));
+                    }
+                }
+            }
+            let mut unique_kernels: Vec<UniqueKernel> = Vec::new();
+            {
+                let mut seen_kernel_iids: HashSet<u64> = HashSet::new();
+                for event in &all_events {
+                    if let Some(kiid) = event.kernel_iid {
+                        if seen_kernel_iids.insert(kiid) {
+                            unique_kernels.push(UniqueKernel {
+                                iid: kiid,
+                                mangled_name: event.kernel_mangled_name.clone().unwrap_or_default(),
+                                demangled_name: event
+                                    .kernel_demangled_name
+                                    .clone()
+                                    .unwrap_or_default(),
+                                arch: event.kernel_arch.clone().unwrap_or_default(),
+                                registers_per_thread: event
+                                    .kernel_registers_per_thread
+                                    .unwrap_or(0),
+                                shared_mem_static: event.kernel_shared_mem_static.unwrap_or(0),
+                                func_cache_config: event
+                                    .kernel_func_cache_config
+                                    .clone()
+                                    .unwrap_or_default(),
+                                shared_mem_config_size: event
+                                    .kernel_shared_mem_config_size
+                                    .unwrap_or(0),
+                                process_name: process_name.clone(),
+                                process_id: process_id as u64,
+                            });
+                        }
+                    }
+                }
+            }
+
             let mut stop_guard_opt = stop_guard;
             get_renderstages_data_source().trace(|ctx: &mut TraceContext| {
                 if ctx.instance_index() != inst_id {
@@ -843,6 +895,8 @@ impl GpuBackend for CuptiBackend {
                             channels: &channels,
                             contexts: &contexts,
                             process_id,
+                            unique_kernels: &unique_kernels,
+                            unique_event_names: &unique_event_names,
                         };
                         emit_render_stage_event(
                             ctx,
@@ -851,8 +905,11 @@ impl GpuBackend for CuptiBackend {
                             duration_ns,
                             was_cleared,
                             &rs_ctx,
-                            &event.name,
-                            &event.extra_data,
+                            event.name_iid,
+                            event.kernel_iid,
+                            event.launch_grid,
+                            event.launch_block,
+                            &event.launch_args,
                         );
                     });
                 }
@@ -904,14 +961,98 @@ impl GpuBackend for CuptiBackend {
 }
 
 // ---------------------------------------------------------------------------
+// Compute kernel structured proto constants and helpers
+// ---------------------------------------------------------------------------
+
+const COMPUTE_ARG_NAMES: &[(u64, &str)] = &[
+    (1, "workgroup_size"),
+    (2, "grid_size"),
+    (3, "thread_count"),
+    (4, "shared_mem_dynamic"),
+    (5, "waves_per_multiprocessor"),
+    (6, "occupancy_limit_blocks"),
+    (7, "occupancy_limit_registers"),
+    (8, "occupancy_limit_shared_mem"),
+    (9, "occupancy_limit_warps"),
+    (10, "sm__maximum_warps_per_active_cycle_pct"),
+    (11, "sm__maximum_warps_avg_per_active_cycle"),
+    (12, "process_name"),
+    (13, "process_id"),
+    (14, "registers_per_thread"),
+    (15, "shared_mem_static"),
+    (16, "func_cache_config"),
+    (19, "shared_mem_config_size"),
+    (20, "shared_mem_driver"),
+];
+
+fn arg_iid(name: &str) -> u64 {
+    COMPUTE_ARG_NAMES
+        .iter()
+        .find(|(_, n)| *n == name)
+        .unwrap_or_else(|| panic!("unknown compute arg name: {name}"))
+        .0
+}
+
+/// Simple hash of kernel name to produce a stable IID for InternedComputeKernel.
+fn kernel_name_iid(name: &str) -> u64 {
+    let mut h: u64 = 5381;
+    for b in name.bytes() {
+        h = h.wrapping_mul(33).wrapping_add(b as u64);
+    }
+    // Avoid 0 (reserved) by ensuring non-zero
+    if h == 0 {
+        1
+    } else {
+        h
+    }
+}
+
+enum KernelArgValue {
+    Uint(u64),
+    Double(f64),
+    #[allow(dead_code)]
+    Str(String),
+}
+
+fn set_kernel_arg_uint(kernel: &mut InternedComputeKernel, name: &str, value: u64) {
+    kernel.set_args(|arg: &mut GpuRenderStageEventExtraComputeArg| {
+        arg.set_name_iid(arg_iid(name));
+        arg.set_uint_value(value);
+    });
+}
+
+fn set_kernel_arg_string(kernel: &mut InternedComputeKernel, name: &str, value: &str) {
+    kernel.set_args(|arg: &mut GpuRenderStageEventExtraComputeArg| {
+        arg.set_name_iid(arg_iid(name));
+        arg.set_string_value(value);
+    });
+}
+
+// ---------------------------------------------------------------------------
 // Render stage helpers
 // ---------------------------------------------------------------------------
+
+/// Information about a unique kernel for interning.
+struct UniqueKernel {
+    iid: u64,
+    mangled_name: String,
+    demangled_name: String,
+    arch: String,
+    registers_per_thread: u64,
+    shared_mem_static: u64,
+    func_cache_config: String,
+    shared_mem_config_size: u64,
+    process_name: String,
+    process_id: u64,
+}
 
 fn emit_interned_specifications(
     packet: &mut TracePacket,
     channels: &std::collections::HashSet<(u32, u32)>,
     contexts: &std::collections::HashSet<u32>,
     process_id: i32,
+    unique_kernels: &[UniqueKernel],
+    unique_event_names: &[(u64, String)],
 ) {
     packet.set_sequence_flags(TracePacketSequenceFlags::SeqIncrementalStateCleared as u32);
     packet.set_interned_data(|interned: &mut InternedData| {
@@ -937,21 +1078,44 @@ fn emit_interned_specifications(
         interned.set_gpu_specifications(|spec: &mut InternedGpuRenderStageSpecification| {
             spec.set_iid(KERNEL_STAGE_IID);
             spec.set_name("Kernel");
-            spec.set_description("CUDA Kernel");
             spec.set_category(InternedGpuRenderStageSpecificationRenderStageCategory::Compute);
         });
         interned.set_gpu_specifications(|spec: &mut InternedGpuRenderStageSpecification| {
             spec.set_iid(MEMCPY_STAGE_IID);
             spec.set_name("MemoryTransfer");
-            spec.set_description("CUDA Memory Transfer");
             spec.set_category(InternedGpuRenderStageSpecificationRenderStageCategory::Other);
         });
         interned.set_gpu_specifications(|spec: &mut InternedGpuRenderStageSpecification| {
             spec.set_iid(MEMSET_STAGE_IID);
             spec.set_name("MemorySet");
-            spec.set_description("CUDA Memory Set");
             spec.set_category(InternedGpuRenderStageSpecificationRenderStageCategory::Other);
         });
+        for &(iid, name) in COMPUTE_ARG_NAMES {
+            interned.set_compute_arg_names(|an: &mut InternedComputeArgName| {
+                an.set_iid(iid);
+                an.set_name(name);
+            });
+        }
+        for (iid, name) in unique_event_names {
+            interned.set_event_names(|en: &mut EventName| {
+                en.set_iid(*iid);
+                en.set_name(name);
+            });
+        }
+        for kernel in unique_kernels {
+            interned.set_compute_kernels(|ck: &mut InternedComputeKernel| {
+                ck.set_iid(kernel.iid);
+                ck.set_name(&kernel.mangled_name);
+                ck.set_demangled_name(&kernel.demangled_name);
+                ck.set_arch(&kernel.arch);
+                set_kernel_arg_uint(ck, "registers_per_thread", kernel.registers_per_thread);
+                set_kernel_arg_uint(ck, "shared_mem_static", kernel.shared_mem_static);
+                set_kernel_arg_string(ck, "func_cache_config", &kernel.func_cache_config);
+                set_kernel_arg_uint(ck, "shared_mem_config_size", kernel.shared_mem_config_size);
+                set_kernel_arg_string(ck, "process_name", &kernel.process_name);
+                set_kernel_arg_uint(ck, "process_id", kernel.process_id);
+            });
+        }
     });
 }
 
@@ -1033,6 +1197,8 @@ struct RenderStageContext<'a> {
     channels: &'a std::collections::HashSet<(u32, u32)>,
     contexts: &'a std::collections::HashSet<u32>,
     process_id: i32,
+    unique_kernels: &'a [UniqueKernel],
+    unique_event_names: &'a [(u64, String)],
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1043,8 +1209,11 @@ fn emit_render_stage_event<T: GpuActivity>(
     duration_ns: u64,
     emit_interned: bool,
     rs_ctx: &RenderStageContext,
-    name: &str,
-    extra_data: &[(String, String)],
+    name_iid: u64,
+    kernel_iid: Option<u64>,
+    launch_grid: Option<(u32, u32, u32)>,
+    launch_block: Option<(u32, u32, u32)>,
+    launch_args: &[(u64, KernelArgValue)],
 ) {
     let hw_queue_iid = activity.channel_id() as u64 + HW_QUEUE_IID_OFFSET;
     let context_iid = activity.context_id() as u64;
@@ -1063,11 +1232,41 @@ fn emit_render_stage_event<T: GpuActivity>(
                     .set_hw_queue_iid(hw_queue_iid)
                     .set_stage_iid(stage_iid)
                     .set_context(context_iid)
-                    .set_name(name);
-                for (name, value) in extra_data {
-                    event.set_extra_data(|extra_data: &mut GpuRenderStageEventExtraData| {
-                        extra_data.set_name(name);
-                        extra_data.set_value(value);
+                    .set_name_iid(name_iid);
+                if let Some(kiid) = kernel_iid {
+                    // Structured compute kernel event.
+                    event.set_kernel_iid(kiid);
+                    event.set_launch(|launch: &mut GpuRenderStageEventComputeKernelLaunch| {
+                        if let Some((gx, gy, gz)) = launch_grid {
+                            launch.set_grid_size(|d: &mut GpuRenderStageEventDim3| {
+                                d.set_x(gx);
+                                d.set_y(gy);
+                                d.set_z(gz);
+                            });
+                        }
+                        if let Some((bx, by, bz)) = launch_block {
+                            launch.set_workgroup_size(|d: &mut GpuRenderStageEventDim3| {
+                                d.set_x(bx);
+                                d.set_y(by);
+                                d.set_z(bz);
+                            });
+                        }
+                        for (name_iid, value) in launch_args {
+                            launch.set_args(|arg: &mut GpuRenderStageEventExtraComputeArg| {
+                                arg.set_name_iid(*name_iid);
+                                match value {
+                                    KernelArgValue::Uint(v) => {
+                                        arg.set_uint_value(*v);
+                                    }
+                                    KernelArgValue::Double(v) => {
+                                        arg.set_double_value(*v);
+                                    }
+                                    KernelArgValue::Str(v) => {
+                                        arg.set_string_value(v);
+                                    }
+                                }
+                            });
+                        }
                     });
                 }
             });
@@ -1077,6 +1276,8 @@ fn emit_render_stage_event<T: GpuActivity>(
                 rs_ctx.channels,
                 rs_ctx.contexts,
                 rs_ctx.process_id,
+                rs_ctx.unique_kernels,
+                rs_ctx.unique_event_names,
             );
         }
     });
@@ -1196,12 +1397,10 @@ pub extern "C" fn InitializeInjection() -> i32 {
 
         let producer_args = ProducerInitArgsBuilder::new().backends(Backends::SYSTEM);
         Producer::init(producer_args.build());
+        TrackEvent::init();
         let _ = get_counters_data_source();
         let _ = get_renderstages_data_source();
-
-        // Initialize track event categories for API call tracing
-        TrackEvent::init();
-        let _ = perfetto_te_ns::register();
+        let _ = get_track_event_data_source();
 
         if let Ok(mut state) = GLOBAL_STATE.lock() {
             if !state.injection_initialized {

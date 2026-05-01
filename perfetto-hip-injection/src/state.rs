@@ -74,6 +74,7 @@ pub struct KernelDispatch {
     pub correlation_id: u64,
 }
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct MemcopyActivity {
     pub bytes: u64,
     pub start_ns: u64,

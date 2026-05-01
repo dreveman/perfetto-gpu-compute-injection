@@ -39,13 +39,6 @@ pub trait GpuActivity {
     fn stage_iid(&self) -> u64;
     /// CUPTI correlation ID linking this GPU activity to its API call.
     fn correlation_id(&self) -> u32;
-    /// Emit extra_data fields specific to this activity type.
-    fn emit_extra_data(
-        &self,
-        process_id: i32,
-        process_name: &str,
-        emit: &mut dyn FnMut(&str, &str),
-    );
 
     /// Returns the nvidia-smi device index as gpu_id.
     /// Falls back to the CUDA ordinal if NVML is unavailable.
@@ -105,7 +98,10 @@ pub struct KernelActivity {
 pub const KERNEL_STAGE_IID: u64 = 1;
 pub const MEMCPY_STAGE_IID: u64 = 2;
 pub const MEMSET_STAGE_IID: u64 = 3;
-pub const HW_QUEUE_IID_OFFSET: u64 = 1000;
+/// Offset for hw_queue IIDs to avoid collisions with stage IIDs
+/// (KERNEL_STAGE_IID, MEMCPY_STAGE_IID, MEMSET_STAGE_IID) since both
+/// share the same InternedGpuRenderStageSpecification namespace.
+pub const HW_QUEUE_IID_OFFSET: u64 = 8;
 
 impl GpuActivity for KernelActivity {
     fn start(&self) -> u64 {
@@ -134,21 +130,6 @@ impl GpuActivity for KernelActivity {
     }
     fn correlation_id(&self) -> u32 {
         self.correlation_id
-    }
-    fn emit_extra_data(
-        &self,
-        process_id: i32,
-        process_name: &str,
-        emit: &mut dyn FnMut(&str, &str),
-    ) {
-        emit("kernel_name", &self.kernel_name);
-        emit("process_id", &process_id.to_string());
-        emit("process_name", process_name);
-        emit("device_id", &self.device_id.to_string());
-        emit("context_id", &self.context_id.to_string());
-        emit("stream_id", &self.stream_id.to_string());
-        emit("channel_id", &self.channel_id.to_string());
-        emit("channel_type", &self.channel_type.to_string());
     }
 }
 
@@ -223,22 +204,6 @@ impl GpuActivity for MemcpyActivity {
     fn correlation_id(&self) -> u32 {
         self.correlation_id
     }
-    fn emit_extra_data(
-        &self,
-        process_id: i32,
-        process_name: &str,
-        emit: &mut dyn FnMut(&str, &str),
-    ) {
-        emit("direction", self.direction_string());
-        emit("size_bytes", &self.bytes.to_string());
-        emit("process_id", &process_id.to_string());
-        emit("process_name", process_name);
-        emit("device_id", &self.device_id.to_string());
-        emit("context_id", &self.context_id.to_string());
-        emit("stream_id", &self.stream_id.to_string());
-        emit("channel_id", &self.channel_id.to_string());
-        emit("channel_type", &self.channel_type.to_string());
-    }
 }
 
 /// Detailed activity information for a memory set operation.
@@ -311,23 +276,6 @@ impl GpuActivity for MemsetActivity {
     }
     fn correlation_id(&self) -> u32 {
         self.correlation_id
-    }
-    fn emit_extra_data(
-        &self,
-        process_id: i32,
-        process_name: &str,
-        emit: &mut dyn FnMut(&str, &str),
-    ) {
-        emit("value", &format!("0x{:08X}", self.value));
-        emit("size_bytes", &self.bytes.to_string());
-        emit("memory_kind", self.memory_kind_string());
-        emit("process_id", &process_id.to_string());
-        emit("process_name", process_name);
-        emit("device_id", &self.device_id.to_string());
-        emit("context_id", &self.context_id.to_string());
-        emit("stream_id", &self.stream_id.to_string());
-        emit("channel_id", &self.channel_id.to_string());
-        emit("channel_type", &self.channel_type.to_string());
     }
 }
 

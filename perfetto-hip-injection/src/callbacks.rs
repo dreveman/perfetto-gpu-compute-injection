@@ -20,15 +20,23 @@ use crate::state::{
 };
 use perfetto_gpu_compute_injection::injection_log;
 use perfetto_gpu_compute_injection::tracing::{
-    get_counter_config, get_track_event_data_source, is_cuda_events_enabled,
-    is_cuda_events_enabled_for, is_tx_events_enabled_for, process_track_uuid, TrackEventIncrState,
+    get_counter_config, get_track_event_data_source, is_hip_events_enabled,
+    is_hip_runtime_debug_enabled_for, is_hip_runtime_enabled_for, is_tx_events_enabled_for,
+    process_track_uuid, TrackEventIncrState,
 };
+// TODO(perfetto-sdk-1.0): drop the trace_packet_defaults shim imports below
+// and switch to perfetto_sdk::protos::trace::trace_packet::TracePacketDefaults
+// once perfetto-sdk lands the field upstream. See
+// `perfetto_gpu_compute_injection::trace_packet_defaults` for context.
+use perfetto_gpu_compute_injection::trace_packet_defaults::prelude::*;
+use perfetto_gpu_compute_injection::trace_packet_defaults::TracePacketDefaults;
 use perfetto_sdk::data_source::TraceContext;
 use perfetto_sdk::protos::trace::interned_data::interned_data::InternedData;
 use perfetto_sdk::protos::trace::trace_packet::{TracePacket, TracePacketSequenceFlags};
 use perfetto_sdk::protos::trace::track_event::track_event::EventCategory;
 use perfetto_sdk::protos::trace::track_event::track_event::EventName;
 use perfetto_sdk::protos::trace::track_event::track_event::TrackEvent as TrackEventProto;
+use perfetto_sdk::protos::trace::track_event::track_event::TrackEventDefaults;
 use perfetto_sdk::protos::trace::track_event::track_event::TrackEventType;
 use perfetto_sdk_protos_gpu::protos::trace::gpu::gpu_track_event::{
     GpuApi, GpuCorrelation, TrackEventExt as GpuTrackEventExt,
@@ -36,15 +44,44 @@ use perfetto_sdk_protos_gpu::protos::trace::gpu::gpu_track_event::{
 use std::ffi::CStr;
 use std::panic;
 
-const HIP_CATEGORY_IID: u64 = 1;
-const TX_CATEGORY_IID: u64 = 2;
+// Category iids. Names mirror kineto's HIP filtering: hip_runtime is the
+// kineto-equivalent default-on set (everything *except* the kineto blocklist
+// of high-frequency, low-information calls); hip_runtime.debug carries the
+// blocklisted calls for consumers that opt in via enabled_tags=["debug"] or
+// the explicit category name. HIP unifies its runtime+driver API surface so
+// — unlike CUDA — there is no separate hip_driver category.
+const HIP_RUNTIME_CATEGORY_IID: u64 = 1;
+const HIP_RUNTIME_DEBUG_CATEGORY_IID: u64 = 2;
+const TX_CATEGORY_IID: u64 = 3;
 
-fn track_event_name_iid(name: &str) -> u64 {
-    let mut h: u64 = 5381;
-    for b in name.bytes() {
-        h = h.wrapping_mul(33).wrapping_add(b as u64);
+fn is_hip_category(iid: u64) -> bool {
+    matches!(
+        iid,
+        HIP_RUNTIME_CATEGORY_IID | HIP_RUNTIME_DEBUG_CATEGORY_IID
+    )
+}
+
+/// Maps a HIP runtime API name to the matching category iid. Mirrors the
+/// blocklist kineto installs on the rocprofiler service via
+/// `RocprofApiIdList::setInvertMode(true)` (see kineto's
+/// fbcode/kineto/libkineto/src/RocprofLogger.cpp). Names in the blocklist go
+/// to `hip_runtime.debug`, everything else to `hip_runtime`.
+fn hip_runtime_cbid_category(name: &str) -> u64 {
+    match name {
+        "hipGetDevice"
+        | "hipSetDevice"
+        | "hipGetLastError"
+        | "__hipPushCallConfiguration"
+        | "__hipPopCallConfiguration"
+        | "hipCtxSetCurrent"
+        | "hipEventRecord"
+        | "hipEventQuery"
+        | "hipGetDeviceProperties"
+        | "hipPeekAtLastError"
+        | "hipModuleGetFunction"
+        | "hipEventCreateWithFlags" => HIP_RUNTIME_DEBUG_CATEGORY_IID,
+        _ => HIP_RUNTIME_CATEGORY_IID,
     }
-    h
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -60,16 +97,31 @@ fn emit_track_event_with_interning(
     gpu_correlation: Option<u64>,
 ) {
     let inst_id = ctx.instance_index();
-    let enabled = if category_iid == HIP_CATEGORY_IID {
-        is_cuda_events_enabled_for(inst_id)
-    } else {
-        is_tx_events_enabled_for(inst_id)
+    let enabled = match category_iid {
+        HIP_RUNTIME_CATEGORY_IID => is_hip_runtime_enabled_for(inst_id),
+        HIP_RUNTIME_DEBUG_CATEGORY_IID => is_hip_runtime_debug_enabled_for(inst_id),
+        TX_CATEGORY_IID => is_tx_events_enabled_for(inst_id),
+        _ => false,
     };
     if !enabled {
         return;
     }
-    let name_iid = name.map(track_event_name_iid);
-    let new_name = name_iid.is_some_and(|iid| !state.interned_names.contains(&iid));
+    // Sequential per-sequence iids: 1-2 byte varints vs the 9-10 byte
+    // hash we used previously. interned_names doubles as the "have we
+    // emitted this name?" check — a fresh insert means we still need to
+    // emit the EventName entry below.
+    let (name_iid, new_name) = match name {
+        Some(n) => match state.interned_names.get(n) {
+            Some(&iid) => (Some(iid), false),
+            None => {
+                let iid = state.next_name_iid;
+                state.next_name_iid += 1;
+                state.interned_names.insert(n.to_string(), iid);
+                (Some(iid), true)
+            }
+        },
+        None => (None, false),
+    };
     let need_state_clear = std::mem::replace(&mut state.was_cleared, false);
 
     if need_state_clear || new_name {
@@ -78,26 +130,46 @@ fn emit_track_event_with_interning(
                 packet.set_sequence_flags(
                     TracePacketSequenceFlags::SeqIncrementalStateCleared as u32,
                 );
+                // Per-sequence defaults — pin this thread's track as the
+                // default so subsequent event packets can omit set_track_uuid
+                // (saves ~10 bytes per packet for the typical case where the
+                // calling thread issues all HIP work).
+                packet.set_trace_packet_defaults(|defaults: &mut TracePacketDefaults| {
+                    defaults.set_track_event_defaults(|te_defaults: &mut TrackEventDefaults| {
+                        te_defaults.set_track_uuid(track_uuid);
+                    });
+                });
             }
             packet.set_interned_data(|interned_data: &mut InternedData| {
-                interned_data.set_event_categories(|ec: &mut EventCategory| {
-                    ec.set_iid(HIP_CATEGORY_IID);
-                    ec.set_name("hip");
-                });
-                interned_data.set_event_categories(|ec: &mut EventCategory| {
-                    ec.set_iid(TX_CATEGORY_IID);
-                    ec.set_name("tx");
-                });
-                if let (Some(n), Some(iid)) = (name, name_iid) {
-                    interned_data.set_event_names(|en: &mut EventName| {
-                        en.set_iid(iid);
-                        en.set_name(n);
+                // Categories are sequence-stable — only emit on state clear,
+                // not on every new-name packet (otherwise every interned_data
+                // re-emits the set and burns ~16 B per category per repeat).
+                if need_state_clear {
+                    interned_data.set_event_categories(|ec: &mut EventCategory| {
+                        ec.set_iid(HIP_RUNTIME_CATEGORY_IID);
+                        ec.set_name("hip_runtime");
                     });
+                    interned_data.set_event_categories(|ec: &mut EventCategory| {
+                        ec.set_iid(HIP_RUNTIME_DEBUG_CATEGORY_IID);
+                        ec.set_name("hip_runtime.debug");
+                    });
+                    interned_data.set_event_categories(|ec: &mut EventCategory| {
+                        ec.set_iid(TX_CATEGORY_IID);
+                        ec.set_name("tx");
+                    });
+                }
+                if new_name {
+                    if let (Some(n), Some(iid)) = (name, name_iid) {
+                        interned_data.set_event_names(|en: &mut EventName| {
+                            en.set_iid(iid);
+                            en.set_name(n);
+                        });
+                    }
                 }
             });
         });
-        if let Some(iid) = name_iid {
-            state.interned_names.insert(iid);
+        if need_state_clear {
+            state.default_track_uuid = Some(track_uuid);
         }
     }
 
@@ -106,12 +178,14 @@ fn emit_track_event_with_interning(
         packet.set_sequence_flags(TracePacketSequenceFlags::SeqNeedsIncrementalState as u32);
         packet.set_track_event(|te: &mut TrackEventProto| {
             te.set_type(event_type);
-            te.set_track_uuid(track_uuid);
+            if state.default_track_uuid != Some(track_uuid) {
+                te.set_track_uuid(track_uuid);
+            }
             te.set_category_iids(category_iid);
             if let Some(iid) = name_iid {
                 te.set_name_iid(iid);
             }
-            if category_iid == HIP_CATEGORY_IID {
+            if is_hip_category(category_iid) {
                 GpuTrackEventExt::set_gpu_api(te, GpuApi::GpuApiHip);
             }
             if let Some(corr_id) = gpu_correlation {
@@ -320,7 +394,7 @@ pub unsafe extern "C" fn buffer_callback(
                     continue;
                 }
 
-                if !is_cuda_events_enabled() {
+                if !is_hip_events_enabled() {
                     continue;
                 }
 
@@ -389,13 +463,14 @@ pub unsafe extern "C" fn buffer_callback(
                 ctx.with_incremental_state(|ctx, state| {
                     for event in &api_events {
                         ensure_track_descriptor(ctx, state, event.track_uuid, event.tid);
+                        let category_iid = hip_runtime_cbid_category(&event.name);
                         emit_track_event_with_interning(
                             ctx,
                             state,
                             event.start_ns,
                             event.track_uuid,
-                            HIP_CATEGORY_IID,
-                            "hip",
+                            category_iid,
+                            "",
                             TrackEventType::TypeSliceBegin,
                             Some(&event.name),
                             event.correlation,
@@ -405,8 +480,8 @@ pub unsafe extern "C" fn buffer_callback(
                             state,
                             event.end_ns,
                             event.track_uuid,
-                            HIP_CATEGORY_IID,
-                            "hip",
+                            category_iid,
+                            "",
                             TrackEventType::TypeSliceEnd,
                             None,
                             None,

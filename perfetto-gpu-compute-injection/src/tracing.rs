@@ -33,7 +33,7 @@ use perfetto_sdk_protos_gpu::protos::config::gpu::gpu_counter_config::{
     GpuCounterConfigInstrumentedSamplingConfigActivityRangeFieldNumber,
     GpuCounterConfigInstrumentedSamplingConfigFieldNumber,
 };
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::{
     atomic::{AtomicU64, AtomicU8, Ordering},
     Condvar, Mutex, OnceLock,
@@ -49,16 +49,34 @@ use libc::CLOCK_MONOTONIC as TRACE_TIME_CLOCK;
 /// Tracks interned event names per sequence to avoid re-emitting.
 pub struct TrackEventIncrState {
     pub was_cleared: bool,
-    pub interned_names: HashSet<u64>,
+    /// Maps event name to its sequentially-assigned iid (1, 2, 3, ...).
+    /// Sequential small iids varint to 1-2 bytes vs the 9-10 bytes a
+    /// 64-bit hash always costs, which dominates per-event overhead for
+    /// the high-rate cuda API trace.
+    pub interned_names: HashMap<String, u64>,
+    /// Next iid to assign for a newly-encountered event name. Starts at 1
+    /// (perfetto convention reserves 0).
+    pub next_name_iid: u64,
     pub track_descriptor_emitted: bool,
+    /// Track uuid set as the per-sequence TrackEventDefaults.track_uuid on
+    /// the state-clear packet. Subsequent event packets whose track matches
+    /// this default omit `set_track_uuid` entirely (saving ~10 bytes per
+    /// packet — track_uuid is a 64-bit hash that always varints to 9-10
+    /// bytes). For typical single-thread CUDA workloads ~99% of events are
+    /// on the calling thread's track and benefit. Reset to None on
+    /// incremental state clear so the next sequence re-establishes its own
+    /// default.
+    pub default_track_uuid: Option<u64>,
 }
 
 impl Default for TrackEventIncrState {
     fn default() -> Self {
         Self {
             was_cleared: true,
-            interned_names: HashSet::new(),
+            interned_names: HashMap::new(),
+            next_name_iid: 1,
             track_descriptor_emitted: false,
+            default_track_uuid: None,
         }
     }
 }
@@ -67,7 +85,9 @@ impl Clear for TrackEventIncrState {
     fn clear(&mut self) {
         self.was_cleared = true;
         self.interned_names.clear();
+        self.next_name_iid = 1;
         // Don't reset track_descriptor_emitted — descriptors persist.
+        self.default_track_uuid = None;
     }
 }
 
@@ -177,7 +197,29 @@ static GPU_TRACK_EVENT_DATA_SOURCE: OnceLock<DataSource<'static, TrackEventIncrS
     OnceLock::new();
 static TRACK_EVENT_STARTED: (Mutex<bool>, Condvar) = (Mutex::new(false), Condvar::new());
 /// Bitmask of instances with CUDA API track events enabled.
+/// Set when *any* of the cuda{_runtime,_runtime.debug,_driver,_driver.debug}
+/// categories is enabled (or the legacy "cuda" alias). Used as a cheap
+/// pre-filter before the per-category dispatch — when this is 0 we can skip
+/// all CUPTI-callback handling for the calling thread.
 static CUDA_EVENTS_MASK: AtomicU8 = AtomicU8::new(0);
+/// Per-category masks for the kineto-compatible category split.
+/// `cuda_runtime` / `cuda_driver` are the kineto-equivalent default-on sets
+/// (allowed runtime calls / allowlisted driver calls respectively).
+/// `cuda_runtime.debug` / `cuda_driver.debug` carry the calls kineto would
+/// otherwise drop (runtime blocklist / non-allowlisted driver) and let a
+/// consumer opt in to the verbose set.
+static CUDA_RUNTIME_MASK: AtomicU8 = AtomicU8::new(0);
+static CUDA_RUNTIME_DEBUG_MASK: AtomicU8 = AtomicU8::new(0);
+static CUDA_DRIVER_MASK: AtomicU8 = AtomicU8::new(0);
+static CUDA_DRIVER_DEBUG_MASK: AtomicU8 = AtomicU8::new(0);
+/// Bitmask of instances with HIP API track events enabled.
+/// Same role as CUDA_EVENTS_MASK on the AMD side: cheap "any hip category
+/// enabled" pre-filter set when *any* of `hip_runtime` / `hip_runtime.debug`
+/// is enabled (or the legacy "hip" alias). HIP unifies its runtime+driver
+/// API surface so there is only one runtime mask pair — no driver split.
+static HIP_EVENTS_MASK: AtomicU8 = AtomicU8::new(0);
+static HIP_RUNTIME_MASK: AtomicU8 = AtomicU8::new(0);
+static HIP_RUNTIME_DEBUG_MASK: AtomicU8 = AtomicU8::new(0);
 /// Bitmask of instances with NVTX (tx) track events enabled.
 static TX_EVENTS_MASK: AtomicU8 = AtomicU8::new(0);
 
@@ -587,6 +629,62 @@ pub fn is_cuda_events_enabled_for(inst_id: u32) -> bool {
     CUDA_EVENTS_MASK.load(Ordering::Relaxed) & (1 << inst_id) != 0
 }
 
+/// Returns true if the `cuda_runtime` category is enabled for a specific
+/// instance — i.e. the consumer wants the kineto-equivalent default set of
+/// runtime API events (everything except the kineto blocklist).
+pub fn is_cuda_runtime_enabled_for(inst_id: u32) -> bool {
+    CUDA_RUNTIME_MASK.load(Ordering::Relaxed) & (1 << inst_id) != 0
+}
+
+/// Returns true if the `cuda_runtime.debug` category is enabled — i.e. the
+/// consumer wants the verbose set: runtime calls in the kineto blocklist
+/// (cudaGetDevice, cudaSetDevice, cudaGetLastError, cudaEventCreate*,
+/// cudaEventDestroy).
+pub fn is_cuda_runtime_debug_enabled_for(inst_id: u32) -> bool {
+    CUDA_RUNTIME_DEBUG_MASK.load(Ordering::Relaxed) & (1 << inst_id) != 0
+}
+
+/// Returns true if the `cuda_driver` category is enabled — i.e. the consumer
+/// wants the kineto-equivalent default set of driver API events (allowlisted
+/// kernel launches and virtual-memory operations only).
+pub fn is_cuda_driver_enabled_for(inst_id: u32) -> bool {
+    CUDA_DRIVER_MASK.load(Ordering::Relaxed) & (1 << inst_id) != 0
+}
+
+/// Returns true if the `cuda_driver.debug` category is enabled — i.e. the
+/// consumer wants every other driver API call kineto would otherwise drop.
+pub fn is_cuda_driver_debug_enabled_for(inst_id: u32) -> bool {
+    CUDA_DRIVER_DEBUG_MASK.load(Ordering::Relaxed) & (1 << inst_id) != 0
+}
+
+/// Returns true if at least one instance has HIP API track events enabled
+/// (cheap pre-filter for the rocprofiler-callback handler).
+pub fn is_hip_events_enabled() -> bool {
+    HIP_EVENTS_MASK.load(Ordering::Relaxed) != 0
+}
+
+/// Returns true if HIP API track events are enabled for a specific instance.
+pub fn is_hip_events_enabled_for(inst_id: u32) -> bool {
+    HIP_EVENTS_MASK.load(Ordering::Relaxed) & (1 << inst_id) != 0
+}
+
+/// Returns true if the `hip_runtime` category is enabled for a specific
+/// instance — i.e. the consumer wants the kineto-equivalent default set of
+/// HIP runtime API events (everything except the kineto blocklist
+/// `hipGetDevice`, `hipSetDevice`, `hipGetLastError`, `__hipPushCallConfiguration`,
+/// `__hipPopCallConfiguration`, `hipCtxSetCurrent`, `hipEventRecord`,
+/// `hipEventQuery`, `hipGetDeviceProperties`, `hipPeekAtLastError`,
+/// `hipModuleGetFunction`, `hipEventCreateWithFlags`).
+pub fn is_hip_runtime_enabled_for(inst_id: u32) -> bool {
+    HIP_RUNTIME_MASK.load(Ordering::Relaxed) & (1 << inst_id) != 0
+}
+
+/// Returns true if the `hip_runtime.debug` category is enabled — i.e. the
+/// consumer wants the verbose set: HIP runtime calls in the kineto blocklist.
+pub fn is_hip_runtime_debug_enabled_for(inst_id: u32) -> bool {
+    HIP_RUNTIME_DEBUG_MASK.load(Ordering::Relaxed) & (1 << inst_id) != 0
+}
+
 /// Returns true if at least one instance has NVTX (tx) track events enabled.
 pub fn is_tx_events_enabled() -> bool {
     TX_EVENTS_MASK.load(Ordering::Relaxed) != 0
@@ -608,29 +706,122 @@ pub fn get_track_event_data_source() -> &'static DataSource<'static, TrackEventI
             .handles_incremental_state_clear(true)
             .on_setup(move |inst_id, config: &[u8], _args| {
                 const TRACK_EVENT_CONFIG_ID: u32 = 113;
+                const DISABLED_CATEGORIES_ID: u32 = 1;
                 const ENABLED_CATEGORIES_ID: u32 = 2;
+                const DISABLED_TAGS_ID: u32 = 3;
+                const ENABLED_TAGS_ID: u32 = 4;
 
-                let mut categories: Vec<String> = Vec::new();
+                let mut enabled_cats: Vec<String> = Vec::new();
+                let mut disabled_cats: Vec<String> = Vec::new();
+                let mut enabled_tags: Vec<String> = Vec::new();
+                let mut disabled_tags: Vec<String> = Vec::new();
+                let mut had_disabled_tags = false;
                 for item in PbDecoder::new(config) {
                     if let Ok((TRACK_EVENT_CONFIG_ID, PbDecoderField::Delimited(data))) = &item {
                         for inner in PbDecoder::new(data) {
-                            if let Ok((ENABLED_CATEGORIES_ID, PbDecoderField::Delimited(cat))) =
-                                &inner
-                            {
-                                if let Ok(s) = std::str::from_utf8(cat) {
-                                    categories.push(s.to_string());
+                            match inner {
+                                Ok((DISABLED_CATEGORIES_ID, PbDecoderField::Delimited(s))) => {
+                                    if let Ok(s) = std::str::from_utf8(s) {
+                                        disabled_cats.push(s.to_string());
+                                    }
                                 }
+                                Ok((ENABLED_CATEGORIES_ID, PbDecoderField::Delimited(s))) => {
+                                    if let Ok(s) = std::str::from_utf8(s) {
+                                        enabled_cats.push(s.to_string());
+                                    }
+                                }
+                                Ok((DISABLED_TAGS_ID, PbDecoderField::Delimited(s))) => {
+                                    had_disabled_tags = true;
+                                    if let Ok(s) = std::str::from_utf8(s) {
+                                        disabled_tags.push(s.to_string());
+                                    }
+                                }
+                                Ok((ENABLED_TAGS_ID, PbDecoderField::Delimited(s))) => {
+                                    if let Ok(s) = std::str::from_utf8(s) {
+                                        enabled_tags.push(s.to_string());
+                                    }
+                                }
+                                _ => {}
                             }
                         }
                     }
                 }
 
-                let enable_all = categories.iter().any(|c| c == "*");
-                if enable_all || categories.iter().any(|c| c == "cuda") {
-                    CUDA_EVENTS_MASK.fetch_or(1 << inst_id, Ordering::SeqCst);
+                // Perfetto convention: when the consumer doesn't set
+                // disabled_tags explicitly, "debug" and "slow" are off by
+                // default. To pull in `.debug` categories the consumer must
+                // either list them by name in enabled_categories or override
+                // with enabled_tags = ["debug"].
+                if !had_disabled_tags {
+                    disabled_tags = vec!["debug".to_string(), "slow".to_string()];
                 }
-                if enable_all || categories.iter().any(|c| c == "tx") {
-                    TX_EVENTS_MASK.fetch_or(1 << inst_id, Ordering::SeqCst);
+
+                let category_enabled = |name: &str, tags: &[&str]| -> bool {
+                    if enabled_cats.iter().any(|c| c == name) {
+                        return true;
+                    }
+                    if disabled_cats.iter().any(|c| c == name) {
+                        return false;
+                    }
+                    for tag in tags {
+                        if disabled_tags.iter().any(|t| t == *tag)
+                            && !enabled_tags.iter().any(|t| t == *tag)
+                        {
+                            return false;
+                        }
+                    }
+                    enabled_cats.iter().any(|c| c == "*")
+                };
+
+                // Legacy "cuda" alias enables the full cuda surface (including
+                // .debug variants) regardless of the tag rules — preserves the
+                // pre-split behavior where any consumer using "cuda" got every
+                // CUDA API event. Existing consumers (e.g. hip's reuse of the
+                // CUDA_EVENTS_MASK bit) keep working.
+                let legacy_cuda = enabled_cats.iter().any(|c| c == "cuda")
+                    && !disabled_cats.iter().any(|c| c == "cuda");
+                // Same legacy alias for "hip" — enables both hip_runtime
+                // and hip_runtime.debug regardless of the tag rules.
+                let legacy_hip = enabled_cats.iter().any(|c| c == "hip")
+                    && !disabled_cats.iter().any(|c| c == "hip");
+
+                let runtime = legacy_cuda || category_enabled("cuda_runtime", &[]);
+                let runtime_debug =
+                    legacy_cuda || category_enabled("cuda_runtime.debug", &["debug"]);
+                let driver = legacy_cuda || category_enabled("cuda_driver", &[]);
+                let driver_debug = legacy_cuda || category_enabled("cuda_driver.debug", &["debug"]);
+                let hip_runtime = legacy_hip || category_enabled("hip_runtime", &[]);
+                let hip_runtime_debug =
+                    legacy_hip || category_enabled("hip_runtime.debug", &["debug"]);
+                let tx_enabled = category_enabled("tx", &[]);
+
+                let bit = 1 << inst_id;
+                if runtime {
+                    CUDA_RUNTIME_MASK.fetch_or(bit, Ordering::SeqCst);
+                }
+                if runtime_debug {
+                    CUDA_RUNTIME_DEBUG_MASK.fetch_or(bit, Ordering::SeqCst);
+                }
+                if driver {
+                    CUDA_DRIVER_MASK.fetch_or(bit, Ordering::SeqCst);
+                }
+                if driver_debug {
+                    CUDA_DRIVER_DEBUG_MASK.fetch_or(bit, Ordering::SeqCst);
+                }
+                if runtime || runtime_debug || driver || driver_debug {
+                    CUDA_EVENTS_MASK.fetch_or(bit, Ordering::SeqCst);
+                }
+                if hip_runtime {
+                    HIP_RUNTIME_MASK.fetch_or(bit, Ordering::SeqCst);
+                }
+                if hip_runtime_debug {
+                    HIP_RUNTIME_DEBUG_MASK.fetch_or(bit, Ordering::SeqCst);
+                }
+                if hip_runtime || hip_runtime_debug {
+                    HIP_EVENTS_MASK.fetch_or(bit, Ordering::SeqCst);
+                }
+                if tx_enabled {
+                    TX_EVENTS_MASK.fetch_or(bit, Ordering::SeqCst);
                 }
             })
             .on_start(move |_inst_id, _| {
@@ -640,8 +831,16 @@ pub fn get_track_event_data_source() -> &'static DataSource<'static, TrackEventI
                 cvar.notify_all();
             })
             .on_stop(move |inst_id, _| {
-                CUDA_EVENTS_MASK.fetch_and(!(1 << inst_id), Ordering::SeqCst);
-                TX_EVENTS_MASK.fetch_and(!(1 << inst_id), Ordering::SeqCst);
+                let bit = !(1 << inst_id);
+                CUDA_EVENTS_MASK.fetch_and(bit, Ordering::SeqCst);
+                CUDA_RUNTIME_MASK.fetch_and(bit, Ordering::SeqCst);
+                CUDA_RUNTIME_DEBUG_MASK.fetch_and(bit, Ordering::SeqCst);
+                CUDA_DRIVER_MASK.fetch_and(bit, Ordering::SeqCst);
+                CUDA_DRIVER_DEBUG_MASK.fetch_and(bit, Ordering::SeqCst);
+                HIP_EVENTS_MASK.fetch_and(bit, Ordering::SeqCst);
+                HIP_RUNTIME_MASK.fetch_and(bit, Ordering::SeqCst);
+                HIP_RUNTIME_DEBUG_MASK.fetch_and(bit, Ordering::SeqCst);
+                TX_EVENTS_MASK.fetch_and(bit, Ordering::SeqCst);
             });
         let mut data_source = DataSource::new_with_incremental_state_type();
         data_source

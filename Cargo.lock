@@ -379,7 +379,7 @@ checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
 name = "perfetto-cuda-injection"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "bindgen",
  "cc",
@@ -392,18 +392,19 @@ dependencies = [
 
 [[package]]
 name = "perfetto-gpu-compute-injection"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "cpp_demangle",
  "libc",
  "once_cell",
+ "paste",
  "perfetto-sdk",
  "perfetto-sdk-protos-gpu",
 ]
 
 [[package]]
 name = "perfetto-gpu-probes"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "cc",
  "clap",
@@ -416,7 +417,7 @@ dependencies = [
 
 [[package]]
 name = "perfetto-hip-injection"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "bindgen",
  "cc",

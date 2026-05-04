@@ -194,6 +194,38 @@ const ALL_COUNTER_KINDS: [CounterKind; 4] = [
     CounterKind::MemUtilization,
 ];
 
+/// Declared encoding type for a counter — drives both wire encoding and the
+/// only-emit-on-change comparison key. Quantization runs *before* the
+/// comparison so two raw samples that round to the same integer dedupe
+/// against each other instead of being treated as distinct.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CounterValueType {
+    /// Counter is integer-valued at the source — cast straight to i64 and
+    /// emit as int_value (no rounding). NVML utilization (% as u32),
+    /// temperature (°C as u32) live here.
+    Integer,
+    /// Counter arrives fractional but 1-unit precision is the natural
+    /// granularity — round to the nearest whole unit before encoding as
+    /// int_value. Power lives here: NVML returns milliwatts, we convert to
+    /// watts and then round so consecutive samples within ±0.5 W of each
+    /// other dedupe to the same int.
+    IntegerRounded,
+    /// Floating-point counter — encode as double_value, full f64 precision.
+    /// No NVML counter currently maps here, but reserved for future
+    /// fractional probes (e.g. fan RPM as a fractional ratio).
+    #[expect(dead_code, reason = "reserved for future fractional counters")]
+    Double,
+}
+
+/// Pre-encoding form of a counter sample. Implements PartialEq so the
+/// only-emit-on-change comparison can compare directly without re-doing
+/// the f64 maths.
+#[derive(Clone, Copy, PartialEq)]
+enum CounterValue {
+    Int(i64),
+    Double(f64),
+}
+
 impl CounterKind {
     fn counter_id(&self) -> u32 {
         match self {
@@ -224,13 +256,52 @@ impl CounterKind {
     fn group(&self) -> GpuCounterDescriptorGpuCounterGroup {
         GpuCounterDescriptorGpuCounterGroup::System
     }
+
+    /// Declared value type for this counter. Stable per kind, so the type
+    /// table doubles as the heuristic the future telemetry pipeline can
+    /// consult without re-deriving it from sample values.
+    fn value_type(&self) -> CounterValueType {
+        match self {
+            Self::Temperature | Self::Utilization | Self::MemUtilization => {
+                CounterValueType::Integer
+            }
+            Self::PowerW => CounterValueType::IntegerRounded,
+        }
+    }
+
+    /// Quantize a raw sample (in the counter's natural unit — °C for
+    /// Temperature, W for PowerW, % for Utilization / MemUtilization) to
+    /// its on-wire form. Apply this before comparing to the previously
+    /// emitted value so dedup hits even when the raw f64 drifted in noise.
+    fn quantize(&self, value: f64) -> CounterValue {
+        match self.value_type() {
+            CounterValueType::Integer => {
+                if value.is_finite() && value >= 0.0 && value < (1u64 << 56) as f64 {
+                    CounterValue::Int(value as i64)
+                } else {
+                    CounterValue::Double(value)
+                }
+            }
+            CounterValueType::IntegerRounded => {
+                let rounded = value.round();
+                if rounded.is_finite() && rounded >= 0.0 && rounded < (1u64 << 56) as f64 {
+                    CounterValue::Int(rounded as i64)
+                } else {
+                    CounterValue::Double(value)
+                }
+            }
+            CounterValueType::Double => CounterValue::Double(value),
+        }
+    }
 }
 
-/// A counter sample from a single GPU.
+/// A counter sample from a single GPU. Holds the *quantized* value so the
+/// emit path is a straight unpack and the only-emit-on-change path can
+/// compare CounterValue directly.
 struct CounterSample {
     gpu_index: u32,
     kind: CounterKind,
-    value: f64,
+    value: CounterValue,
 }
 
 /// Emits interned counter descriptors for all GPUs.
@@ -260,6 +331,51 @@ fn emit_interned_counter_descriptors(ctx: &mut TraceContext, gpu_indices: &HashS
             }
         });
     });
+}
+
+/// Compare a fresh counter reading against the last-emitted quantized value
+/// and, on change, push a single backwards-looking cap packet carrying the
+/// OLD value at T_now. The trace processor's backwards-looking interpretation
+/// turns that cap into "OLD held until T_now", which closes the previous
+/// interval at the actual change point. The NEW value is *not* emitted here —
+/// it becomes the OLD value that gets capped at the next change (or at the
+/// trace-end pass), so emitting it now would be redundant. The polling loop
+/// initialises last_emitted to Some(CounterValue::Int(0)) and emits a
+/// dedicated T_0 anchor packet so the very first cap has a meaningful T_prev.
+#[allow(clippy::too_many_arguments)]
+fn handle_counter_change(
+    kind: CounterKind,
+    raw: Option<f64>,
+    last_emitted: &mut Option<CounterValue>,
+    gpu_index: u32,
+    backend_name: &str,
+    counter_label: &str,
+    unit_suffix: &str,
+    caps: &mut Vec<CounterSample>,
+) {
+    let Some(raw) = raw else {
+        return;
+    };
+    let new_value = kind.quantize(raw);
+    if *last_emitted == Some(new_value) {
+        return;
+    }
+    perfetto_dlog!(
+        "{} GPU {}: {} {}{}",
+        backend_name,
+        gpu_index,
+        counter_label,
+        raw,
+        unit_suffix
+    );
+    if let Some(prev) = *last_emitted {
+        caps.push(CounterSample {
+            gpu_index,
+            kind,
+            value: prev,
+        });
+    }
+    *last_emitted = Some(new_value);
 }
 
 /// Emits GpuCounterEvent packets for changed counter values.
@@ -293,7 +409,14 @@ fn emit_gpu_counter_events(
                 for s in gpu_samples {
                     event.set_counters(|counter: &mut GpuCounterEventGpuCounter| {
                         counter.set_counter_id(s.kind.counter_id());
-                        counter.set_double_value(s.value);
+                        match s.value {
+                            CounterValue::Int(v) => {
+                                counter.set_int_value(v);
+                            }
+                            CounterValue::Double(v) => {
+                                counter.set_double_value(v);
+                            }
+                        }
                     });
                 }
             });
@@ -385,16 +508,62 @@ pub(crate) fn run_poll_loop<G: PollableGpu>(
 
     let mut last_freq: Vec<Option<u32>> = vec![None; gpus.len()];
     let mut last_mem: Vec<Option<u64>> = vec![None; gpus.len()];
-    let mut last_temp: Vec<Option<u32>> = vec![None; gpus.len()];
-    let mut last_power: Vec<Option<u32>> = vec![None; gpus.len()];
-    let mut last_gpu_util: Vec<Option<u32>> = vec![None; gpus.len()];
-    let mut last_mem_util: Vec<Option<u32>> = vec![None; gpus.len()];
+    // Per-GPU quantized "last emitted" state for the four counter kinds.
+    // Initialised to Some(0) instead of None so handle_counter_change always
+    // has an OLD value to push as a cap when the reading changes — paired
+    // with the T_0 anchor packet emitted immediately below, this gives every
+    // counter a starting point of 0 at trace-source-instance-start that the
+    // first real cap will close at the iteration where the counter actually
+    // produced a non-zero reading.
+    let zero = CounterValue::Int(0);
+    let mut last_emitted_temp: Vec<Option<CounterValue>> = vec![Some(zero); gpus.len()];
+    let mut last_emitted_power: Vec<Option<CounterValue>> = vec![Some(zero); gpus.len()];
+    let mut last_emitted_gpu_util: Vec<Option<CounterValue>> = vec![Some(zero); gpus.len()];
+    let mut last_emitted_mem_util: Vec<Option<CounterValue>> = vec![Some(zero); gpus.len()];
     let gpu_indices: HashSet<u32> = gpus.iter().map(|g| g.index()).collect();
     let mut descriptors_emitted = false;
-    // GPU counters are "backwards looking" in the trace processor: a value
-    // emitted at T2 gets assigned to T1. To compensate, we buffer the
-    // previous counter samples and emit them at the current timestamp.
-    let mut prev_counter_samples: Vec<CounterSample> = Vec::new();
+    // GPU counters are "backwards looking" in the trace processor: a packet
+    // at timestamp T_pkt assigns its value to the interval [T_prev_pkt,
+    // T_pkt]. To make this work with dedup we (1) emit a single anchor
+    // packet at the data source instance start carrying value 0 for every
+    // counter (gives the first real cap a meaningful T_prev so its
+    // backwards-looking interval starts at T_0 instead of stretching to
+    // -infinity) and (2) on every change emit one cap packet at T_now
+    // carrying the OLD value, which closes the previous interval at the
+    // actual change point. The NEW value implicitly becomes the next OLD
+    // value and gets capped at the iteration where it changes again — or
+    // at the trace-end pass for the final value. No paired "start" packet
+    // is needed because the backwards-looking interpretation makes the next
+    // cap retroactively establish the interval anyway.
+
+    // T_0 anchor: one packet per GPU carrying value 0 for all four counter
+    // kinds. Also triggers the lazy interned-counter-descriptor emission
+    // (and the SEQ_INCREMENTAL_STATE_CLEARED flag) inside
+    // emit_gpu_counter_events, since this is the first counter packet of
+    // the sequence.
+    let anchor_samples: Vec<CounterSample> = gpus
+        .iter()
+        .flat_map(|gpu| {
+            ALL_COUNTER_KINDS.iter().map(move |kind| CounterSample {
+                gpu_index: gpu.index(),
+                kind: *kind,
+                value: zero,
+            })
+        })
+        .collect();
+    let anchor_ts = trace_time_ns();
+    data_source.trace(|ctx: &mut TraceContext| {
+        if ctx.instance_index() != inst_id {
+            return;
+        }
+        emit_gpu_counter_events(
+            ctx,
+            &anchor_samples,
+            &mut descriptors_emitted,
+            &gpu_indices,
+            anchor_ts,
+        );
+    });
 
     while !stop.is_stopped() {
         // Collect changed samples before entering the trace closure.
@@ -435,58 +604,64 @@ pub(crate) fn run_poll_loop<G: PollableGpu>(
             }
         }
 
-        // Read current counter values and update last-known state.
+        // Read current counter values, quantize per declared CounterKind
+        // type, and on each change push a single backwards-looking cap
+        // carrying the OLD value at T_now. The NEW value is held in
+        // last_emitted_* until it changes again or the trace ends — no
+        // separate "start" packet is needed because the trace processor's
+        // backwards-looking interpretation will retroactively establish the
+        // NEW value's interval at the next cap (or final) emission.
+        // Quantization runs *before* the comparison so two raw samples that
+        // round to the same integer (PowerW samples within ±0.5 W, etc.)
+        // dedupe to a no-op.
+        let mut counter_caps: Vec<CounterSample> = Vec::new();
         for (i, gpu) in gpus.iter().enumerate() {
-            if let Some(temp) = gpu.read_temperature() {
-                if last_temp[i] != Some(temp) {
-                    perfetto_dlog!(
-                        "{} GPU {}: temperature {} C",
-                        backend_name,
-                        gpu.index(),
-                        temp
-                    );
-                }
-                last_temp[i] = Some(temp);
-            }
-            if let Some(power_mw) = gpu.read_power_usage_mw() {
-                if last_power[i] != Some(power_mw) {
-                    perfetto_dlog!(
-                        "{} GPU {}: power {} mW",
-                        backend_name,
-                        gpu.index(),
-                        power_mw
-                    );
-                }
-                last_power[i] = Some(power_mw);
-            }
-            if let Some(gpu_util) = gpu.read_gpu_utilization() {
-                if last_gpu_util[i] != Some(gpu_util) {
-                    perfetto_dlog!(
-                        "{} GPU {}: utilization {}%",
-                        backend_name,
-                        gpu.index(),
-                        gpu_util
-                    );
-                }
-                last_gpu_util[i] = Some(gpu_util);
-            }
-            if let Some(mem_util) = gpu.read_mem_utilization() {
-                if last_mem_util[i] != Some(mem_util) {
-                    perfetto_dlog!(
-                        "{} GPU {}: memory utilization {}%",
-                        backend_name,
-                        gpu.index(),
-                        mem_util
-                    );
-                }
-                last_mem_util[i] = Some(mem_util);
-            }
+            handle_counter_change(
+                CounterKind::Temperature,
+                gpu.read_temperature().map(|t| t as f64),
+                &mut last_emitted_temp[i],
+                gpu.index(),
+                backend_name,
+                "temperature",
+                "C",
+                &mut counter_caps,
+            );
+            handle_counter_change(
+                CounterKind::PowerW,
+                gpu.read_power_usage_mw().map(|mw| mw as f64 / 1000.0),
+                &mut last_emitted_power[i],
+                gpu.index(),
+                backend_name,
+                "power",
+                "W",
+                &mut counter_caps,
+            );
+            handle_counter_change(
+                CounterKind::Utilization,
+                gpu.read_gpu_utilization().map(|u| u as f64),
+                &mut last_emitted_gpu_util[i],
+                gpu.index(),
+                backend_name,
+                "utilization",
+                "%",
+                &mut counter_caps,
+            );
+            handle_counter_change(
+                CounterKind::MemUtilization,
+                gpu.read_mem_utilization().map(|u| u as f64),
+                &mut last_emitted_mem_util[i],
+                gpu.index(),
+                backend_name,
+                "memory utilization",
+                "%",
+                &mut counter_caps,
+            );
         }
 
         let has_freq_mem = !freq_samples.is_empty() || !mem_samples.is_empty();
-        let has_prev_counters = !prev_counter_samples.is_empty();
+        let has_counters = !counter_caps.is_empty();
 
-        if has_freq_mem || has_prev_counters {
+        if has_freq_mem || has_counters {
             let timestamp = trace_time_ns();
             data_source.trace(|ctx: &mut TraceContext| {
                 if ctx.instance_index() != inst_id {
@@ -498,48 +673,16 @@ pub(crate) fn run_poll_loop<G: PollableGpu>(
                 if !mem_samples.is_empty() {
                     emit_gpu_mem_total(ctx, &mem_samples, timestamp);
                 }
-                if has_prev_counters {
+                if !counter_caps.is_empty() {
                     emit_gpu_counter_events(
                         ctx,
-                        &prev_counter_samples,
+                        &counter_caps,
                         &mut descriptors_emitted,
                         &gpu_indices,
                         timestamp,
                     );
                 }
             });
-        }
-        // Build buffered samples from last-known values for next iteration.
-        prev_counter_samples.clear();
-        for (i, gpu) in gpus.iter().enumerate() {
-            if let Some(temp) = last_temp[i] {
-                prev_counter_samples.push(CounterSample {
-                    gpu_index: gpu.index(),
-                    kind: CounterKind::Temperature,
-                    value: temp as f64,
-                });
-            }
-            if let Some(power_mw) = last_power[i] {
-                prev_counter_samples.push(CounterSample {
-                    gpu_index: gpu.index(),
-                    kind: CounterKind::PowerW,
-                    value: power_mw as f64 / 1000.0,
-                });
-            }
-            if let Some(gpu_util) = last_gpu_util[i] {
-                prev_counter_samples.push(CounterSample {
-                    gpu_index: gpu.index(),
-                    kind: CounterKind::Utilization,
-                    value: gpu_util as f64,
-                });
-            }
-            if let Some(mem_util) = last_mem_util[i] {
-                prev_counter_samples.push(CounterSample {
-                    gpu_index: gpu.index(),
-                    kind: CounterKind::MemUtilization,
-                    value: mem_util as f64,
-                });
-            }
         }
 
         stop.wait(Duration::from_micros(poll_us));
@@ -563,42 +706,47 @@ pub(crate) fn run_poll_loop<G: PollableGpu>(
                 size_bytes: mem_used,
             });
         }
-        if let Some(temp) = last_temp[i] {
+        // Final samples carry the last-emitted quantized value so the
+        // counter track extends cleanly to the trace end timestamp. No
+        // dedup needed here — these always emit one packet per known
+        // counter so the consumer sees the closing edge.
+        if let Some(q) = last_emitted_temp[i] {
             final_counter_samples.push(CounterSample {
                 gpu_index: gpu.index(),
                 kind: CounterKind::Temperature,
-                value: temp as f64,
+                value: q,
             });
         }
-        if let Some(power_mw) = last_power[i] {
+        if let Some(q) = last_emitted_power[i] {
             final_counter_samples.push(CounterSample {
                 gpu_index: gpu.index(),
                 kind: CounterKind::PowerW,
-                value: power_mw as f64 / 1000.0,
+                value: q,
             });
         }
-        if let Some(gpu_util) = last_gpu_util[i] {
+        if let Some(q) = last_emitted_gpu_util[i] {
             final_counter_samples.push(CounterSample {
                 gpu_index: gpu.index(),
                 kind: CounterKind::Utilization,
-                value: gpu_util as f64,
+                value: q,
             });
         }
-        if let Some(mem_util) = last_mem_util[i] {
+        if let Some(q) = last_emitted_mem_util[i] {
             final_counter_samples.push(CounterSample {
                 gpu_index: gpu.index(),
                 kind: CounterKind::MemUtilization,
-                value: mem_util as f64,
+                value: q,
             });
         }
     }
 
-    // Emit any remaining buffered counter samples plus final values.
-    let mut combined_counter_samples = prev_counter_samples;
-    combined_counter_samples.extend(final_counter_samples);
+    // Closing edge: emit one packet per known counter at trace-end timestamp
+    // so the backwards-looking value extends right up to the trace end. No
+    // pair-emission needed here — the final packet for each counter caps
+    // its current value at the trace boundary; nothing follows it.
     let has_final = !final_freq_samples.is_empty()
         || !final_mem_samples.is_empty()
-        || !combined_counter_samples.is_empty();
+        || !final_counter_samples.is_empty();
     if has_final {
         let timestamp = trace_time_ns();
         data_source.trace(|ctx: &mut TraceContext| {
@@ -611,10 +759,10 @@ pub(crate) fn run_poll_loop<G: PollableGpu>(
             if !final_mem_samples.is_empty() {
                 emit_gpu_mem_total(ctx, &final_mem_samples, timestamp);
             }
-            if !combined_counter_samples.is_empty() {
+            if !final_counter_samples.is_empty() {
                 emit_gpu_counter_events(
                     ctx,
-                    &combined_counter_samples,
+                    &final_counter_samples,
                     &mut descriptors_emitted,
                     &gpu_indices,
                     timestamp,

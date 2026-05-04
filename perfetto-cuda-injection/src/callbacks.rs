@@ -16,18 +16,26 @@ use crate::cupti_profiler::{self as profiler, *};
 use crate::state::{KernelActivity, KernelLaunch, MemcpyActivity, MemsetActivity, GLOBAL_STATE};
 use libc::c_void;
 use perfetto_gpu_compute_injection::tracing::{
-    get_counter_config, get_track_event_data_source, is_cuda_events_enabled,
-    is_cuda_events_enabled_for, is_instrumented_enabled, is_tx_events_enabled,
+    get_counter_config, get_track_event_data_source, is_cuda_driver_debug_enabled_for,
+    is_cuda_driver_enabled_for, is_cuda_events_enabled, is_cuda_runtime_debug_enabled_for,
+    is_cuda_runtime_enabled_for, is_instrumented_enabled, is_tx_events_enabled,
     is_tx_events_enabled_for, process_track_uuid, thread_track_uuid, trace_time_ns,
     TrackEventIncrState,
 };
 use perfetto_gpu_compute_injection::{injection_fatal, injection_log};
+// TODO(perfetto-sdk-1.0): drop the trace_packet_defaults shim imports below
+// and switch to perfetto_sdk::protos::trace::trace_packet::TracePacketDefaults
+// once perfetto-sdk lands the field upstream. See
+// `perfetto_gpu_compute_injection::trace_packet_defaults` for context.
+use perfetto_gpu_compute_injection::trace_packet_defaults::prelude::*;
+use perfetto_gpu_compute_injection::trace_packet_defaults::TracePacketDefaults;
 use perfetto_sdk::data_source::TraceContext;
 use perfetto_sdk::protos::trace::interned_data::interned_data::InternedData;
 use perfetto_sdk::protos::trace::trace_packet::{TracePacket, TracePacketSequenceFlags};
 use perfetto_sdk::protos::trace::track_event::track_event::EventCategory;
 use perfetto_sdk::protos::trace::track_event::track_event::EventName;
 use perfetto_sdk::protos::trace::track_event::track_event::TrackEvent as TrackEventProto;
+use perfetto_sdk::protos::trace::track_event::track_event::TrackEventDefaults;
 use perfetto_sdk::protos::trace::track_event::track_event::TrackEventType;
 use perfetto_sdk_protos_gpu::protos::trace::gpu::gpu_track_event::{
     GpuApi, GpuCorrelation, TrackEventExt as GpuTrackEventExt,
@@ -61,24 +69,70 @@ struct DeferredTrackEvent {
     track_uuid: u64,
     name: String,
     correlation: Option<u64>,
+    /// Category iid resolved at ENTER time from the runtime cbid base name.
+    /// Held on the deferred record so the EXIT path can emit BEGIN+END with
+    /// the same category without recomputing.
+    category_iid: u64,
 }
 
-const CUDA_CATEGORY_IID: u64 = 1;
-const TX_CATEGORY_IID: u64 = 2;
+// Category iids. Names mirror kineto's ActivityType strings (cuda_runtime,
+// cuda_driver). The ".debug" variants carry the events kineto would drop
+// (runtime blocklist / non-allowlisted driver) and let consumers opt in to
+// the verbose set without changing the producer.
+const CUDA_RUNTIME_CATEGORY_IID: u64 = 1;
+const CUDA_RUNTIME_DEBUG_CATEGORY_IID: u64 = 2;
+const CUDA_DRIVER_CATEGORY_IID: u64 = 3;
+const CUDA_DRIVER_DEBUG_CATEGORY_IID: u64 = 4;
+const TX_CATEGORY_IID: u64 = 5;
+
+fn is_cuda_category(iid: u64) -> bool {
+    matches!(
+        iid,
+        CUDA_RUNTIME_CATEGORY_IID
+            | CUDA_RUNTIME_DEBUG_CATEGORY_IID
+            | CUDA_DRIVER_CATEGORY_IID
+            | CUDA_DRIVER_DEBUG_CATEGORY_IID
+    )
+}
+
+/// Maps a runtime API base name to the matching category iid. Mirrors the
+/// blocklist in kineto's CuptiCbidRegistry — anything in the blocklist goes
+/// to `cuda_runtime.debug`, everything else to `cuda_runtime`.
+fn runtime_cbid_category(base_name: &str) -> u64 {
+    match base_name {
+        "cudaGetDevice"
+        | "cudaSetDevice"
+        | "cudaGetLastError"
+        | "cudaEventCreate"
+        | "cudaEventCreateWithFlags"
+        | "cudaEventDestroy" => CUDA_RUNTIME_DEBUG_CATEGORY_IID,
+        _ => CUDA_RUNTIME_CATEGORY_IID,
+    }
+}
+
+/// Maps a driver API base name to the matching category iid. Mirrors the
+/// allowlist in kineto's CuptiCbidRegistry — only the listed launch and
+/// virtual-memory operations go to `cuda_driver`, everything else (memcpy,
+/// memset, sync, module load, etc.) goes to `cuda_driver.debug`.
+fn driver_cbid_category(base_name: &str) -> u64 {
+    match base_name {
+        "cuLaunchKernel"
+        | "cuLaunchKernelEx"
+        | "cuMemCreate"
+        | "cuMemMap"
+        | "cuMemUnmap"
+        | "cuMemRelease"
+        | "cuMemExportToShareableHandle"
+        | "cuMemImportFromShareableHandle" => CUDA_DRIVER_CATEGORY_IID,
+        _ => CUDA_DRIVER_DEBUG_CATEGORY_IID,
+    }
+}
 
 fn is_gpu_work_cbid(cbid: CUpti_CallbackId) -> bool {
     let name = profiler::get_callback_name(CUpti_CallbackDomain_CUPTI_CB_DOMAIN_DRIVER_API, cbid);
     name.starts_with("cuLaunchKernel")
         || name.starts_with("cuMemcpy")
         || name.starts_with("cuMemset")
-}
-
-fn track_event_name_iid(name: &str) -> u64 {
-    let mut h: u64 = 5381;
-    for b in name.bytes() {
-        h = h.wrapping_mul(33).wrapping_add(b as u64);
-    }
-    h
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -94,16 +148,33 @@ fn emit_track_event_with_interning(
     gpu_correlation: Option<u64>,
 ) {
     let inst_id = ctx.instance_index();
-    let enabled = if category_iid == CUDA_CATEGORY_IID {
-        is_cuda_events_enabled_for(inst_id)
-    } else {
-        is_tx_events_enabled_for(inst_id)
+    let enabled = match category_iid {
+        CUDA_RUNTIME_CATEGORY_IID => is_cuda_runtime_enabled_for(inst_id),
+        CUDA_RUNTIME_DEBUG_CATEGORY_IID => is_cuda_runtime_debug_enabled_for(inst_id),
+        CUDA_DRIVER_CATEGORY_IID => is_cuda_driver_enabled_for(inst_id),
+        CUDA_DRIVER_DEBUG_CATEGORY_IID => is_cuda_driver_debug_enabled_for(inst_id),
+        TX_CATEGORY_IID => is_tx_events_enabled_for(inst_id),
+        _ => false,
     };
     if !enabled {
         return;
     }
-    let name_iid = name.map(track_event_name_iid);
-    let new_name = name_iid.is_some_and(|iid| !state.interned_names.contains(&iid));
+    // Sequential per-sequence iids: 1-2 byte varints vs the 9-10 byte
+    // hash we used previously. interned_names doubles as the "have we
+    // emitted this name?" check — a fresh insert means we still need to
+    // emit the EventName entry below.
+    let (name_iid, new_name) = match name {
+        Some(n) => match state.interned_names.get(n) {
+            Some(&iid) => (Some(iid), false),
+            None => {
+                let iid = state.next_name_iid;
+                state.next_name_iid += 1;
+                state.interned_names.insert(n.to_string(), iid);
+                (Some(iid), true)
+            }
+        },
+        None => (None, false),
+    };
     let need_state_clear = std::mem::replace(&mut state.was_cleared, false);
 
     if need_state_clear || new_name {
@@ -112,26 +183,54 @@ fn emit_track_event_with_interning(
                 packet.set_sequence_flags(
                     TracePacketSequenceFlags::SeqIncrementalStateCleared as u32,
                 );
+                // Per-sequence defaults — pin this thread's track as the
+                // default so subsequent event packets can omit set_track_uuid
+                // (saves ~10 bytes per packet for the typical case where the
+                // calling thread issues all CUDA work).
+                packet.set_trace_packet_defaults(|defaults: &mut TracePacketDefaults| {
+                    defaults.set_track_event_defaults(|te_defaults: &mut TrackEventDefaults| {
+                        te_defaults.set_track_uuid(track_uuid);
+                    });
+                });
             }
             packet.set_interned_data(|interned_data: &mut InternedData| {
-                interned_data.set_event_categories(|ec: &mut EventCategory| {
-                    ec.set_iid(CUDA_CATEGORY_IID);
-                    ec.set_name("cuda");
-                });
-                interned_data.set_event_categories(|ec: &mut EventCategory| {
-                    ec.set_iid(TX_CATEGORY_IID);
-                    ec.set_name("tx");
-                });
-                if let (Some(n), Some(iid)) = (name, name_iid) {
-                    interned_data.set_event_names(|en: &mut EventName| {
-                        en.set_iid(iid);
-                        en.set_name(n);
+                // Categories are sequence-stable — only emit on state clear,
+                // not on every new-name packet (otherwise every interned_data
+                // re-emits the set and burns ~16 B per category per repeat).
+                if need_state_clear {
+                    interned_data.set_event_categories(|ec: &mut EventCategory| {
+                        ec.set_iid(CUDA_RUNTIME_CATEGORY_IID);
+                        ec.set_name("cuda_runtime");
                     });
+                    interned_data.set_event_categories(|ec: &mut EventCategory| {
+                        ec.set_iid(CUDA_RUNTIME_DEBUG_CATEGORY_IID);
+                        ec.set_name("cuda_runtime.debug");
+                    });
+                    interned_data.set_event_categories(|ec: &mut EventCategory| {
+                        ec.set_iid(CUDA_DRIVER_CATEGORY_IID);
+                        ec.set_name("cuda_driver");
+                    });
+                    interned_data.set_event_categories(|ec: &mut EventCategory| {
+                        ec.set_iid(CUDA_DRIVER_DEBUG_CATEGORY_IID);
+                        ec.set_name("cuda_driver.debug");
+                    });
+                    interned_data.set_event_categories(|ec: &mut EventCategory| {
+                        ec.set_iid(TX_CATEGORY_IID);
+                        ec.set_name("tx");
+                    });
+                }
+                if new_name {
+                    if let (Some(n), Some(iid)) = (name, name_iid) {
+                        interned_data.set_event_names(|en: &mut EventName| {
+                            en.set_iid(iid);
+                            en.set_name(n);
+                        });
+                    }
                 }
             });
         });
-        if let Some(iid) = name_iid {
-            state.interned_names.insert(iid);
+        if need_state_clear {
+            state.default_track_uuid = Some(track_uuid);
         }
     }
 
@@ -140,12 +239,14 @@ fn emit_track_event_with_interning(
         packet.set_sequence_flags(TracePacketSequenceFlags::SeqNeedsIncrementalState as u32);
         packet.set_track_event(|te: &mut TrackEventProto| {
             te.set_type(event_type);
-            te.set_track_uuid(track_uuid);
+            if state.default_track_uuid != Some(track_uuid) {
+                te.set_track_uuid(track_uuid);
+            }
             te.set_category_iids(category_iid);
             if let Some(iid) = name_iid {
                 te.set_name_iid(iid);
             }
-            if category_iid == CUDA_CATEGORY_IID {
+            if is_cuda_category(category_iid) {
                 GpuTrackEventExt::set_gpu_api(te, GpuApi::GpuApiCuda);
             }
             if let Some(corr_id) = gpu_correlation {
@@ -348,12 +449,14 @@ pub unsafe extern "C" fn profiler_callback_handler(
 
                 if cb_data.callbackSite == CUpti_ApiCallbackSite_CUPTI_API_ENTER {
                     RUNTIME_API_DEPTH.with(|d| *d.borrow_mut() += 1);
+                    let category_iid = runtime_cbid_category(base_name);
                     DEFERRED_EVENT.with(|d| {
                         *d.borrow_mut() = Some(DeferredTrackEvent {
                             ts,
                             track_uuid,
                             name: base_name.to_string(),
                             correlation: None,
+                            category_iid,
                         });
                     });
                 } else if cb_data.callbackSite == CUpti_ApiCallbackSite_CUPTI_API_EXIT {
@@ -371,8 +474,8 @@ pub unsafe extern "C" fn profiler_callback_handler(
                                     state,
                                     ev.ts,
                                     ev.track_uuid,
-                                    CUDA_CATEGORY_IID,
-                                    "cuda",
+                                    ev.category_iid,
+                                    "",
                                     TrackEventType::TypeSliceBegin,
                                     Some(&ev.name),
                                     ev.correlation,
@@ -382,8 +485,8 @@ pub unsafe extern "C" fn profiler_callback_handler(
                                     state,
                                     ts,
                                     ev.track_uuid,
-                                    CUDA_CATEGORY_IID,
-                                    "cuda",
+                                    ev.category_iid,
+                                    "",
                                     TrackEventType::TypeSliceEnd,
                                     None,
                                     None,
@@ -414,6 +517,7 @@ pub unsafe extern "C" fn profiler_callback_handler(
                     None
                 };
 
+                let category_iid = driver_cbid_category(base_name);
                 if cb_data.callbackSite == CUpti_ApiCallbackSite_CUPTI_API_ENTER {
                     get_track_event_data_source().trace(|ctx| {
                         ctx.with_incremental_state(|ctx, state| {
@@ -423,8 +527,8 @@ pub unsafe extern "C" fn profiler_callback_handler(
                                 state,
                                 ts,
                                 track_uuid,
-                                CUDA_CATEGORY_IID,
-                                "cuda",
+                                category_iid,
+                                "",
                                 TrackEventType::TypeSliceBegin,
                                 Some(base_name),
                                 correlation,
@@ -440,8 +544,8 @@ pub unsafe extern "C" fn profiler_callback_handler(
                                 state,
                                 ts,
                                 track_uuid,
-                                CUDA_CATEGORY_IID,
-                                "cuda",
+                                category_iid,
+                                "",
                                 TrackEventType::TypeSliceEnd,
                                 None,
                                 None,

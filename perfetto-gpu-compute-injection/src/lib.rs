@@ -14,4 +14,5 @@
 
 pub mod config;
 pub mod kernel;
+pub mod trace_packet_defaults;
 pub mod tracing;

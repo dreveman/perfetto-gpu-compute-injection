@@ -431,17 +431,7 @@ pub unsafe extern "C" fn buffer_callback(
                     None
                 };
 
-                // Compute thread track UUID from tid.
-                let track_uuid = {
-                    let mut h: u64 = 0xcbf29ce484222325;
-                    let pid_bytes = (std::process::id() as u64).to_le_bytes();
-                    let tid_bytes = tid.to_le_bytes();
-                    for b in pid_bytes.iter().chain(tid_bytes.iter()) {
-                        h ^= *b as u64;
-                        h = h.wrapping_mul(0x100000001b3);
-                    }
-                    h
-                };
+                let track_uuid = tid ^ process_track_uuid();
 
                 // Collect API event for deferred emission after lock release.
                 api_events.push(CollectedApiEvent {

@@ -265,14 +265,28 @@ impl GpuBackend for CuptiBackend {
                         .get(ctx_id)
                         .copied()
                         .unwrap_or(0);
-                    for ((range, launch), activity) in data.range_info[range_start..]
+                    // `range_info` is dense (one entry per *profiled* kernel)
+                    // while `kernel_launches` and `kernel_activities` are sparse
+                    // (one entry per *every* cuLaunchKernel). Walk launches and
+                    // advance the range_info iterator only on profiled kernels
+                    // so each profiled kernel gets paired with its own metrics
+                    // — zipping them by index would slide range_info forward
+                    // by exactly `skip` positions and chop the last `skip`
+                    // results off the emitted events.
+                    let mut range_iter = data.range_info[range_start..].iter();
+                    for (launch, activity) in data.kernel_launches[launch_start..]
                         .iter()
-                        .zip(data.kernel_launches[launch_start..].iter())
                         .zip(data.kernel_activities[activity_start..].iter())
                     {
                         if launch.end == 0 {
                             continue;
                         }
+                        if launch.profiled_instances == 0 {
+                            continue;
+                        }
+                        let Some(range) = range_iter.next() else {
+                            break;
+                        };
                         events.push(CollectedCounterEvent {
                             timestamp_start: launch.start,
                             timestamp_end: launch.end,

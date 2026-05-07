@@ -243,6 +243,11 @@ impl GpuBackend for RocprofilerBackend {
                     // Build structured compute kernel launch args.
                     let launch_args: Vec<(u64, KernelArgValue)> = vec![
                         (
+                            arg_iid("device"),
+                            KernelArgValue::Uint(kd.device_index as u64),
+                        ),
+                        (arg_iid("stream"), KernelArgValue::Uint(kd.queue_handle)),
+                        (
                             arg_iid("workgroup_size"),
                             KernelArgValue::Uint(workgroup_size as u64),
                         ),
@@ -968,6 +973,8 @@ const COMPUTE_ARG_NAMES: &[(u64, &str)] = &[
     (17, "GRBM_GUI_ACTIVE_avr_per_second"),
     (19, "shared_mem_config_size"),
     (20, "shared_mem_driver"),
+    (21, "device"),
+    (22, "stream"),
 ];
 
 fn arg_iid(name: &str) -> u64 {

@@ -607,6 +607,14 @@ impl GpuBackend for CuptiBackend {
 
                         let launch_args: Vec<(u64, KernelArgValue)> = vec![
                             (
+                                arg_iid("device"),
+                                KernelArgValue::Uint(activity.device_id as u64),
+                            ),
+                            (
+                                arg_iid("stream"),
+                                KernelArgValue::Uint(activity.stream_id as u64),
+                            ),
+                            (
                                 arg_iid("workgroup_size"),
                                 KernelArgValue::Uint(block_size as u64),
                             ),
@@ -995,6 +1003,8 @@ const COMPUTE_ARG_NAMES: &[(u64, &str)] = &[
     (14, "registers_per_thread"),
     (15, "shared_mem_static"),
     (16, "func_cache_config"),
+    (17, "device"),
+    (18, "stream"),
     (19, "shared_mem_config_size"),
     (20, "shared_mem_driver"),
 ];

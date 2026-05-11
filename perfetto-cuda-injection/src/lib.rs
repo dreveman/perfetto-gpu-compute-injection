@@ -745,7 +745,16 @@ impl GpuBackend for CuptiBackend {
                                 kernel_shared_mem_config_size: None,
                                 launch_grid: None,
                                 launch_block: None,
-                                launch_args: Vec::new(),
+                                launch_args: vec![
+                                    (
+                                        arg_iid("device"),
+                                        KernelArgValue::Uint(activity.device_id as u64),
+                                    ),
+                                    (
+                                        arg_iid("stream"),
+                                        KernelArgValue::Uint(activity.stream_id as u64),
+                                    ),
+                                ],
                             });
                     }
                     let ms_start = start_offsets
@@ -789,7 +798,16 @@ impl GpuBackend for CuptiBackend {
                                 kernel_shared_mem_config_size: None,
                                 launch_grid: None,
                                 launch_block: None,
-                                launch_args: Vec::new(),
+                                launch_args: vec![
+                                    (
+                                        arg_iid("device"),
+                                        KernelArgValue::Uint(activity.device_id as u64),
+                                    ),
+                                    (
+                                        arg_iid("stream"),
+                                        KernelArgValue::Uint(activity.stream_id as u64),
+                                    ),
+                                ],
                             });
                     }
                 }

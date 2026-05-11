@@ -305,6 +305,7 @@ pub unsafe extern "C" fn buffer_callback(
                         start_ns: rec.start_timestamp,
                         end_ns: rec.end_timestamp,
                         device_index,
+                        queue_handle: Some(info.queue_id.handle),
                         direction: -1,
                         correlation_id: rec.correlation_id.internal,
                     });
@@ -320,6 +321,7 @@ pub unsafe extern "C" fn buffer_callback(
                         start_ns: rec.start_timestamp,
                         end_ns: rec.end_timestamp,
                         device_index,
+                        queue_handle: Some(info.queue_id.handle),
                         correlation_id: rec.correlation_id.internal,
                     });
                     continue;
@@ -376,6 +378,7 @@ pub unsafe extern "C" fn buffer_callback(
                     start_ns: rec.start_timestamp,
                     end_ns: rec.end_timestamp,
                     device_index,
+                    queue_handle: None,
                     #[allow(clippy::unnecessary_cast)]
                     direction: rec.operation as i32,
                     correlation_id: rec.correlation_id.internal,

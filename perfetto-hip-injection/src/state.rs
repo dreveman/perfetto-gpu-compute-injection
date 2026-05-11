@@ -80,6 +80,9 @@ pub struct MemcopyActivity {
     pub start_ns: u64,
     pub end_ns: u64,
     pub device_index: i32,
+    /// HSA queue handle the copy was submitted on. None for buffer-traced
+    /// MEMORY_COPY records, which don't carry a queue id.
+    pub queue_handle: Option<u64>,
     /// Memory copy direction (raw `rocprofiler_memory_copy_operation_t` value).
     pub direction: i32,
     /// rocprofiler internal correlation ID linking this copy to its API call.
@@ -92,6 +95,9 @@ pub struct MemsetActivity {
     pub start_ns: u64,
     pub end_ns: u64,
     pub device_index: i32,
+    /// HSA queue handle the memset was submitted on. None when the source
+    /// record didn't carry a queue id.
+    pub queue_handle: Option<u64>,
     /// rocprofiler internal correlation ID linking this memset to its API call.
     pub correlation_id: u64,
 }

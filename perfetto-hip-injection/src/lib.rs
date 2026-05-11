@@ -296,6 +296,13 @@ impl GpuBackend for RocprofilerBackend {
                         4 => "Memcpy DtoD",
                         _ => "Memcpy",
                     };
+                    let mut launch_args: Vec<(u64, KernelArgValue)> = vec![(
+                        arg_iid("device"),
+                        KernelArgValue::Uint(mc.device_index as u64),
+                    )];
+                    if let Some(queue) = mc.queue_handle {
+                        launch_args.push((arg_iid("stream"), KernelArgValue::Uint(queue)));
+                    }
                     events.push(PendingEvent {
                         start_ns: mc.start_ns,
                         end_ns: mc.end_ns,
@@ -311,12 +318,19 @@ impl GpuBackend for RocprofilerBackend {
                         kernel_arch: None,
                         launch_grid: None,
                         launch_block: None,
-                        launch_args: Vec::new(),
+                        launch_args,
                     });
                 }
 
                 // Memory set events.
                 for ms in state.memsets[ms_start..].iter() {
+                    let mut launch_args: Vec<(u64, KernelArgValue)> = vec![(
+                        arg_iid("device"),
+                        KernelArgValue::Uint(ms.device_index as u64),
+                    )];
+                    if let Some(queue) = ms.queue_handle {
+                        launch_args.push((arg_iid("stream"), KernelArgValue::Uint(queue)));
+                    }
                     events.push(PendingEvent {
                         start_ns: ms.start_ns,
                         end_ns: ms.end_ns,
@@ -332,7 +346,7 @@ impl GpuBackend for RocprofilerBackend {
                         kernel_arch: None,
                         launch_grid: None,
                         launch_block: None,
-                        launch_args: Vec::new(),
+                        launch_args,
                     });
                 }
 

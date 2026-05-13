@@ -877,7 +877,7 @@ pub fn emit_track_descriptor(
         if let Some((pid, tid)) = thread {
             td.set_thread(|thd: &mut ThreadDescriptor| {
                 thd.set_pid(pid);
-                thd.set_tid(tid);
+                thd.set_tid(tid.into());
             });
         }
     });

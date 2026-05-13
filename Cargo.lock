@@ -379,7 +379,7 @@ checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
 name = "perfetto-cuda-injection"
-version = "0.5.7"
+version = "0.6.0"
 dependencies = [
  "bindgen",
  "cc",
@@ -392,7 +392,7 @@ dependencies = [
 
 [[package]]
 name = "perfetto-gpu-compute-injection"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "cpp_demangle",
  "libc",
@@ -404,7 +404,7 @@ dependencies = [
 
 [[package]]
 name = "perfetto-gpu-probes"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "cc",
  "clap",
@@ -417,7 +417,7 @@ dependencies = [
 
 [[package]]
 name = "perfetto-hip-injection"
-version = "0.5.7"
+version = "0.6.0"
 dependencies = [
  "bindgen",
  "cc",
@@ -430,9 +430,9 @@ dependencies = [
 
 [[package]]
 name = "perfetto-sdk"
-version = "0.3.0"
+version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b201f9f9083621ae9c687ccdfded5151bd680460c2e649491acce5d0d032beb6"
+checksum = "3f6cc199e0e04fce848624ed5753fe20d2c72322bb11bb2fa779f01db2a79b07"
 dependencies = [
  "bitflags",
  "paste",
@@ -442,9 +442,9 @@ dependencies = [
 
 [[package]]
 name = "perfetto-sdk-protos-gpu"
-version = "0.3.9"
+version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "531e34a2b4804cb52ac3335bfc9ed658fd92659657cddfc58e37489254646a25"
+checksum = "837b0777aa40d78b8b5171a0c65ce1dfa9cf61a83889879ef9e899da9fa20ae7"
 dependencies = [
  "paste",
  "perfetto-sdk",
@@ -452,9 +452,9 @@ dependencies = [
 
 [[package]]
 name = "perfetto-sdk-sys"
-version = "0.2.4"
+version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e515953ce45e9cf239e60d4246d64e6b81ef5dac1f9b047152465d7a31cd3f9c"
+checksum = "1b0d338b5f443f580b9a45c59268657553ccfd164278357438be9d34d640d0fd"
 dependencies = [
  "cc",
 ]

@@ -23,15 +23,11 @@ use perfetto_gpu_compute_injection::tracing::{
     TrackEventIncrState,
 };
 use perfetto_gpu_compute_injection::{injection_fatal, injection_log};
-// TODO(perfetto-sdk-1.0): drop the trace_packet_defaults shim imports below
-// and switch to perfetto_sdk::protos::trace::trace_packet::TracePacketDefaults
-// once perfetto-sdk lands the field upstream. See
-// `perfetto_gpu_compute_injection::trace_packet_defaults` for context.
-use perfetto_gpu_compute_injection::trace_packet_defaults::prelude::*;
-use perfetto_gpu_compute_injection::trace_packet_defaults::TracePacketDefaults;
 use perfetto_sdk::data_source::TraceContext;
 use perfetto_sdk::protos::trace::interned_data::interned_data::InternedData;
-use perfetto_sdk::protos::trace::trace_packet::{TracePacket, TracePacketSequenceFlags};
+use perfetto_sdk::protos::trace::trace_packet::{
+    TracePacket, TracePacketDefaults, TracePacketSequenceFlags,
+};
 use perfetto_sdk::protos::trace::track_event::track_event::EventCategory;
 use perfetto_sdk::protos::trace::track_event::track_event::EventName;
 use perfetto_sdk::protos::trace::track_event::track_event::TrackEvent as TrackEventProto;

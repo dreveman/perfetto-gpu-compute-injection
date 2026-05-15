@@ -1144,8 +1144,13 @@ fn emit_render_stage_event(
                     .set_context(1)
                     .set_name_iid(name_iid);
                 if let Some(kiid) = kernel_iid {
-                    // Structured compute kernel event.
                     re.set_kernel_iid(kiid);
+                }
+                if kernel_iid.is_some()
+                    || launch_grid.is_some()
+                    || launch_block.is_some()
+                    || !launch_args.is_empty()
+                {
                     re.set_launch(|launch: &mut GpuRenderStageEventComputeKernelLaunch| {
                         if let Some((gx, gy, gz)) = launch_grid {
                             launch.set_grid_size(|d: &mut GpuRenderStageEventDim3| {

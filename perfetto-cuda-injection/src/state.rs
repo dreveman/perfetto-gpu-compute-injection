@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::cupti_profiler::bindings::*;
 use crate::cupti_profiler::cuda;
 use crate::cupti_profiler::*;
 use once_cell::sync::Lazy;
